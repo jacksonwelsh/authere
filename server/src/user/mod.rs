@@ -1,6 +1,6 @@
 pub mod auth;
 
-use crate::db::DbEntity;
+use crate::{db::DbEntity, user::auth::Authenticator};
 use crate::errors::AppError;
 
 use regex::Regex;
@@ -69,6 +69,9 @@ impl User {
         }
         if let Some(email_err) = User::validate_email(&input.email)? {
             errors.push(email_err);
+        }
+        if let Some(pw_err) = Authenticator::validate_password(&input.password)? {
+            errors.push(pw_err);
         }
 
         Ok(errors)
@@ -322,7 +325,7 @@ mod tests {
             username: String::from("user"),
             name: String::from("Test User"),
             email: Some(String::from("hello@authere.jacksn.dev")),
-            password: String::from("hunter2"),
+            password: String::from("hunter2hunter2"),
         };
 
         assert!(
@@ -344,6 +347,6 @@ mod tests {
         let got = User::validate_input(&input).expect("validate_input is not ok!");
 
         // Messages are tested elsewhere, just make sure we're collecting something here.
-        assert_eq!(3, got.len());
+        assert_eq!(4, got.len());
     }
 }

@@ -7,6 +7,9 @@ use argon2::{
 use sqlx::{FromRow, Row, SqliteConnection, sqlite::SqliteRow};
 use uuid::Uuid;
 
+const MIN_PASSWORD_LEN: usize = 12;
+const MAX_PASSWORD_LEN: usize = 512;
+
 #[derive(thiserror::Error, Debug)]
 pub enum AuthenticationError {
     #[error("Mismatched authentication scheme. This method only supports scheme {0:?}")]
@@ -59,6 +62,20 @@ impl Authenticator {
                     .into(),
             )
         }
+    }
+
+    pub fn validate_password(password_cleartext: &String) -> Result<Option<String>, AppError> {
+        Ok(
+            if password_cleartext.len() < MIN_PASSWORD_LEN
+                || password_cleartext.len() > MAX_PASSWORD_LEN
+            {
+                Some(format!(
+                    "Password must be between {MIN_PASSWORD_LEN} and {MAX_PASSWORD_LEN} characters"
+                ))
+            } else {
+                None
+            },
+        )
     }
 }
 
@@ -153,6 +170,43 @@ mod tests {
                 .unwrap_err()
                 .downcast_ref::<AuthenticationError>()
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn validate_password_len() {
+        let short_pw = (0..MIN_PASSWORD_LEN - 1).map(|_| "a").collect::<String>();
+        let got = Authenticator::validate_password(&short_pw)
+            .expect("validate_password is not ok!")
+            .expect("validate_password is not some!");
+
+        let want = format!(
+            "Password must be between {MIN_PASSWORD_LEN} and {MAX_PASSWORD_LEN} characters"
+        );
+        assert_eq!(want, got);
+
+        let long_pw = (0..MAX_PASSWORD_LEN + 1).map(|_| "a").collect::<String>();
+        let got = Authenticator::validate_password(&long_pw)
+            .expect("validate_password is not ok!")
+            .expect("validate_password is not some!");
+
+        assert_eq!(want, got);
+    }
+
+    #[test]
+    fn validate_password_ok() {
+        let min_pw = (0..MIN_PASSWORD_LEN).map(|_| "a").collect::<String>();
+        let max_pw = (0..MAX_PASSWORD_LEN).map(|_| "a").collect::<String>();
+
+        assert!(
+            Authenticator::validate_password(&min_pw)
+                .expect("validate_password is not ok!")
+                .is_none()
+        );
+        assert!(
+            Authenticator::validate_password(&max_pw)
+                .expect("validate_password is not ok!")
+                .is_none()
         );
     }
 }
