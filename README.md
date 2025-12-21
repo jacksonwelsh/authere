@@ -2,6 +2,15 @@
 
 Authentication and authorization software for web services.
 
+## Goals
+
+- [ ] Forward-auth support (specifically targeting Caddy)
+- [ ] Very basic LDAP support
+  - Not intended to be a full server at all, but should be complete enough to support Jellyfin
+- [ ] Full OAuth2 support
+- [ ] Web management UI
+  - Not set on how this will be built, but goal is to completely embed this within the binary
+
 ## Motivations
 
 Authere is a personal project I'm building, with the goal of replacing my use of [Authentik](https://goauthentik.io) in
