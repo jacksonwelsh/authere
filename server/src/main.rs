@@ -2,13 +2,13 @@ use std::io;
 
 use crate::db::DbEntity;
 use crate::errors::AppError;
-use crate::user::User;
+use crate::user::{CreateUserInput, User};
 use crate::user::auth::Authenticator;
 
 use axum::extract::{self, Path, State};
-use serde::Deserialize;
+use axum::http::StatusCode;
 use sqlx::SqlitePool;
-use utoipa::OpenApi;
+use utoipa::{OpenApi};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 use utoipa_swagger_ui::SwaggerUi;
@@ -54,38 +54,49 @@ async fn main() -> Result<(), io::Error> {
     axum::serve(listener, router).await
 }
 
-#[derive(Deserialize)]
-struct CreateUserInput {
-    username: String,
-    name: String,
-    password: String,
-    email: Option<String>,
-}
-
 #[utoipa::path(
     post,
     path = "/user",
     responses(
-        (status = 200, description = "Created a new user"),
+        (status = 201, description = "Created a new user"),
         (status = 400, description = "Invalid input when creating a new user"),
+        (status = 409, description = "User with that username already exists"),
         (status = 500, description = "Internal error when creating the user"),
+    ),
+    request_body(
+        content = CreateUserInput,
+        example = json!(CreateUserInput {
+            username: String::from("bob_burger"),
+            name: String::from("Bob Belcher"),
+            password: String::from("hunter2"),
+            email: Some(String::from("bob@bobsburgers.net"))
+        })
     ),
     tag = AUTH_TAG
 )]
 async fn create_user(
     State(state): State<AppState>,
-    extract::Json(payload): extract::Json<CreateUserInput>,
-) -> Result<axum::Json<User>, AppError> {
-    let user = User::new(payload.username, payload.name, payload.email);
-    let authenticator = Authenticator::new_password(payload.password, user.id)
-        .expect("Authenticator failed to build!");
+    extract::Json(input): extract::Json<CreateUserInput>,
+) -> Result<(StatusCode, axum::Json<User>), AppError> {
+    let input_errs = User::validate_input(&input)?;
+    if !input_errs.is_empty() {
+        return Err(AppError::InputError(input_errs));
+    }
+
+    let user = User::new(input.username, input.name, input.email);
+    let authenticator = Authenticator::new_password(input.password, user.id).map_err(|e| {
+        AppError::InternalError(format!(
+            "Failed to create Authenticator for user {user:?} ({e})"
+        ))
+    })?;
 
     let mut tx = state.db_pool.begin().await?;
     user.save(&mut tx).await?;
     authenticator.save(&mut tx).await?;
     tx.commit().await?;
+    // TODO: implement idempotency
 
-    Ok(axum::Json(user))
+    Ok((StatusCode::CREATED, axum::Json(user)))
 }
 
 #[utoipa::path(
@@ -107,6 +118,9 @@ async fn get_users(State(state): State<AppState>) -> Result<axum::Json<Vec<User>
 #[utoipa::path(
     get,
     path = "/user/{id}",
+    params(
+        ("id" = Uuid, Path, description = "User ID")
+    ),
     responses(
         (status = 200, description = "Retrieved a user"),
         (status = 404, description = "User not found"),

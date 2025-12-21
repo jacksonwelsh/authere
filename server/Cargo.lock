@@ -81,6 +81,7 @@ dependencies = [
  "anyhow",
  "argon2",
  "axum",
+ "regex",
  "serde",
  "serde_json",
  "sqlx",
@@ -1980,6 +1981,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+ "uuid",
 ]
 
 [[package]]

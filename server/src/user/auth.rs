@@ -68,12 +68,14 @@ impl DbEntity for Authenticator {
             AuthenticationScheme::Password(hash) => ("password", hash),
             AuthenticationScheme::Totp(secret) => ("totp", secret),
         };
+        let id = self.id.to_string();
+        let owner_id = self.owner_id.to_string();
         sqlx::query!(
             "INSERT INTO authenticators(id, type, value, owner_id) VALUES (?, ?, ?, ?)",
-            self.id,
+            id,
             auth_type,
             value,
-            self.owner_id
+            owner_id
         )
         .execute(executor)
         .await?;
