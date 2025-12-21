@@ -68,7 +68,7 @@ async fn main() -> Result<(), io::Error> {
         example = json!(CreateUserInput {
             username: String::from("bob_burger"),
             name: String::from("Bob Belcher"),
-            password: String::from("hunter2"),
+            password: String::from("hunter2hunter2"),
             email: Some(String::from("bob@bobsburgers.net"))
         })
     ),
