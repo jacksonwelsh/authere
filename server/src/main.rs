@@ -1,3 +1,4 @@
+use std::env;
 use std::io;
 
 use crate::db::DbEntity;
@@ -37,7 +38,11 @@ struct AppState {
 
 #[tokio::main]
 async fn main() -> Result<(), io::Error> {
-    let db_pool = SqlitePool::connect("sqlite:///Users/jacksonwelsh/code/authere/data.db")
+    let database_url = env::var("DATABASE_URL").unwrap_or_else(|_| {
+        eprintln!("DATABASE_URL not set, using default: sqlite:./data.db");
+        String::from("sqlite:./data.db")
+    });
+    let db_pool = SqlitePool::connect(&database_url)
         .await
         .expect("Could not connect to sqlite!");
 
