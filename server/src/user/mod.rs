@@ -1,5 +1,7 @@
 pub mod auth;
 
+use std::sync::LazyLock;
+
 use crate::errors::AppError;
 use crate::{db::DbEntity, user::auth::Authenticator};
 
@@ -9,7 +11,8 @@ use sqlx::SqliteConnection;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-const USERNAME_PATTERN: &'static str = r"^[A-Za-z0-9.\-_]*$";
+const USERNAME_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[A-Za-z0-9.\-_]*$").expect("invalid username regex"));
 const MIN_USERNAME_LEN: usize = 3;
 const MAX_USERNAME_LEN: usize = 64;
 
@@ -18,10 +21,10 @@ const MAX_NAME_LEN: usize = 128;
 
 /// Specified by RFC 3936 errata
 const MAX_EMAIL_LEN: usize = 254;
+static EMAIL_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^.+@.+\..{2,}$").expect("invalid email regex"));
 
-const EMAIL_PATTERN: &'static str = r"^.+@.+\..{2,}$";
-
-type Result<T> = core::result::Result<T, AppError>;
+type AppResult<T> = Result<T, AppError>;
 
 #[derive(Deserialize, Serialize, ToSchema)]
 pub struct CreateUserInput {
@@ -56,7 +59,7 @@ impl User {
         }
     }
 
-    pub async fn list(conn: &mut SqliteConnection) -> Result<Vec<User>> {
+    pub async fn list(conn: &mut SqliteConnection) -> AppResult<Vec<User>> {
         Ok(sqlx::query_as!(
             User,
             r#"SELECT id as "id: uuid::Uuid", name, username, email FROM users"#
@@ -65,7 +68,7 @@ impl User {
         .await?)
     }
 
-    pub async fn login(input: LoginInput, conn: &mut SqliteConnection) -> Result<Self> {
+    pub async fn login(input: LoginInput, conn: &mut SqliteConnection) -> AppResult<Self> {
         if let Some(user) = User::get_by_username(&input.username, conn).await? {
             match Authenticator::try_password_login(&user, input.password, conn).await {
                 Ok(()) => Ok(user),
@@ -76,28 +79,28 @@ impl User {
         }
     }
 
-    pub fn validate_create_input(input: &CreateUserInput) -> Result<Vec<String>> {
-        let mut errors = Vec::new();
-        if let Some(username_err) = User::validate_username(&input.username)? {
-            errors.push(username_err);
-        }
-        if let Some(name_err) = User::validate_name(&input.name)? {
-            errors.push(name_err);
-        }
-        if let Some(email_err) = User::validate_email(&input.email)? {
-            errors.push(email_err);
-        }
-        if let Some(pw_err) = Authenticator::validate_password(&input.password)? {
-            errors.push(pw_err);
-        }
+    pub fn validate_create_input(input: &CreateUserInput) -> AppResult<()> {
+        let errors: Vec<String> = vec![
+            User::validate_username(&input.username),
+            User::validate_name(&input.name),
+            User::validate_email(&input.email),
+            Authenticator::validate_password(&input.password),
+        ]
+        .into_iter()
+        .filter_map(Result::err)
+        .collect();
 
-        Ok(errors)
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(AppError::InputError(errors))
+        }
     }
 
     async fn get_by_username(
         username: &String,
         conn: &mut SqliteConnection,
-    ) -> Result<Option<Self>> {
+    ) -> AppResult<Option<Self>> {
         Ok(sqlx::query_as!(
             User,
             r#"SELECT id as "id: uuid::Uuid", name, username, email FROM users WHERE username = ?"#,
@@ -107,50 +110,47 @@ impl User {
         .await?)
     }
 
-    fn validate_username(username: &String) -> Result<Option<String>> {
-        Ok(
-            if username.len() < MIN_USERNAME_LEN || username.len() > MAX_USERNAME_LEN {
-                Some(format!(
-                    "Username must be between {MIN_USERNAME_LEN} and {MAX_USERNAME_LEN} characters"
+    fn validate_username(username: &String) -> Result<(), String> {
+        if username.len() < MIN_USERNAME_LEN || username.len() > MAX_USERNAME_LEN {
+            Err(format!(
+                "Username must be between {MIN_USERNAME_LEN} and {MAX_USERNAME_LEN} characters"
+            ))
+        } else {
+            // Don't run regex on arbitrarily long strings
+            if !USERNAME_REGEX.is_match(username) {
+                Err(String::from(
+                    "Username must consist only of letters, numbers, and allowed symbols",
                 ))
             } else {
-                // Don't run regex on arbitrarily long strings
-                let username_regex = Regex::new(USERNAME_PATTERN)?;
-                if !username_regex.is_match(username) {
-                    Some(String::from(
-                        "Username must consist only of letters, numbers, and allowed symbols",
-                    ))
-                } else {
-                    None
-                }
-            },
-        )
+                Ok(())
+            }
+        }
     }
 
-    fn validate_name(name: &String) -> Result<Option<String>> {
-        Ok(if name.len() < MIN_NAME_LEN || name.len() > MAX_NAME_LEN {
-            Some(format!(
+    fn validate_name(name: &String) -> Result<(), String> {
+        if name.len() < MIN_NAME_LEN || name.len() > MAX_NAME_LEN {
+            Err(format!(
                 "Name must be between {MIN_NAME_LEN} and {MAX_NAME_LEN} characters"
             ))
         } else {
-            None
-        })
+            Ok(())
+        }
     }
 
-    fn validate_email(email: &Option<String>) -> Result<Option<String>> {
-        Ok(match email {
-            None => None,
-            Some(email) if email.len() > MAX_EMAIL_LEN => Some(format!(
+    fn validate_email(email: &Option<String>) -> Result<(), String> {
+        match email {
+            None => Ok(()),
+            Some(email) if email.len() > MAX_EMAIL_LEN => Err(format!(
                 "Email must contain no more than {MAX_EMAIL_LEN} characters"
             )),
-            Some(email) if Regex::new(EMAIL_PATTERN)?.is_match(email) => None,
-            _ => Some(String::from("Email is not valid")),
-        })
+            Some(email) if EMAIL_REGEX.is_match(email) => Ok(()),
+            _ => Err(String::from("Email is not valid")),
+        }
     }
 }
 
 impl DbEntity for User {
-    async fn save(&self, conn: &mut SqliteConnection) -> Result<()> {
+    async fn save(&self, conn: &mut SqliteConnection) -> AppResult<()> {
         sqlx::query!(
             "INSERT INTO users (id, username, name, email) VALUES (?, ?, ?, ?)",
             self.id,
@@ -164,7 +164,7 @@ impl DbEntity for User {
         Ok(())
     }
 
-    async fn get(id: uuid::Uuid, conn: &mut SqliteConnection) -> Result<Option<Self>> {
+    async fn get(id: uuid::Uuid, conn: &mut SqliteConnection) -> AppResult<Option<Self>> {
         Ok(sqlx::query_as!(
             User,
             r#"SELECT id as "id: uuid::Uuid", username, name, email FROM users WHERE id = ?"#,
@@ -182,9 +182,8 @@ mod tests {
     #[test]
     fn validate_username_pattern() {
         let bad_username = String::from("user!");
-        let got = User::validate_username(&bad_username)
-            .expect("validate_username is not ok!")
-            .expect("validate_username is not some!");
+        let got =
+            User::validate_username(&bad_username).expect_err("validate_username is not err!");
 
         assert_eq!(
             "Username must consist only of letters, numbers, and allowed symbols",
@@ -195,9 +194,8 @@ mod tests {
     #[test]
     fn validate_username_length() {
         let short_username = (0..MIN_USERNAME_LEN - 1).map(|_| "a").collect::<String>();
-        let got = User::validate_username(&short_username)
-            .expect("validate_username is not ok!")
-            .expect("validate_username is not some!");
+        let got =
+            User::validate_username(&short_username).expect_err("validate_username is not err!");
         assert_eq!(
             format!(
                 "Username must be between {MIN_USERNAME_LEN} and {MAX_USERNAME_LEN} characters"
@@ -206,9 +204,8 @@ mod tests {
         );
 
         let long_username = (0..MAX_USERNAME_LEN + 1).map(|_| "a").collect::<String>();
-        let got = User::validate_username(&long_username)
-            .expect("validate_username is not ok!")
-            .expect("validate_username is not some!");
+        let got =
+            User::validate_username(&long_username).expect_err("validate_username is not err!");
         assert_eq!(
             format!(
                 "Username must be between {MIN_USERNAME_LEN} and {MAX_USERNAME_LEN} characters"
@@ -220,41 +217,25 @@ mod tests {
     #[test]
     fn validate_username_ok() {
         let min_username = (0..MIN_USERNAME_LEN).map(|_| "a").collect::<String>();
-        assert!(
-            User::validate_username(&min_username)
-                .expect("validate_username is not ok!")
-                .is_none()
-        );
+        User::validate_username(&min_username).expect("validate_username is not ok!");
         let max_username = (0..MAX_USERNAME_LEN).map(|_| "a").collect::<String>();
-        assert!(
-            User::validate_username(&max_username)
-                .expect("validate_username is not ok!")
-                .is_none()
-        );
+        User::validate_username(&max_username).expect("validate_username is not ok!");
 
         let symbol_username = String::from("_abcdefghijklmnopqrstuvwxyz.1234567890-");
-        assert!(
-            User::validate_username(&symbol_username)
-                .expect("validate_username is not ok!")
-                .is_none()
-        );
+        User::validate_username(&symbol_username).expect("validate_username is not ok!");
     }
 
     #[test]
     fn validate_name_length() {
         let short_name = (0..MIN_NAME_LEN - 1).map(|_| "a").collect::<String>();
-        let got = User::validate_name(&short_name)
-            .expect("validate_name is not ok!")
-            .expect("validate_name is not some!");
+        let got = User::validate_name(&short_name).expect_err("validate_name is not err!");
         assert_eq!(
             format!("Name must be between {MIN_NAME_LEN} and {MAX_NAME_LEN} characters"),
             got
         );
 
         let long_name = (0..MAX_NAME_LEN + 1).map(|_| "a").collect::<String>();
-        let got = User::validate_name(&long_name)
-            .expect("validate_name is not ok!")
-            .expect("validate_name is not some!");
+        let got = User::validate_name(&long_name).expect_err("validate_name is not err!");
         assert_eq!(
             format!("Name must be between {MIN_NAME_LEN} and {MAX_NAME_LEN} characters"),
             got
@@ -264,25 +245,13 @@ mod tests {
     #[test]
     fn validate_name_ok() {
         let min_name = (0..MIN_NAME_LEN).map(|_| "a").collect::<String>();
-        assert!(
-            User::validate_name(&min_name)
-                .expect("validate_name is not ok!")
-                .is_none()
-        );
+        User::validate_name(&min_name).expect("validate_name is not ok!");
 
         let max_name = (0..MAX_NAME_LEN).map(|_| "a").collect::<String>();
-        assert!(
-            User::validate_name(&max_name)
-                .expect("validate_name is not ok!")
-                .is_none()
-        );
+        User::validate_name(&max_name).expect("validate_name is not ok!");
 
         let realistic_name = String::from("Jane Ivey");
-        assert!(
-            User::validate_name(&realistic_name)
-                .expect("validate_name is not ok!")
-                .is_none()
-        );
+        User::validate_name(&realistic_name).expect("validate_name is not ok!");
     }
 
     #[test]
@@ -297,19 +266,13 @@ mod tests {
         let max_email = format!("{max_email_inbox}@{max_email_host}.co");
         let long_email = format!("x{max_email}");
 
-        let got = User::validate_email(&Some(long_email))
-            .expect("validate_email is not ok!")
-            .expect("validate_email is not some!");
+        let got = User::validate_email(&Some(long_email)).expect_err("validate_email is not err!");
         assert_eq!(
             format!("Email must contain no more than {MAX_EMAIL_LEN} characters"),
             got
         );
 
-        assert!(
-            User::validate_email(&Some(max_email))
-                .expect("validate_email is not ok!")
-                .is_none()
-        );
+        User::validate_email(&Some(max_email)).expect("validate_email is not ok!");
     }
 
     #[test]
@@ -326,26 +289,16 @@ mod tests {
         let ok_emails = vec![ok_minimal, ok_realistic];
 
         for email in bad_emails {
-            let got = User::validate_email(&Some(email))
-                .expect("validate_email is not ok!")
-                .expect("validate_email is not some!");
+            let got = User::validate_email(&Some(email)).expect_err("validate_email is not err!");
             assert_eq!(String::from("Email is not valid"), got);
         }
 
         for email in ok_emails {
-            assert!(
-                User::validate_email(&Some(email))
-                    .expect("validate_email is not ok!")
-                    .is_none()
-            );
+            User::validate_email(&Some(email)).expect("validate_email is not ok!");
         }
 
         // Missing emails should always be treated as valid
-        assert!(
-            User::validate_email(&None)
-                .expect("validate_email is not ok!")
-                .is_none()
-        )
+        User::validate_email(&None).expect("validate_email is not ok!");
     }
 
     #[test]
@@ -357,11 +310,7 @@ mod tests {
             password: String::from("hunter2hunter2"),
         };
 
-        assert!(
-            User::validate_create_input(&input)
-                .expect("validate_input is not ok!")
-                .is_empty()
-        );
+        User::validate_create_input(&input).expect("validate_input is not ok!");
     }
 
     #[test]
@@ -373,9 +322,11 @@ mod tests {
             password: String::from(""),
         };
 
-        let got = User::validate_create_input(&input).expect("validate_input is not ok!");
-
+        let got = User::validate_create_input(&input).expect_err("validate_input is not err!");
+        let AppError::InputError(errs) = got else {
+            panic!("Error type was not InputError!");
+        };
         // Messages are tested elsewhere, just make sure we're collecting something here.
-        assert_eq!(4, got.len());
+        assert_eq!(4, errs.len());
     }
 }
