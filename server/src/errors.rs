@@ -11,6 +11,8 @@ pub enum AppError {
     NotFound,
     /// Malformed user input. Each problem will have its own entry in the vec.
     InputError(Vec<String>),
+    /// User needs to log in. Can also be raised by authn endpoints for invalid credentials.
+    AuthenticationRequired,
     // General internal server errors, distinct from those caused directly by the DB.
     InternalError(String),
 }
@@ -22,6 +24,7 @@ impl From<AppError> for StatusCode {
             AppError::UniqueError(_) => StatusCode::CONFLICT,
             AppError::NotFound => StatusCode::NOT_FOUND,
             AppError::InputError(_) => StatusCode::BAD_REQUEST,
+            AppError::AuthenticationRequired => StatusCode::UNAUTHORIZED,
             AppError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -50,6 +53,11 @@ impl IntoResponse for AppError {
                 (StatusCode::NOT_FOUND, String::from("Resource not found")).into_response()
             }
             Self::UniqueError(err) => (StatusCode::CONFLICT, err).into_response(),
+            Self::AuthenticationRequired => (
+                StatusCode::UNAUTHORIZED,
+                String::from("Authentication required"),
+            )
+                .into_response(),
             Self::InputError(errs) => (StatusCode::BAD_REQUEST, errs.join(", ")).into_response(),
         }
     }

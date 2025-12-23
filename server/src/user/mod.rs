@@ -1,7 +1,7 @@
 pub mod auth;
 
-use crate::{db::DbEntity, user::auth::Authenticator};
 use crate::errors::AppError;
+use crate::{db::DbEntity, user::auth::Authenticator};
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -29,6 +29,12 @@ pub struct CreateUserInput {
     pub name: String,
     pub password: String,
     pub email: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, ToSchema)]
+pub struct LoginInput {
+    pub username: String,
+    pub password: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -59,7 +65,18 @@ impl User {
         .await?)
     }
 
-    pub fn validate_input(input: &CreateUserInput) -> Result<Vec<String>> {
+    pub async fn login(input: LoginInput, conn: &mut SqliteConnection) -> Result<Self> {
+        if let Some(user) = User::get_by_username(&input.username, conn).await? {
+            match Authenticator::try_password_login(&user, input.password, conn).await {
+                Ok(()) => Ok(user),
+                Err(_) => Err(AppError::AuthenticationRequired),
+            }
+        } else {
+            Err(AppError::AuthenticationRequired)
+        }
+    }
+
+    pub fn validate_create_input(input: &CreateUserInput) -> Result<Vec<String>> {
         let mut errors = Vec::new();
         if let Some(username_err) = User::validate_username(&input.username)? {
             errors.push(username_err);
@@ -75,6 +92,19 @@ impl User {
         }
 
         Ok(errors)
+    }
+
+    async fn get_by_username(
+        username: &String,
+        conn: &mut SqliteConnection,
+    ) -> Result<Option<Self>> {
+        Ok(sqlx::query_as!(
+            User,
+            r#"SELECT id as "id: uuid::Uuid", name, username, email FROM users WHERE username = ?"#,
+            username
+        )
+        .fetch_optional(conn)
+        .await?)
     }
 
     fn validate_username(username: &String) -> Result<Option<String>> {
@@ -121,10 +151,9 @@ impl User {
 
 impl DbEntity for User {
     async fn save(&self, conn: &mut SqliteConnection) -> Result<()> {
-        let id = self.id.to_string();
         sqlx::query!(
             "INSERT INTO users (id, username, name, email) VALUES (?, ?, ?, ?)",
-            id,
+            self.id,
             self.username,
             self.name,
             self.email
@@ -329,7 +358,7 @@ mod tests {
         };
 
         assert!(
-            User::validate_input(&input)
+            User::validate_create_input(&input)
                 .expect("validate_input is not ok!")
                 .is_empty()
         );
@@ -344,7 +373,7 @@ mod tests {
             password: String::from(""),
         };
 
-        let got = User::validate_input(&input).expect("validate_input is not ok!");
+        let got = User::validate_create_input(&input).expect("validate_input is not ok!");
 
         // Messages are tested elsewhere, just make sure we're collecting something here.
         assert_eq!(4, got.len());

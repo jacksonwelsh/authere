@@ -2,13 +2,13 @@ use std::io;
 
 use crate::db::DbEntity;
 use crate::errors::AppError;
-use crate::user::{CreateUserInput, User};
 use crate::user::auth::Authenticator;
+use crate::user::{CreateUserInput, LoginInput, User};
 
 use axum::extract::{self, Path, State};
 use axum::http::StatusCode;
 use sqlx::SqlitePool;
-use utoipa::{OpenApi};
+use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 use utoipa_swagger_ui::SwaggerUi;
@@ -45,6 +45,7 @@ async fn main() -> Result<(), io::Error> {
     let (router, api) = OpenApiRouter::with_openapi(ApiDoc::openapi())
         .routes(routes!(create_user, get_users))
         .routes(routes!(get_user))
+        .routes(routes!(login))
         .with_state(AppState { db_pool })
         .split_for_parts();
 
@@ -78,7 +79,7 @@ async fn create_user(
     State(state): State<AppState>,
     extract::Json(input): extract::Json<CreateUserInput>,
 ) -> Result<(StatusCode, axum::Json<User>), AppError> {
-    let input_errs = User::validate_input(&input)?;
+    let input_errs = User::validate_create_input(&input)?;
     if !input_errs.is_empty() {
         return Err(AppError::InputError(input_errs));
     }
@@ -139,4 +140,40 @@ async fn get_user(
         Some(user) => Ok(axum::Json(user)),
         None => Err(AppError::NotFound),
     }
+}
+
+#[utoipa::path(
+    post,
+    path = "/login",
+    request_body(
+        content = LoginInput,
+        example = json!(LoginInput {
+            username: String::from("bob_burger"),
+            password: String::from("hunter2hunter2"),
+        }),
+    ),
+    responses(
+        (status = 200, description = "Successful login"),
+        (status = 400, description = "Invalid username or password"),
+        (status = 401, description = "Incorrect username or password"),
+        (status = 500, description = "Internal server error")
+    ),
+    tag = AUTH_TAG,
+)]
+async fn login(
+    State(state): State<AppState>,
+    extract::Json(input): extract::Json<LoginInput>,
+) -> Result<axum::Json<User>, AppError> {
+    // Something to handle later: there's a distinctly different latency between requests where a
+    // user is found and a user is not, due to password hashing (10ms vs 300ms). Need to slow down
+    // user-not-found requests to deter enumeration attacks, maybe add some jitter to user-found
+    // requests too.
+    let mut conn = state.db_pool.acquire().await?;
+    // Be kind to users, throw a different error if password doesn't meet requirements
+    Authenticator::validate_password(&input.password)?;
+    let user = User::login(input, &mut conn).await?;
+
+    // TODO: return some kind of token here. The user object is effectly useless.
+    // Set a cookie?
+    Ok(axum::Json(user))
 }

@@ -1,3 +1,4 @@
+use crate::User;
 use crate::{db::DbEntity, errors::AppError};
 
 use argon2::{
@@ -25,6 +26,7 @@ pub enum AuthenticationScheme {
     // TODO: Implement WebAuthn. Design DB schema with this in mind.
 }
 
+#[derive(Debug)]
 pub struct Authenticator {
     pub id: Uuid,
     pub scheme: AuthenticationScheme,
@@ -46,8 +48,23 @@ impl Authenticator {
         Ok(Authenticator {
             id: Uuid::now_v7(),
             scheme: AuthenticationScheme::Password(hash),
-            owner_id: owner_id,
+            owner_id,
         })
+    }
+
+    pub async fn try_password_login(
+        user: &User,
+        password_cleartext: String,
+        conn: &mut SqliteConnection,
+    ) -> Result<(), AppError> {
+        if let Some(password) = Authenticator::get_password_for(user, conn).await? {
+            match password.verify_password(&password_cleartext) {
+                Ok(()) => Ok(()),
+                Err(_) => Err(AppError::AuthenticationRequired),
+            }
+        } else {
+            Err(AppError::AuthenticationRequired)
+        }
     }
 
     pub fn verify_password(&self, input_cleartext: &str) -> anyhow::Result<()> {
@@ -77,6 +94,19 @@ impl Authenticator {
             },
         )
     }
+
+    async fn get_password_for(
+        user: &User,
+        conn: &mut SqliteConnection,
+    ) -> Result<Option<Authenticator>, AppError> {
+        Ok(
+            sqlx::query_as(
+                r#"SELECT id, type, value, owner_id FROM authenticators WHERE owner_id = ? AND type = 'password'"#)
+            .bind(user.id)
+            .fetch_optional(conn)
+            .await?
+        )
+    }
 }
 
 impl DbEntity for Authenticator {
@@ -85,14 +115,12 @@ impl DbEntity for Authenticator {
             AuthenticationScheme::Password(hash) => ("password", hash),
             AuthenticationScheme::Totp(secret) => ("totp", secret),
         };
-        let id = self.id.to_string();
-        let owner_id = self.owner_id.to_string();
         sqlx::query!(
             "INSERT INTO authenticators(id, type, value, owner_id) VALUES (?, ?, ?, ?)",
-            id,
+            self.id,
             auth_type,
             value,
-            owner_id
+            self.owner_id
         )
         .execute(executor)
         .await?;
@@ -104,7 +132,7 @@ impl DbEntity for Authenticator {
         // Cannot use macro here as we need the custom FromRow impl which does not work with the
         // macro
         Ok(sqlx::query_as(
-                r#"SELECT id as "id: uuid::Uuid", type, value, owner_id FROM authenticators WHERE id = ?"#,
+                r#"SELECT id, type, value, owner_id FROM authenticators WHERE id = ?"#,
                 ).bind(id)
             .fetch_optional(conn)
             .await?)
