@@ -98,7 +98,7 @@ impl User {
     }
 
     async fn get_by_username(
-        username: &String,
+        username: &str,
         conn: &mut SqliteConnection,
     ) -> AppResult<Option<Self>> {
         Ok(sqlx::query_as!(
@@ -110,7 +110,7 @@ impl User {
         .await?)
     }
 
-    fn validate_username(username: &String) -> Result<(), String> {
+    fn validate_username(username: &str) -> Result<(), String> {
         if username.len() < MIN_USERNAME_LEN || username.len() > MAX_USERNAME_LEN {
             Err(format!(
                 "Username must be between {MIN_USERNAME_LEN} and {MAX_USERNAME_LEN} characters"
@@ -127,7 +127,7 @@ impl User {
         }
     }
 
-    fn validate_name(name: &String) -> Result<(), String> {
+    fn validate_name(name: &str) -> Result<(), String> {
         if name.len() < MIN_NAME_LEN || name.len() > MAX_NAME_LEN {
             Err(format!(
                 "Name must be between {MIN_NAME_LEN} and {MAX_NAME_LEN} characters"

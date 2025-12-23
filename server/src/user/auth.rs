@@ -81,7 +81,7 @@ impl Authenticator {
         }
     }
 
-    pub fn validate_password(password_cleartext: &String) -> Result<(), String> {
+    pub fn validate_password(password_cleartext: &str) -> Result<(), String> {
         if password_cleartext.len() < MIN_PASSWORD_LEN
             || password_cleartext.len() > MAX_PASSWORD_LEN
         {
