@@ -79,10 +79,7 @@ async fn create_user(
     State(state): State<AppState>,
     extract::Json(input): extract::Json<CreateUserInput>,
 ) -> Result<(StatusCode, axum::Json<User>), AppError> {
-    let input_errs = User::validate_create_input(&input)?;
-    if !input_errs.is_empty() {
-        return Err(AppError::InputError(input_errs));
-    }
+    User::validate_create_input(&input)?;
 
     let user = User::new(input.username, input.name, input.email);
     let authenticator = Authenticator::new_password(input.password, user.id).map_err(|e| {
@@ -170,7 +167,9 @@ async fn login(
     // requests too.
     let mut conn = state.db_pool.acquire().await?;
     // Be kind to users, throw a different error if password doesn't meet requirements
-    Authenticator::validate_password(&input.password)?;
+    if let Err(msg) = Authenticator::validate_password(&input.password) {
+        return Err(AppError::InputError(vec![msg]));
+    }
     let user = User::login(input, &mut conn).await?;
 
     // TODO: return some kind of token here. The user object is effectly useless.

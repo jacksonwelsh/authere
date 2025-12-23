@@ -81,18 +81,16 @@ impl Authenticator {
         }
     }
 
-    pub fn validate_password(password_cleartext: &String) -> Result<Option<String>, AppError> {
-        Ok(
-            if password_cleartext.len() < MIN_PASSWORD_LEN
-                || password_cleartext.len() > MAX_PASSWORD_LEN
-            {
-                Some(format!(
-                    "Password must be between {MIN_PASSWORD_LEN} and {MAX_PASSWORD_LEN} characters"
-                ))
-            } else {
-                None
-            },
-        )
+    pub fn validate_password(password_cleartext: &String) -> Result<(), String> {
+        if password_cleartext.len() < MIN_PASSWORD_LEN
+            || password_cleartext.len() > MAX_PASSWORD_LEN
+        {
+            Err(format!(
+                "Password must be between {MIN_PASSWORD_LEN} and {MAX_PASSWORD_LEN} characters"
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     async fn get_password_for(
@@ -131,11 +129,12 @@ impl DbEntity for Authenticator {
     async fn get(id: uuid::Uuid, conn: &mut SqliteConnection) -> Result<Option<Self>, AppError> {
         // Cannot use macro here as we need the custom FromRow impl which does not work with the
         // macro
-        Ok(sqlx::query_as(
-                r#"SELECT id, type, value, owner_id FROM authenticators WHERE id = ?"#,
-                ).bind(id)
-            .fetch_optional(conn)
-            .await?)
+        Ok(
+            sqlx::query_as(r#"SELECT id, type, value, owner_id FROM authenticators WHERE id = ?"#)
+                .bind(id)
+                .fetch_optional(conn)
+                .await?,
+        )
     }
 }
 
@@ -204,9 +203,8 @@ mod tests {
     #[test]
     fn validate_password_len() {
         let short_pw = (0..MIN_PASSWORD_LEN - 1).map(|_| "a").collect::<String>();
-        let got = Authenticator::validate_password(&short_pw)
-            .expect("validate_password is not ok!")
-            .expect("validate_password is not some!");
+        let got =
+            Authenticator::validate_password(&short_pw).expect_err("validate_password is not err!");
 
         let want = format!(
             "Password must be between {MIN_PASSWORD_LEN} and {MAX_PASSWORD_LEN} characters"
@@ -214,9 +212,8 @@ mod tests {
         assert_eq!(want, got);
 
         let long_pw = (0..MAX_PASSWORD_LEN + 1).map(|_| "a").collect::<String>();
-        let got = Authenticator::validate_password(&long_pw)
-            .expect("validate_password is not ok!")
-            .expect("validate_password is not some!");
+        let got =
+            Authenticator::validate_password(&long_pw).expect_err("validate_password is not err!");
 
         assert_eq!(want, got);
     }
@@ -226,15 +223,7 @@ mod tests {
         let min_pw = (0..MIN_PASSWORD_LEN).map(|_| "a").collect::<String>();
         let max_pw = (0..MAX_PASSWORD_LEN).map(|_| "a").collect::<String>();
 
-        assert!(
-            Authenticator::validate_password(&min_pw)
-                .expect("validate_password is not ok!")
-                .is_none()
-        );
-        assert!(
-            Authenticator::validate_password(&max_pw)
-                .expect("validate_password is not ok!")
-                .is_none()
-        );
+        Authenticator::validate_password(&min_pw).expect("validate_password is not ok!");
+        Authenticator::validate_password(&max_pw).expect("validate_password is not ok!");
     }
 }
