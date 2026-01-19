@@ -6,6 +6,9 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.100"
 argon2 = { version = "0.5.3", features = ["std"] }
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+sha2 = "0.10"
 axum = "0.8.7"
 ed25519-dalek = { version = "2.2.0", features = ["pkcs8", "rand_core"] }
 jsonwebtoken = { version = "10.2.0", features = ["rust_crypto"] }

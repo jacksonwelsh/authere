@@ -59,6 +59,20 @@ impl User {
         }
     }
 
+    /// Get all role names for this user
+    pub async fn get_roles(&self, conn: &mut SqliteConnection) -> AppResult<Vec<String>> {
+        let roles = sqlx::query_scalar!(
+            r#"SELECT r.name FROM roles r
+               INNER JOIN user_roles ur ON ur.role_id = r.id
+               WHERE ur.user_id = ?"#,
+            self.id
+        )
+        .fetch_all(conn)
+        .await?;
+
+        Ok(roles)
+    }
+
     pub async fn list(conn: &mut SqliteConnection) -> AppResult<Vec<User>> {
         Ok(sqlx::query_as!(
             User,
