@@ -3,10 +3,12 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use crate::audit::{log_login_failed, log_login_success, log_logout, log_token_refresh, log_user_created};
+use crate::auth_middleware::AdminUser;
 use crate::cli::{Cli, Commands};
 use crate::db::DbEntity;
 use crate::errors::AppError;
 use crate::rate_limit::{RateLimitConfig, RateLimitExceeded, RateLimiter};
+use crate::role::{CreateRoleInput, Role, UserRole};
 use crate::user::auth::token::{self, TokenPair, generate_token_pair, verify_refresh_token, revoke_refresh_token};
 use crate::user::auth::Authenticator;
 use crate::user::{CreateUserInput, LoginInput, User};
@@ -34,6 +36,7 @@ pub mod cli;
 pub mod db;
 pub mod errors;
 pub mod rate_limit;
+pub mod role;
 pub mod user;
 
 #[derive(OpenApi)]
@@ -139,6 +142,14 @@ async fn main() -> Result<(), AppError> {
         .routes(routes!(login))
         .routes(routes!(refresh_token))
         .routes(routes!(logout))
+        // Role management
+        .routes(routes!(list_roles))
+        .routes(routes!(create_role))
+        .routes(routes!(delete_role))
+        // User role management
+        .routes(routes!(get_user_roles))
+        .routes(routes!(assign_role))
+        .routes(routes!(remove_role))
         .with_state(state)
         .split_for_parts();
 
@@ -203,11 +214,16 @@ async fn create_user(
     path = "/user",
     responses(
         (status = 200, description = "Lists all users on the system"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Admin access required"),
         (status = 500, description = "Internal error when listing users"),
     ),
     tag = ADMIN_TAG
 )]
-async fn get_users(State(state): State<AppState>) -> Result<axum::Json<Vec<User>>, AppError> {
+async fn get_users(
+    State(state): State<AppState>,
+    _admin: AdminUser,
+) -> Result<axum::Json<Vec<User>>, AppError> {
     let mut conn = state.db_pool.acquire().await?;
     let users = User::list(&mut conn).await?;
 
@@ -222,6 +238,8 @@ async fn get_users(State(state): State<AppState>) -> Result<axum::Json<Vec<User>
     ),
     responses(
         (status = 200, description = "Retrieved a user"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Admin access required"),
         (status = 404, description = "User not found"),
         (status = 500, description = "Internal error when getting user"),
     ),
@@ -229,6 +247,7 @@ async fn get_users(State(state): State<AppState>) -> Result<axum::Json<Vec<User>
 )]
 async fn get_user(
     State(state): State<AppState>,
+    _admin: AdminUser,
     Path(id): Path<Uuid>,
 ) -> Result<axum::Json<User>, AppError> {
     let mut conn = state.db_pool.acquire().await?;
@@ -375,4 +394,199 @@ async fn logout(
     let _ = log_logout(user_id, &ip_str, &mut conn).await;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ============================================================================
+// Role Management Endpoints
+// ============================================================================
+
+#[utoipa::path(
+    get,
+    path = "/roles",
+    responses(
+        (status = 200, description = "List all roles", body = Vec<Role>),
+        (status = 401, description = "Authentication required"),
+        (status = 500, description = "Internal server error")
+    ),
+    tag = ADMIN_TAG,
+)]
+async fn list_roles(
+    State(state): State<AppState>,
+    _admin: AdminUser,
+) -> Result<axum::Json<Vec<Role>>, AppError> {
+    let mut conn = state.db_pool.acquire().await?;
+    let roles = Role::list(&mut conn).await?;
+    Ok(axum::Json(roles))
+}
+
+#[utoipa::path(
+    post,
+    path = "/roles",
+    request_body(content = CreateRoleInput),
+    responses(
+        (status = 201, description = "Role created", body = Role),
+        (status = 400, description = "Invalid input"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Admin access required"),
+        (status = 409, description = "Role already exists"),
+        (status = 500, description = "Internal server error")
+    ),
+    tag = ADMIN_TAG,
+)]
+async fn create_role(
+    State(state): State<AppState>,
+    _admin: AdminUser,
+    extract::Json(input): extract::Json<CreateRoleInput>,
+) -> Result<(StatusCode, axum::Json<Role>), AppError> {
+    Role::validate_input(&input)?;
+
+    let role = Role::new(input.name, input.description);
+    let mut conn = state.db_pool.acquire().await?;
+    role.save(&mut conn).await?;
+
+    Ok((StatusCode::CREATED, axum::Json(role)))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/roles/{id}",
+    params(
+        ("id" = Uuid, Path, description = "Role ID")
+    ),
+    responses(
+        (status = 204, description = "Role deleted"),
+        (status = 400, description = "Cannot delete role (in use or built-in)"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Admin access required"),
+        (status = 404, description = "Role not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    tag = ADMIN_TAG,
+)]
+async fn delete_role(
+    State(state): State<AppState>,
+    _admin: AdminUser,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, AppError> {
+    let mut conn = state.db_pool.acquire().await?;
+
+    let deleted = Role::delete(id, &mut conn).await?;
+    if deleted {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(AppError::NotFound)
+    }
+}
+
+// ============================================================================
+// User Role Management Endpoints
+// ============================================================================
+
+#[utoipa::path(
+    get,
+    path = "/users/{user_id}/roles",
+    params(
+        ("user_id" = Uuid, Path, description = "User ID")
+    ),
+    responses(
+        (status = 200, description = "List user's roles", body = Vec<UserRole>),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Admin access required"),
+        (status = 404, description = "User not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    tag = ADMIN_TAG,
+)]
+async fn get_user_roles(
+    State(state): State<AppState>,
+    _admin: AdminUser,
+    Path(user_id): Path<Uuid>,
+) -> Result<axum::Json<Vec<UserRole>>, AppError> {
+    let mut conn = state.db_pool.acquire().await?;
+
+    // Check user exists
+    let user = User::get(user_id, &mut conn).await?;
+    if user.is_none() {
+        return Err(AppError::NotFound);
+    }
+
+    let roles = UserRole::get_for_user(user_id, &mut conn).await?;
+    Ok(axum::Json(roles))
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct AssignRoleInput {
+    pub role_id: Uuid,
+}
+
+#[utoipa::path(
+    post,
+    path = "/users/{user_id}/roles",
+    params(
+        ("user_id" = Uuid, Path, description = "User ID")
+    ),
+    request_body(content = AssignRoleInput),
+    responses(
+        (status = 201, description = "Role assigned"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Admin access required"),
+        (status = 404, description = "User or role not found"),
+        (status = 409, description = "Role already assigned"),
+        (status = 500, description = "Internal server error")
+    ),
+    tag = ADMIN_TAG,
+)]
+async fn assign_role(
+    State(state): State<AppState>,
+    _admin: AdminUser,
+    Path(user_id): Path<Uuid>,
+    extract::Json(input): extract::Json<AssignRoleInput>,
+) -> Result<StatusCode, AppError> {
+    let mut conn = state.db_pool.acquire().await?;
+
+    // Check user exists
+    let user = User::get(user_id, &mut conn).await?;
+    if user.is_none() {
+        return Err(AppError::NotFound);
+    }
+
+    // Check role exists
+    let role = Role::get(input.role_id, &mut conn).await?;
+    if role.is_none() {
+        return Err(AppError::NotFound);
+    }
+
+    UserRole::assign(user_id, input.role_id, &mut conn).await?;
+    Ok(StatusCode::CREATED)
+}
+
+#[utoipa::path(
+    delete,
+    path = "/users/{user_id}/roles/{role_id}",
+    params(
+        ("user_id" = Uuid, Path, description = "User ID"),
+        ("role_id" = Uuid, Path, description = "Role ID")
+    ),
+    responses(
+        (status = 204, description = "Role removed"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Admin access required"),
+        (status = 404, description = "User, role, or assignment not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    tag = ADMIN_TAG,
+)]
+async fn remove_role(
+    State(state): State<AppState>,
+    _admin: AdminUser,
+    Path((user_id, role_id)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode, AppError> {
+    let mut conn = state.db_pool.acquire().await?;
+
+    let removed = UserRole::remove(user_id, role_id, &mut conn).await?;
+    if removed {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(AppError::NotFound)
+    }
 }
