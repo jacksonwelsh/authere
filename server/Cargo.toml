@@ -10,6 +10,8 @@ clap = { version = "4", features = ["derive"] }
 hex = "0.4"
 sha2 = "0.10"
 axum = "0.8.7"
+axum-extra = { version = "0.10", features = ["typed-header"] }
+headers = "0.4"
 ed25519-dalek = { version = "2.2.0", features = ["pkcs8", "rand_core"] }
 jsonwebtoken = { version = "10.2.0", features = ["rust_crypto"] }
 rand = "0.8"

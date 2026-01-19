@@ -1,13 +1,22 @@
 use std::env;
+use std::net::SocketAddr;
+use std::time::Duration;
 
+use crate::audit::{log_login_failed, log_login_success, log_logout, log_token_refresh, log_user_created};
+use crate::cli::{Cli, Commands};
 use crate::db::DbEntity;
 use crate::errors::AppError;
+use crate::rate_limit::{RateLimitConfig, RateLimitExceeded, RateLimiter};
 use crate::user::auth::token::{self, TokenPair, generate_token_pair, verify_refresh_token, revoke_refresh_token};
 use crate::user::auth::Authenticator;
 use crate::user::{CreateUserInput, LoginInput, User};
 
-use axum::extract::{self, Path, State};
+use axum::extract::{self, ConnectInfo, Path, State};
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum_extra::TypedHeader;
+use clap::Parser;
+use headers::UserAgent;
 use serde::Deserialize;
 use sqlx::SqlitePool;
 use utoipa::{OpenApi, ToSchema};
@@ -19,9 +28,12 @@ use uuid::Uuid;
 const ADMIN_TAG: &str = "admin";
 const AUTH_TAG: &str = "auth";
 
+pub mod audit;
 pub mod auth_middleware;
+pub mod cli;
 pub mod db;
 pub mod errors;
+pub mod rate_limit;
 pub mod user;
 
 #[derive(OpenApi)]
@@ -36,6 +48,7 @@ struct ApiDoc;
 #[derive(Clone)]
 struct AppState {
     db_pool: SqlitePool,
+    login_rate_limiter: RateLimiter,
 }
 
 impl axum::extract::FromRef<AppState> for SqlitePool {
@@ -44,8 +57,37 @@ impl axum::extract::FromRef<AppState> for SqlitePool {
     }
 }
 
+/// Error type that can be either an AppError or a RateLimitExceeded
+pub enum LoginError {
+    App(AppError),
+    RateLimit(RateLimitExceeded),
+}
+
+impl IntoResponse for LoginError {
+    fn into_response(self) -> Response {
+        match self {
+            LoginError::App(e) => e.into_response(),
+            LoginError::RateLimit(e) => e.into_response(),
+        }
+    }
+}
+
+impl From<AppError> for LoginError {
+    fn from(e: AppError) -> Self {
+        LoginError::App(e)
+    }
+}
+
+impl From<sqlx::Error> for LoginError {
+    fn from(e: sqlx::Error) -> Self {
+        LoginError::App(AppError::from(e))
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), AppError> {
+    let cli = Cli::parse();
+
     let database_url = env::var("DATABASE_URL").unwrap_or_else(|_| {
         eprintln!("DATABASE_URL not set, using default: sqlite:./data.db");
         String::from("sqlite:./data.db")
@@ -56,6 +98,40 @@ async fn main() -> Result<(), AppError> {
 
     let mut conn = db_pool.acquire().await?;
     token::try_initialize(&mut conn).await?;
+    drop(conn);
+
+    // Handle CLI commands
+    match cli.command {
+        Some(Commands::InitAdmin {
+            username,
+            password,
+            name,
+            email,
+        }) => {
+            let password = match password {
+                Some(p) => p,
+                None => cli::prompt_password().map_err(|e| {
+                    AppError::InternalError(format!("Failed to read password: {e}"))
+                })?,
+            };
+            cli::init_admin(&db_pool, username, password, name, email).await?;
+            return Ok(());
+        }
+        Some(Commands::Serve) | None => {
+            // Continue to serve
+        }
+    }
+
+    // Configure rate limiter: 5 login attempts per minute per IP
+    let login_rate_limiter = RateLimiter::new(RateLimitConfig {
+        max_requests: 5,
+        window: Duration::from_secs(60),
+    });
+
+    let state = AppState {
+        db_pool,
+        login_rate_limiter,
+    };
 
     let (router, api) = OpenApiRouter::with_openapi(ApiDoc::openapi())
         .routes(routes!(create_user, get_users))
@@ -63,13 +139,16 @@ async fn main() -> Result<(), AppError> {
         .routes(routes!(login))
         .routes(routes!(refresh_token))
         .routes(routes!(logout))
-        .with_state(AppState { db_pool })
+        .with_state(state)
         .split_for_parts();
 
     let router = router.merge(SwaggerUi::new("/docs").url("/apidoc/openapi.json", api));
 
+    println!("Starting server on 0.0.0.0:3000");
+    println!("Swagger UI available at http://localhost:3000/docs");
+
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
-    Ok(axum::serve(listener, router).await?)
+    Ok(axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).await?)
 }
 
 #[utoipa::path(
@@ -94,8 +173,10 @@ async fn main() -> Result<(), AppError> {
 )]
 async fn create_user(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     extract::Json(input): extract::Json<CreateUserInput>,
 ) -> Result<(StatusCode, axum::Json<User>), AppError> {
+    let ip_str = addr.ip().to_string();
     User::validate_create_input(&input)?;
 
     let user = User::new(input.username, input.name, input.email);
@@ -109,7 +190,10 @@ async fn create_user(
     user.save(&mut tx).await?;
     authenticator.save(&mut tx).await?;
     tx.commit().await?;
-    // TODO: implement idempotency
+
+    // Log user creation (no actor_id since this is self-registration or unauthenticated)
+    let mut conn = state.db_pool.acquire().await?;
+    let _ = log_user_created(user.id, None, &ip_str, &mut conn).await;
 
     Ok((StatusCode::CREATED, axum::Json(user)))
 }
@@ -170,26 +254,50 @@ async fn get_user(
         (status = 200, description = "Successful login", body = TokenPair),
         (status = 400, description = "Invalid username or password"),
         (status = 401, description = "Incorrect username or password"),
+        (status = 429, description = "Too many login attempts"),
         (status = 500, description = "Internal server error")
     ),
     tag = AUTH_TAG,
 )]
 async fn login(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    user_agent: Option<TypedHeader<UserAgent>>,
     extract::Json(input): extract::Json<LoginInput>,
-) -> Result<axum::Json<TokenPair>, AppError> {
-    // TODO: there's a distinctly different latency between requests where a user is found and a
-    // user is not, due to password hashing (10ms vs 300ms). Need to slow down user-not-found
-    // requests to deter enumeration attacks, maybe add some jitter to user-found requests too.
+) -> Result<axum::Json<TokenPair>, LoginError> {
+    let client_ip = addr.ip();
+    let ip_str = client_ip.to_string();
+    let ua_str = user_agent.map(|h| h.to_string());
+
+    // Check rate limit before processing
+    if let Err(retry_after) = state.login_rate_limiter.check(client_ip).await {
+        return Err(LoginError::RateLimit(RateLimitExceeded { retry_after }));
+    }
+
     let mut conn = state.db_pool.acquire().await?;
     // Be kind to users, throw a different error if password doesn't meet requirements
     if let Err(msg) = Authenticator::validate_password(&input.password) {
-        return Err(AppError::InputError(vec![msg]));
+        return Err(AppError::InputError(vec![msg]).into());
     }
-    let user = User::login(input, &mut conn).await?;
-    let roles = user.get_roles(&mut conn).await?;
 
+    let username = input.username.clone();
+    let user = match User::login(input, &mut conn).await {
+        Ok(user) => user,
+        Err(e) => {
+            // Record the failure for rate limiting purposes
+            state.login_rate_limiter.record_failure(client_ip).await;
+            // Log the failed login attempt
+            let _ = log_login_failed(&username, &ip_str, ua_str, &mut conn).await;
+            return Err(e.into());
+        }
+    };
+
+    let roles = user.get_roles(&mut conn).await?;
     let token_pair = generate_token_pair(user.id, roles, &mut conn).await?;
+
+    // Log successful login
+    let _ = log_login_success(user.id, &ip_str, ua_str, &mut conn).await;
+
     Ok(axum::Json(token_pair))
 }
 
@@ -211,8 +319,10 @@ pub struct RefreshTokenInput {
 )]
 async fn refresh_token(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     extract::Json(input): extract::Json<RefreshTokenInput>,
 ) -> Result<axum::Json<TokenPair>, AppError> {
+    let ip_str = addr.ip().to_string();
     let mut conn = state.db_pool.acquire().await?;
 
     // Verify the refresh token and get the user ID
@@ -229,6 +339,10 @@ async fn refresh_token(
 
     // Generate new token pair
     let token_pair = generate_token_pair(user_id, roles, &mut conn).await?;
+
+    // Log the token refresh
+    let _ = log_token_refresh(user_id, &ip_str, &mut conn).await;
+
     Ok(axum::Json(token_pair))
 }
 
@@ -245,12 +359,20 @@ async fn refresh_token(
 )]
 async fn logout(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     extract::Json(input): extract::Json<RefreshTokenInput>,
 ) -> Result<StatusCode, AppError> {
+    let ip_str = addr.ip().to_string();
     let mut conn = state.db_pool.acquire().await?;
+
+    // Verify the refresh token to get the user ID for logging
+    let user_id = verify_refresh_token(&input.refresh_token, &mut conn).await?;
 
     // Revoke the refresh token
     revoke_refresh_token(&input.refresh_token, &mut conn).await?;
+
+    // Log the logout
+    let _ = log_logout(user_id, &ip_str, &mut conn).await;
 
     Ok(StatusCode::NO_CONTENT)
 }

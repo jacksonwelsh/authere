@@ -124,7 +124,7 @@ impl User {
         .await?)
     }
 
-    fn validate_username(username: &str) -> Result<(), String> {
+    pub fn validate_username(username: &str) -> Result<(), String> {
         if username.len() < MIN_USERNAME_LEN || username.len() > MAX_USERNAME_LEN {
             Err(format!(
                 "Username must be between {MIN_USERNAME_LEN} and {MAX_USERNAME_LEN} characters"
@@ -141,7 +141,7 @@ impl User {
         }
     }
 
-    fn validate_name(name: &str) -> Result<(), String> {
+    pub fn validate_name(name: &str) -> Result<(), String> {
         if name.len() < MIN_NAME_LEN || name.len() > MAX_NAME_LEN {
             Err(format!(
                 "Name must be between {MIN_NAME_LEN} and {MAX_NAME_LEN} characters"
@@ -151,7 +151,7 @@ impl User {
         }
     }
 
-    fn validate_email(email: &Option<String>) -> Result<(), String> {
+    pub fn validate_email(email: &Option<String>) -> Result<(), String> {
         match email {
             None => Ok(()),
             Some(email) if email.len() > MAX_EMAIL_LEN => Err(format!(
