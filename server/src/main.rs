@@ -1,8 +1,8 @@
 use std::env;
-use std::io;
 
 use crate::db::DbEntity;
 use crate::errors::AppError;
+use crate::user::auth;
 use crate::user::auth::Authenticator;
 use crate::user::{CreateUserInput, LoginInput, User};
 
@@ -37,7 +37,7 @@ struct AppState {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), io::Error> {
+async fn main() -> Result<(), AppError> {
     let database_url = env::var("DATABASE_URL").unwrap_or_else(|_| {
         eprintln!("DATABASE_URL not set, using default: sqlite:./data.db");
         String::from("sqlite:./data.db")
@@ -45,6 +45,9 @@ async fn main() -> Result<(), io::Error> {
     let db_pool = SqlitePool::connect(&database_url)
         .await
         .expect("Could not connect to sqlite!");
+
+    let mut conn = db_pool.acquire().await?;
+    auth::token::try_initialize(&mut conn).await?;
 
     // add a single route
     let (router, api) = OpenApiRouter::with_openapi(ApiDoc::openapi())
@@ -57,7 +60,7 @@ async fn main() -> Result<(), io::Error> {
     let router = router.merge(SwaggerUi::new("/docs").url("/apidoc/openapi.json", api));
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
-    axum::serve(listener, router).await
+    Ok(axum::serve(listener, router).await?)
 }
 
 #[utoipa::path(

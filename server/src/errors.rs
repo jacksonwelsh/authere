@@ -1,3 +1,4 @@
+use std::io;
 use axum::{http::StatusCode, response::IntoResponse};
 use sqlx::error::ErrorKind::UniqueViolation;
 
@@ -79,6 +80,12 @@ impl From<sqlx::Error> for AppError {
 
 impl From<regex::Error> for AppError {
     fn from(err: regex::Error) -> Self {
+        AppError::InternalError(err.to_string())
+    }
+}
+
+impl From<io::Error> for AppError {
+    fn from(err: io::Error) -> Self {
         AppError::InternalError(err.to_string())
     }
 }
