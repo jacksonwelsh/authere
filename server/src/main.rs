@@ -2,6 +2,7 @@ use std::env;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use crate::application::{Application, CreateApplicationInput, UpdateApplicationInput};
 use crate::audit::{log_login_failed, log_login_success, log_logout, log_token_refresh, log_user_created};
 use crate::auth_middleware::AdminUser;
 use crate::cli::{Cli, Commands};
@@ -9,17 +10,17 @@ use crate::db::DbEntity;
 use crate::errors::AppError;
 use crate::rate_limit::{RateLimitConfig, RateLimitExceeded, RateLimiter};
 use crate::role::{CreateRoleInput, Role, UserRole};
-use crate::user::auth::token::{self, TokenPair, generate_token_pair, verify_refresh_token, revoke_refresh_token};
+use crate::user::auth::token::{self, TokenPair, generate_token_pair, verify_access_token, verify_refresh_token, revoke_refresh_token};
 use crate::user::auth::Authenticator;
 use crate::user::{CreateUserInput, LoginInput, User};
 
-use axum::extract::{self, ConnectInfo, Path, State};
+use axum::extract::{self, ConnectInfo, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum_extra::TypedHeader;
 use clap::Parser;
 use headers::UserAgent;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
@@ -30,6 +31,7 @@ use uuid::Uuid;
 const ADMIN_TAG: &str = "admin";
 const AUTH_TAG: &str = "auth";
 
+pub mod application;
 pub mod audit;
 pub mod auth_middleware;
 pub mod cli;
@@ -150,6 +152,17 @@ async fn main() -> Result<(), AppError> {
         .routes(routes!(get_user_roles))
         .routes(routes!(assign_role))
         .routes(routes!(remove_role))
+        // Application management
+        .routes(routes!(list_applications))
+        .routes(routes!(create_application))
+        .routes(routes!(get_application))
+        .routes(routes!(update_application))
+        .routes(routes!(delete_application))
+        // Forward auth
+        .routes(routes!(verify_auth))
+        // Browser-friendly auth
+        .routes(routes!(browser_login))
+        .routes(routes!(browser_logout))
         .with_state(state)
         .split_for_parts();
 
@@ -323,6 +336,34 @@ async fn login(
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct RefreshTokenInput {
     pub refresh_token: String,
+}
+
+/// Cookie configuration
+const AUTH_COOKIE_NAME: &str = "authere_token";
+const REFRESH_COOKIE_NAME: &str = "authere_refresh";
+
+/// Build Set-Cookie header for authentication
+fn build_auth_cookie(token: &str, max_age_secs: i64) -> String {
+    format!(
+        "{}={}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age={}",
+        AUTH_COOKIE_NAME, token, max_age_secs
+    )
+}
+
+/// Build Set-Cookie header for refresh token
+fn build_refresh_cookie(token: &str, max_age_secs: i64) -> String {
+    format!(
+        "{}={}; HttpOnly; Secure; SameSite=Lax; Path=/auth; Max-Age={}",
+        REFRESH_COOKIE_NAME, token, max_age_secs
+    )
+}
+
+/// Clear authentication cookies
+fn clear_auth_cookies() -> Vec<String> {
+    vec![
+        format!("{}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0", AUTH_COOKIE_NAME),
+        format!("{}=; HttpOnly; Secure; SameSite=Lax; Path=/auth; Max-Age=0", REFRESH_COOKIE_NAME),
+    ]
 }
 
 #[utoipa::path(
@@ -589,4 +630,452 @@ async fn remove_role(
     } else {
         Err(AppError::NotFound)
     }
+}
+
+// ============================================================================
+// Application Management Endpoints
+// ============================================================================
+
+#[utoipa::path(
+    get,
+    path = "/applications",
+    responses(
+        (status = 200, description = "List all applications", body = Vec<Application>),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Admin access required"),
+        (status = 500, description = "Internal server error")
+    ),
+    tag = ADMIN_TAG,
+)]
+async fn list_applications(
+    State(state): State<AppState>,
+    _admin: AdminUser,
+) -> Result<axum::Json<Vec<Application>>, AppError> {
+    let mut conn = state.db_pool.acquire().await?;
+    let apps = Application::list(&mut conn).await?;
+    Ok(axum::Json(apps))
+}
+
+#[utoipa::path(
+    post,
+    path = "/applications",
+    request_body(content = CreateApplicationInput),
+    responses(
+        (status = 201, description = "Application created", body = Application),
+        (status = 400, description = "Invalid input"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Admin access required"),
+        (status = 409, description = "Application with that slug already exists"),
+        (status = 500, description = "Internal server error")
+    ),
+    tag = ADMIN_TAG,
+)]
+async fn create_application(
+    State(state): State<AppState>,
+    _admin: AdminUser,
+    extract::Json(input): extract::Json<CreateApplicationInput>,
+) -> Result<(StatusCode, axum::Json<Application>), AppError> {
+    Application::validate_input(&input)?;
+
+    let app = Application::new(input);
+    let mut conn = state.db_pool.acquire().await?;
+    app.save(&mut conn).await?;
+
+    Ok((StatusCode::CREATED, axum::Json(app)))
+}
+
+#[utoipa::path(
+    get,
+    path = "/applications/{id}",
+    params(
+        ("id" = Uuid, Path, description = "Application ID")
+    ),
+    responses(
+        (status = 200, description = "Application details", body = Application),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Admin access required"),
+        (status = 404, description = "Application not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    tag = ADMIN_TAG,
+)]
+async fn get_application(
+    State(state): State<AppState>,
+    _admin: AdminUser,
+    Path(id): Path<Uuid>,
+) -> Result<axum::Json<Application>, AppError> {
+    let mut conn = state.db_pool.acquire().await?;
+    let app = Application::get(id, &mut conn).await?;
+
+    match app {
+        Some(app) => Ok(axum::Json(app)),
+        None => Err(AppError::NotFound),
+    }
+}
+
+#[utoipa::path(
+    put,
+    path = "/applications/{id}",
+    params(
+        ("id" = Uuid, Path, description = "Application ID")
+    ),
+    request_body(content = UpdateApplicationInput),
+    responses(
+        (status = 200, description = "Application updated", body = Application),
+        (status = 400, description = "Invalid input"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Admin access required"),
+        (status = 404, description = "Application not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    tag = ADMIN_TAG,
+)]
+async fn update_application(
+    State(state): State<AppState>,
+    _admin: AdminUser,
+    Path(id): Path<Uuid>,
+    extract::Json(input): extract::Json<UpdateApplicationInput>,
+) -> Result<axum::Json<Application>, AppError> {
+    let mut conn = state.db_pool.acquire().await?;
+    let mut app = Application::get(id, &mut conn)
+        .await?
+        .ok_or(AppError::NotFound)?;
+
+    app.update(input, &mut conn).await?;
+    Ok(axum::Json(app))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/applications/{id}",
+    params(
+        ("id" = Uuid, Path, description = "Application ID")
+    ),
+    responses(
+        (status = 204, description = "Application deleted"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Admin access required"),
+        (status = 404, description = "Application not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    tag = ADMIN_TAG,
+)]
+async fn delete_application(
+    State(state): State<AppState>,
+    _admin: AdminUser,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, AppError> {
+    let mut conn = state.db_pool.acquire().await?;
+
+    let deleted = Application::delete(id, &mut conn).await?;
+    if deleted {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(AppError::NotFound)
+    }
+}
+
+// ============================================================================
+// Forward Auth Endpoint
+// ============================================================================
+
+use axum::http::header::{HeaderMap, HeaderName, HeaderValue};
+
+/// Response headers for successful forward auth
+fn build_auth_headers(user: &User, roles: &[String], email: Option<&str>) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+
+    headers.insert(
+        HeaderName::from_static("x-auth-user"),
+        HeaderValue::from_str(&user.id.to_string()).unwrap_or_else(|_| HeaderValue::from_static("")),
+    );
+
+    headers.insert(
+        HeaderName::from_static("x-auth-username"),
+        HeaderValue::from_str(&user.username).unwrap_or_else(|_| HeaderValue::from_static("")),
+    );
+
+    headers.insert(
+        HeaderName::from_static("x-auth-roles"),
+        HeaderValue::from_str(&roles.join(",")).unwrap_or_else(|_| HeaderValue::from_static("")),
+    );
+
+    if let Some(email) = email {
+        if let Ok(value) = HeaderValue::from_str(email) {
+            headers.insert(HeaderName::from_static("x-auth-email"), value);
+        }
+    }
+
+    headers
+}
+
+#[utoipa::path(
+    get,
+    path = "/auth/verify",
+    responses(
+        (status = 200, description = "Authenticated and authorized"),
+        (status = 401, description = "Not authenticated"),
+        (status = 403, description = "Not authorized for this application"),
+        (status = 500, description = "Internal server error")
+    ),
+    tag = AUTH_TAG,
+)]
+async fn verify_auth(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, HeaderMap), AppError> {
+    let mut conn = state.db_pool.acquire().await?;
+
+    // Extract the Authorization header
+    let auth_header = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok());
+
+    // Also check for cookie-based auth (for browser requests)
+    let cookie_token = headers
+        .get("cookie")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|cookies| {
+            cookies
+                .split(';')
+                .map(|s| s.trim())
+                .find(|s| s.starts_with("authere_token="))
+                .map(|s| s.strip_prefix("authere_token=").unwrap_or(""))
+        });
+
+    // Get the token from either source
+    let token = auth_header
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .or(cookie_token)
+        .ok_or(AppError::AuthenticationRequired)?;
+
+    // Verify the token
+    let claims = verify_access_token(token, &mut conn).await?;
+
+    let user_id = Uuid::parse_str(&claims.sub)
+        .map_err(|_| AppError::InternalError("Invalid user ID in token".to_string()))?;
+
+    // Get user details
+    let user = User::get(user_id, &mut conn)
+        .await?
+        .ok_or(AppError::AuthenticationRequired)?;
+
+    // Check if there's an application that matches the request
+    let host = headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get("host"))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    let path = headers
+        .get("x-forwarded-uri")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("/");
+
+    // Find matching application
+    if let Some(app) = Application::find_matching(host, path, &mut conn).await? {
+        // Check if user has required roles
+        if !app.check_access(&claims.roles) {
+            return Err(AppError::Forbidden);
+        }
+    }
+    // If no application matches, allow access (just authentication required)
+
+    // Build response headers
+    let response_headers = build_auth_headers(&user, &claims.roles, user.email.as_deref());
+
+    Ok((StatusCode::OK, response_headers))
+}
+
+// ============================================================================
+// Browser-Friendly Auth Endpoints
+// ============================================================================
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct BrowserLoginQuery {
+    /// URL to redirect to after successful login
+    pub redirect_uri: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct BrowserLoginResponse {
+    pub success: bool,
+    pub redirect_uri: Option<String>,
+}
+
+/// Browser-friendly login that sets cookies and optionally redirects
+#[utoipa::path(
+    post,
+    path = "/auth/login",
+    request_body(content = LoginInput),
+    params(
+        ("redirect_uri" = Option<String>, Query, description = "URL to redirect to after login")
+    ),
+    responses(
+        (status = 200, description = "Login successful, cookies set"),
+        (status = 302, description = "Login successful, redirecting"),
+        (status = 400, description = "Invalid input"),
+        (status = 401, description = "Invalid credentials"),
+        (status = 429, description = "Too many login attempts"),
+        (status = 500, description = "Internal server error")
+    ),
+    tag = AUTH_TAG,
+)]
+async fn browser_login(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    user_agent: Option<TypedHeader<UserAgent>>,
+    Query(query): Query<BrowserLoginQuery>,
+    extract::Json(input): extract::Json<LoginInput>,
+) -> Result<Response, LoginError> {
+    let client_ip = addr.ip();
+    let ip_str = client_ip.to_string();
+    let ua_str = user_agent.map(|h| h.to_string());
+
+    // Check rate limit
+    if let Err(retry_after) = state.login_rate_limiter.check(client_ip).await {
+        return Err(LoginError::RateLimit(RateLimitExceeded { retry_after }));
+    }
+
+    let mut conn = state.db_pool.acquire().await?;
+
+    if let Err(msg) = Authenticator::validate_password(&input.password) {
+        return Err(AppError::InputError(vec![msg]).into());
+    }
+
+    let username = input.username.clone();
+    let user = match User::login(input, &mut conn).await {
+        Ok(user) => user,
+        Err(e) => {
+            state.login_rate_limiter.record_failure(client_ip).await;
+            let _ = log_login_failed(&username, &ip_str, ua_str, &mut conn).await;
+            return Err(e.into());
+        }
+    };
+
+    let roles = user.get_roles(&mut conn).await?;
+    let token_pair = generate_token_pair(user.id, roles, &mut conn).await?;
+
+    let _ = log_login_success(user.id, &ip_str, ua_str, &mut conn).await;
+
+    // Build response with cookies
+    let access_cookie = build_auth_cookie(&token_pair.access_token, token_pair.expires_in);
+    let refresh_cookie = build_refresh_cookie(
+        &token_pair.refresh_token,
+        crate::user::auth::token::REFRESH_TOKEN_LIFETIME,
+    );
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::SET_COOKIE,
+        access_cookie.parse().unwrap(),
+    );
+    headers.append(
+        axum::http::header::SET_COOKIE,
+        refresh_cookie.parse().unwrap(),
+    );
+
+    // If redirect_uri is provided, redirect there
+    if let Some(redirect_uri) = query.redirect_uri {
+        // Validate redirect URI (only allow relative paths or same-origin for security)
+        if redirect_uri.starts_with('/') {
+            headers.insert(
+                axum::http::header::LOCATION,
+                redirect_uri.parse().unwrap(),
+            );
+            return Ok((StatusCode::SEE_OTHER, headers).into_response());
+        }
+    }
+
+    // Return JSON response with cookies
+    Ok((
+        StatusCode::OK,
+        headers,
+        axum::Json(BrowserLoginResponse {
+            success: true,
+            redirect_uri: None,
+        }),
+    )
+        .into_response())
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct BrowserLogoutQuery {
+    /// URL to redirect to after logout
+    pub redirect_uri: Option<String>,
+}
+
+/// Browser-friendly logout that clears cookies
+#[utoipa::path(
+    post,
+    path = "/auth/browser-logout",
+    params(
+        ("redirect_uri" = Option<String>, Query, description = "URL to redirect to after logout")
+    ),
+    responses(
+        (status = 200, description = "Logged out, cookies cleared"),
+        (status = 302, description = "Logged out, redirecting"),
+        (status = 500, description = "Internal server error")
+    ),
+    tag = AUTH_TAG,
+)]
+async fn browser_logout(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(query): Query<BrowserLogoutQuery>,
+) -> Result<Response, AppError> {
+    let ip_str = addr.ip().to_string();
+    let mut conn = state.db_pool.acquire().await?;
+
+    // Try to get the refresh token from cookies to revoke it
+    let refresh_token = headers
+        .get("cookie")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|cookies| {
+            cookies
+                .split(';')
+                .map(|s| s.trim())
+                .find(|s| s.starts_with("authere_refresh="))
+                .map(|s| s.strip_prefix("authere_refresh=").unwrap_or(""))
+        });
+
+    // If we have a refresh token, try to revoke it and log the logout
+    if let Some(token) = refresh_token {
+        if let Ok(user_id) = verify_refresh_token(token, &mut conn).await {
+            let _ = revoke_refresh_token(token, &mut conn).await;
+            let _ = log_logout(user_id, &ip_str, &mut conn).await;
+        }
+    }
+
+    // Clear cookies
+    let clear_cookies = clear_auth_cookies();
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::SET_COOKIE,
+        clear_cookies[0].parse().unwrap(),
+    );
+    headers.append(
+        axum::http::header::SET_COOKIE,
+        clear_cookies[1].parse().unwrap(),
+    );
+
+    // If redirect_uri is provided, redirect there
+    if let Some(redirect_uri) = query.redirect_uri {
+        if redirect_uri.starts_with('/') {
+            headers.insert(
+                axum::http::header::LOCATION,
+                redirect_uri.parse().unwrap(),
+            );
+            return Ok((StatusCode::SEE_OTHER, headers).into_response());
+        }
+    }
+
+    Ok((
+        StatusCode::OK,
+        headers,
+        axum::Json(serde_json::json!({ "success": true })),
+    )
+        .into_response())
 }
