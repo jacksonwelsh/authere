@@ -1,6 +1,6 @@
 use std::sync::LazyLock;
 
-use crate::User;
+use crate::user::User;
 use crate::{db::DbEntity, errors::AppError};
 
 use argon2::{
@@ -272,5 +272,62 @@ mod tests {
 
         Authenticator::validate_password(&min_pw).expect("validate_password is not ok!");
         Authenticator::validate_password(&max_pw).expect("validate_password is not ok!");
+    }
+
+    #[test]
+    fn dummy_password_check_does_not_panic() {
+        Authenticator::dummy_password_check();
+        Authenticator::dummy_password_check();
+    }
+
+    #[test]
+    fn new_password_authenticator_has_correct_fields() {
+        let owner_id = Uuid::now_v7();
+        let auth = Authenticator::new_password("valid_password_12".into(), owner_id).unwrap();
+        assert_eq!(auth.owner_id, owner_id);
+        assert!(matches!(auth.scheme, AuthenticationScheme::Password(_)));
+    }
+
+    #[test]
+    fn new_password_produces_unique_hashes() {
+        let owner_id = Uuid::now_v7();
+        let a1 = Authenticator::new_password("same_password_12".into(), owner_id).unwrap();
+        let a2 = Authenticator::new_password("same_password_12".into(), owner_id).unwrap();
+
+        let h1 = match &a1.scheme {
+            AuthenticationScheme::Password(h) => h.clone(),
+            _ => panic!("wrong scheme"),
+        };
+        let h2 = match &a2.scheme {
+            AuthenticationScheme::Password(h) => h.clone(),
+            _ => panic!("wrong scheme"),
+        };
+        assert_ne!(h1, h2, "different salts should produce different hashes");
+    }
+
+    #[test]
+    fn new_password_generates_unique_ids() {
+        let owner = Uuid::now_v7();
+        let a1 = Authenticator::new_password("password1234".into(), owner).unwrap();
+        let a2 = Authenticator::new_password("password1234".into(), owner).unwrap();
+        assert_ne!(a1.id, a2.id);
+    }
+
+    #[test]
+    fn verify_password_wrong_scheme() {
+        let auth = Authenticator {
+            id: Uuid::now_v7(),
+            scheme: AuthenticationScheme::Totp("seed123".into()),
+            owner_id: Uuid::now_v7(),
+        };
+        let err = auth.verify_password("anything").unwrap_err();
+        assert!(err.downcast_ref::<AuthenticationError>().is_some());
+    }
+
+    #[test]
+    fn authentication_error_display() {
+        let err = AuthenticationError::MismatchedAuthenticationScheme("Password".into());
+        let msg = format!("{err}");
+        assert!(msg.contains("Password"));
     }
 }

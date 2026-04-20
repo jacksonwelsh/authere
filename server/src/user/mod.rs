@@ -373,4 +373,76 @@ mod tests {
         // Messages are tested elsewhere, just make sure we're collecting something here.
         assert_eq!(4, errs.len());
     }
+
+    #[test]
+    fn user_new_generates_id() {
+        let u1 = User::new("alice".into(), "Alice".into(), None);
+        let u2 = User::new("bob".into(), "Bob".into(), None);
+        assert_ne!(u1.id, u2.id);
+    }
+
+    #[test]
+    fn user_new_stores_fields() {
+        let user = User::new(
+            "alice".into(),
+            "Alice Smith".into(),
+            Some("alice@test.com".into()),
+        );
+        assert_eq!(user.username, "alice");
+        assert_eq!(user.name, "Alice Smith");
+        assert_eq!(user.email, Some("alice@test.com".into()));
+    }
+
+    #[test]
+    fn user_new_no_email() {
+        let user = User::new("bob".into(), "Bob".into(), None);
+        assert!(user.email.is_none());
+    }
+
+    #[test]
+    fn user_serialization_roundtrip() {
+        let user = User::new("test".into(), "Test User".into(), Some("t@t.co".into()));
+        let json = serde_json::to_string(&user).unwrap();
+        let deserialized: User = serde_json::from_str(&json).unwrap();
+        assert_eq!(user.id, deserialized.id);
+        assert_eq!(user.username, deserialized.username);
+        assert_eq!(user.name, deserialized.name);
+        assert_eq!(user.email, deserialized.email);
+    }
+
+    #[test]
+    fn validate_input_no_email_is_ok() {
+        let input = CreateUserInput {
+            username: String::from("user"),
+            name: String::from("Test User"),
+            email: None,
+            password: String::from("hunter2hunter2"),
+        };
+        User::validate_create_input(&input).expect("should be valid without email");
+    }
+
+    #[test]
+    fn validate_username_dots_and_dashes() {
+        User::validate_username("user.name-123").unwrap();
+    }
+
+    #[test]
+    fn validate_username_uppercase() {
+        User::validate_username("UserName").unwrap();
+    }
+
+    #[test]
+    fn validate_username_only_numbers() {
+        User::validate_username("12345").unwrap();
+    }
+
+    #[test]
+    fn validate_email_subdomain() {
+        User::validate_email(&Some("user@mail.example.co.uk".into())).unwrap();
+    }
+
+    #[test]
+    fn validate_email_plus_addressing() {
+        User::validate_email(&Some("user+tag@example.com".into())).unwrap();
+    }
 }

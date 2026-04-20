@@ -201,4 +201,111 @@ mod tests {
         // Now should succeed again
         assert!(limiter.check(ip).await.is_ok());
     }
+
+    #[tokio::test]
+    async fn test_record_failure_counts_toward_limit() {
+        let config = RateLimitConfig {
+            max_requests: 2,
+            window: Duration::from_secs(60),
+        };
+        let limiter = RateLimiter::new(config);
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+
+        limiter.record_failure(ip).await;
+        limiter.record_failure(ip).await;
+
+        assert!(limiter.check(ip).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_record_failure_resets_window() {
+        let config = RateLimitConfig {
+            max_requests: 1,
+            window: Duration::from_millis(50),
+        };
+        let limiter = RateLimiter::new(config);
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+
+        limiter.record_failure(ip).await;
+        assert!(limiter.check(ip).await.is_err());
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        limiter.record_failure(ip).await;
+        let entries = limiter.entries.read().await;
+        assert_eq!(entries.get(&ip).unwrap().count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_removes_expired() {
+        let config = RateLimitConfig {
+            max_requests: 1,
+            window: Duration::from_millis(50),
+        };
+        let limiter = RateLimiter::new(config);
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+
+        limiter.check(ip).await.ok();
+        {
+            let entries = limiter.entries.read().await;
+            assert_eq!(entries.len(), 1);
+        }
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        limiter.cleanup().await;
+
+        let entries = limiter.entries.read().await;
+        assert_eq!(entries.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_keeps_active() {
+        let config = RateLimitConfig {
+            max_requests: 5,
+            window: Duration::from_secs(60),
+        };
+        let limiter = RateLimiter::new(config);
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+
+        limiter.check(ip).await.ok();
+        limiter.cleanup().await;
+
+        let entries = limiter.entries.read().await;
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn test_rate_limit_config_default() {
+        let config = RateLimitConfig::default();
+        assert_eq!(config.max_requests, 5);
+        assert_eq!(config.window, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn test_rate_limit_exceeded_into_response() {
+        let exceeded = RateLimitExceeded {
+            retry_after: Duration::from_secs(42),
+        };
+        let resp = exceeded.into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers().get("Retry-After").unwrap().to_str().unwrap(),
+            "42"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rate_limiter_err_returns_retry_after() {
+        let config = RateLimitConfig {
+            max_requests: 1,
+            window: Duration::from_secs(60),
+        };
+        let limiter = RateLimiter::new(config);
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+
+        limiter.check(ip).await.ok();
+        let retry_after = limiter.check(ip).await.unwrap_err();
+        assert!(retry_after.as_secs() > 0);
+        assert!(retry_after.as_secs() <= 60);
+    }
 }

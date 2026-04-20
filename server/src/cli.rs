@@ -1,8 +1,10 @@
 use clap::{Parser, Subcommand};
 use sqlx::SqlitePool;
+use tracing::info;
 
 use crate::db::DbEntity;
 use crate::errors::AppError;
+use crate::role::{Role, ROLE_ADMIN};
 use crate::user::auth::Authenticator;
 use crate::user::User;
 
@@ -47,7 +49,6 @@ pub async fn init_admin(
     name: String,
     email: Option<String>,
 ) -> Result<(), AppError> {
-    // Validate input
     if let Err(e) = User::validate_username(&username) {
         return Err(AppError::InputError(vec![e]));
     }
@@ -63,7 +64,6 @@ pub async fn init_admin(
 
     let mut conn = pool.acquire().await?;
 
-    // Check if admin user already exists
     let existing_admins = sqlx::query_scalar!(
         r#"SELECT COUNT(*) as count FROM user_roles ur
            INNER JOIN roles r ON ur.role_id = r.id
@@ -78,7 +78,10 @@ pub async fn init_admin(
         ));
     }
 
-    // Create the user
+    let admin_role = Role::get_by_name(ROLE_ADMIN, &mut conn)
+        .await?
+        .ok_or_else(|| AppError::InternalError("Admin role not found in database".to_string()))?;
+
     let user = User::new(username.clone(), name, email);
     let authenticator = Authenticator::new_password(password, user.id).map_err(|e| {
         AppError::InternalError(format!(
@@ -90,25 +93,17 @@ pub async fn init_admin(
     user.save(&mut tx).await?;
     authenticator.save(&mut tx).await?;
 
-    // Assign admin role
-    // The admin role ID is fixed in the migration
-    let admin_role_id: Vec<u8> = vec![
-        0x01, 0x91, 0xf9, 0xb0, 0xa0, 0xb0, 0x7a, 0x8f, 0x9c, 0x4d, 0x5e, 0x6f, 0x7a, 0x8b, 0x9c,
-        0x0d,
-    ];
-
     sqlx::query!(
         "INSERT INTO user_roles (user_id, role_id) VALUES (?, ?)",
         user.id,
-        admin_role_id
+        admin_role.id
     )
     .execute(&mut *tx)
     .await?;
 
     tx.commit().await?;
 
-    println!("Admin user '{}' created successfully.", username);
-    println!("User ID: {}", user.id);
+    info!(username = %username, user_id = %user.id, "admin user created via CLI");
 
     Ok(())
 }

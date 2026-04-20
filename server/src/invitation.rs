@@ -212,3 +212,205 @@ impl Invitation {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_invitation(
+        max_uses: Option<i64>,
+        uses: i64,
+        expires_at: Option<i64>,
+    ) -> Invitation {
+        Invitation {
+            id: "test-id".into(),
+            created_by: Uuid::nil(),
+            label: None,
+            max_uses,
+            uses,
+            expires_at,
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn is_valid_no_constraints() {
+        let inv = make_invitation(None, 0, None);
+        assert!(inv.is_valid());
+    }
+
+    #[test]
+    fn is_valid_under_max_uses() {
+        let inv = make_invitation(Some(5), 3, None);
+        assert!(inv.is_valid());
+    }
+
+    #[test]
+    fn is_valid_exhausted_uses() {
+        let inv = make_invitation(Some(5), 5, None);
+        assert!(!inv.is_valid());
+    }
+
+    #[test]
+    fn is_valid_over_max_uses() {
+        let inv = make_invitation(Some(5), 6, None);
+        assert!(!inv.is_valid());
+    }
+
+    #[test]
+    fn is_valid_not_expired() {
+        let future = current_timestamp() + 3600;
+        let inv = make_invitation(None, 0, Some(future));
+        assert!(inv.is_valid());
+    }
+
+    #[test]
+    fn is_valid_expired() {
+        let past = current_timestamp() - 3600;
+        let inv = make_invitation(None, 0, Some(past));
+        assert!(!inv.is_valid());
+    }
+
+    #[test]
+    fn is_valid_expired_and_exhausted() {
+        let past = current_timestamp() - 3600;
+        let inv = make_invitation(Some(1), 1, Some(past));
+        assert!(!inv.is_valid());
+    }
+
+    #[test]
+    fn is_valid_not_expired_but_exhausted() {
+        let future = current_timestamp() + 3600;
+        let inv = make_invitation(Some(1), 1, Some(future));
+        assert!(!inv.is_valid());
+    }
+
+    #[test]
+    fn validate_input_ok_minimal() {
+        let input = CreateInvitationInput {
+            label: None,
+            max_uses: None,
+            expires_at: None,
+        };
+        assert!(Invitation::validate_input(&input).is_ok());
+    }
+
+    #[test]
+    fn validate_input_ok_with_all_fields() {
+        let input = CreateInvitationInput {
+            label: Some("Welcome".into()),
+            max_uses: Some(10),
+            expires_at: Some(current_timestamp() + 86400),
+        };
+        assert!(Invitation::validate_input(&input).is_ok());
+    }
+
+    #[test]
+    fn validate_input_max_uses_zero() {
+        let input = CreateInvitationInput {
+            label: None,
+            max_uses: Some(0),
+            expires_at: None,
+        };
+        assert!(Invitation::validate_input(&input).is_err());
+    }
+
+    #[test]
+    fn validate_input_max_uses_negative() {
+        let input = CreateInvitationInput {
+            label: None,
+            max_uses: Some(-1),
+            expires_at: None,
+        };
+        assert!(Invitation::validate_input(&input).is_err());
+    }
+
+    #[test]
+    fn validate_input_expires_in_past() {
+        let input = CreateInvitationInput {
+            label: None,
+            max_uses: None,
+            expires_at: Some(1000),
+        };
+        assert!(Invitation::validate_input(&input).is_err());
+    }
+
+    #[test]
+    fn validate_input_label_too_long() {
+        let input = CreateInvitationInput {
+            label: Some("a".repeat(129)),
+            max_uses: None,
+            expires_at: None,
+        };
+        assert!(Invitation::validate_input(&input).is_err());
+    }
+
+    #[test]
+    fn validate_input_label_at_max_length() {
+        let input = CreateInvitationInput {
+            label: Some("a".repeat(128)),
+            max_uses: None,
+            expires_at: None,
+        };
+        assert!(Invitation::validate_input(&input).is_ok());
+    }
+
+    #[test]
+    fn validate_input_multiple_errors() {
+        let input = CreateInvitationInput {
+            label: Some("a".repeat(129)),
+            max_uses: Some(0),
+            expires_at: Some(1000),
+        };
+        let err = Invitation::validate_input(&input).unwrap_err();
+        if let AppError::InputError(errs) = err {
+            assert_eq!(errs.len(), 3);
+        } else {
+            panic!("Expected InputError");
+        }
+    }
+
+    #[test]
+    fn generate_id_is_64_hex_chars() {
+        let id = generate_id();
+        assert_eq!(id.len(), 64);
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn generate_id_is_unique() {
+        let id1 = generate_id();
+        let id2 = generate_id();
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn new_invitation_defaults() {
+        let input = CreateInvitationInput {
+            label: Some("Test".into()),
+            max_uses: Some(5),
+            expires_at: None,
+        };
+        let creator = Uuid::nil();
+        let inv = Invitation::new(input, creator);
+
+        assert_eq!(inv.created_by, creator);
+        assert_eq!(inv.label, Some("Test".into()));
+        assert_eq!(inv.max_uses, Some(5));
+        assert_eq!(inv.uses, 0);
+        assert!(inv.expires_at.is_none());
+        assert_eq!(inv.id.len(), 64);
+        assert!(inv.created_at > 0);
+    }
+
+    #[test]
+    fn invitation_serialization_roundtrip() {
+        let inv = make_invitation(Some(5), 2, Some(9999999999));
+        let json = serde_json::to_string(&inv).unwrap();
+        let deserialized: Invitation = serde_json::from_str(&json).unwrap();
+        assert_eq!(inv.id, deserialized.id);
+        assert_eq!(inv.max_uses, deserialized.max_uses);
+        assert_eq!(inv.uses, deserialized.uses);
+        assert_eq!(inv.expires_at, deserialized.expires_at);
+    }
+}

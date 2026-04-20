@@ -459,4 +459,269 @@ mod tests {
 
         assert!(Application::validate_input(&input).is_err());
     }
+
+    #[test]
+    fn test_matches_host_and_path_combined() {
+        let app = Application {
+            id: Uuid::now_v7(),
+            name: "Test".to_string(),
+            slug: "test".to_string(),
+            host_pattern: Some("app.example.com".to_string()),
+            path_prefix: Some("/api/".to_string()),
+            required_roles: vec![],
+            enabled: true,
+            created_at: 0,
+            updated_at: 0,
+        };
+
+        assert!(app.matches("app.example.com", "/api/users"));
+        assert!(!app.matches("app.example.com", "/web/"));
+        assert!(!app.matches("other.example.com", "/api/users"));
+        assert!(!app.matches("other.example.com", "/web/"));
+    }
+
+    #[test]
+    fn test_matches_no_patterns() {
+        let app = Application {
+            id: Uuid::now_v7(),
+            name: "Test".to_string(),
+            slug: "test".to_string(),
+            host_pattern: None,
+            path_prefix: None,
+            required_roles: vec![],
+            enabled: true,
+            created_at: 0,
+            updated_at: 0,
+        };
+
+        assert!(app.matches("any.host", "/any/path"));
+        assert!(app.matches("", ""));
+    }
+
+    #[test]
+    fn test_matches_host_regex_anchored() {
+        let app = Application {
+            id: Uuid::now_v7(),
+            name: "Test".to_string(),
+            slug: "test".to_string(),
+            host_pattern: Some("app".to_string()),
+            path_prefix: None,
+            required_roles: vec![],
+            enabled: true,
+            created_at: 0,
+            updated_at: 0,
+        };
+
+        assert!(app.matches("app", "/"));
+        assert!(!app.matches("app.example.com", "/"));
+    }
+
+    #[test]
+    fn test_check_access_empty_user_roles() {
+        let app = Application {
+            id: Uuid::now_v7(),
+            name: "Test".to_string(),
+            slug: "test".to_string(),
+            host_pattern: None,
+            path_prefix: None,
+            required_roles: vec!["admin".to_string()],
+            enabled: true,
+            created_at: 0,
+            updated_at: 0,
+        };
+
+        assert!(!app.check_access(&[]));
+    }
+
+    #[test]
+    fn test_new_application_defaults() {
+        let input = CreateApplicationInput {
+            name: "My App".to_string(),
+            slug: "my-app".to_string(),
+            host_pattern: None,
+            path_prefix: None,
+            required_roles: None,
+            enabled: None,
+        };
+
+        let app = Application::new(input);
+        assert_eq!(app.name, "My App");
+        assert_eq!(app.slug, "my-app");
+        assert!(app.host_pattern.is_none());
+        assert!(app.path_prefix.is_none());
+        assert!(app.required_roles.is_empty());
+        assert!(app.enabled);
+        assert!(app.created_at > 0);
+        assert_eq!(app.created_at, app.updated_at);
+    }
+
+    #[test]
+    fn test_new_application_with_enabled_false() {
+        let input = CreateApplicationInput {
+            name: "App".to_string(),
+            slug: "app".to_string(),
+            host_pattern: Some("host".into()),
+            path_prefix: Some("/prefix".into()),
+            required_roles: Some(vec!["admin".into()]),
+            enabled: Some(false),
+        };
+
+        let app = Application::new(input);
+        assert!(!app.enabled);
+        assert_eq!(app.required_roles, vec!["admin".to_string()]);
+        assert_eq!(app.host_pattern, Some("host".into()));
+        assert_eq!(app.path_prefix, Some("/prefix".into()));
+    }
+
+    #[test]
+    fn test_application_row_conversion() {
+        let id = Uuid::now_v7();
+        let row = ApplicationRow {
+            id,
+            name: "Test".into(),
+            slug: "test".into(),
+            host_pattern: Some("host".into()),
+            path_prefix: Some("/prefix".into()),
+            required_roles: Some(r#"["admin","user"]"#.into()),
+            enabled: 1,
+            created_at: 100,
+            updated_at: 200,
+        };
+
+        let app = Application::from(row);
+        assert_eq!(app.id, id);
+        assert_eq!(app.name, "Test");
+        assert_eq!(app.required_roles, vec!["admin", "user"]);
+        assert!(app.enabled);
+    }
+
+    #[test]
+    fn test_application_row_conversion_null_roles() {
+        let row = ApplicationRow {
+            id: Uuid::now_v7(),
+            name: "Test".into(),
+            slug: "test".into(),
+            host_pattern: None,
+            path_prefix: None,
+            required_roles: None,
+            enabled: 0,
+            created_at: 0,
+            updated_at: 0,
+        };
+
+        let app = Application::from(row);
+        assert!(app.required_roles.is_empty());
+        assert!(!app.enabled);
+    }
+
+    #[test]
+    fn test_application_row_conversion_invalid_json_roles() {
+        let row = ApplicationRow {
+            id: Uuid::now_v7(),
+            name: "Test".into(),
+            slug: "test".into(),
+            host_pattern: None,
+            path_prefix: None,
+            required_roles: Some("not-json".into()),
+            enabled: 1,
+            created_at: 0,
+            updated_at: 0,
+        };
+
+        let app = Application::from(row);
+        assert!(app.required_roles.is_empty());
+    }
+
+    #[test]
+    fn test_validate_input_empty_name() {
+        let input = CreateApplicationInput {
+            name: "".to_string(),
+            slug: "valid".to_string(),
+            host_pattern: None,
+            path_prefix: None,
+            required_roles: None,
+            enabled: None,
+        };
+        assert!(Application::validate_input(&input).is_err());
+    }
+
+    #[test]
+    fn test_validate_input_name_too_long() {
+        let input = CreateApplicationInput {
+            name: "a".repeat(129),
+            slug: "valid".to_string(),
+            host_pattern: None,
+            path_prefix: None,
+            required_roles: None,
+            enabled: None,
+        };
+        assert!(Application::validate_input(&input).is_err());
+    }
+
+    #[test]
+    fn test_validate_input_empty_slug() {
+        let input = CreateApplicationInput {
+            name: "Valid".to_string(),
+            slug: "".to_string(),
+            host_pattern: None,
+            path_prefix: None,
+            required_roles: None,
+            enabled: None,
+        };
+        assert!(Application::validate_input(&input).is_err());
+    }
+
+    #[test]
+    fn test_validate_input_slug_too_long() {
+        let input = CreateApplicationInput {
+            name: "Valid".to_string(),
+            slug: "a".repeat(65),
+            host_pattern: None,
+            path_prefix: None,
+            required_roles: None,
+            enabled: None,
+        };
+        assert!(Application::validate_input(&input).is_err());
+    }
+
+    #[test]
+    fn test_validate_input_multiple_errors() {
+        let input = CreateApplicationInput {
+            name: "".to_string(),
+            slug: "invalid slug!".to_string(),
+            host_pattern: Some("[bad".into()),
+            path_prefix: None,
+            required_roles: None,
+            enabled: None,
+        };
+        let err = Application::validate_input(&input).unwrap_err();
+        if let AppError::InputError(errs) = err {
+            assert!(errs.len() >= 3);
+        } else {
+            panic!("Expected InputError");
+        }
+    }
+
+    #[test]
+    fn test_application_serialization_roundtrip() {
+        let app = Application {
+            id: Uuid::now_v7(),
+            name: "Test App".into(),
+            slug: "test-app".into(),
+            host_pattern: Some("*.example.com".into()),
+            path_prefix: Some("/api".into()),
+            required_roles: vec!["admin".into()],
+            enabled: true,
+            created_at: 1000,
+            updated_at: 2000,
+        };
+
+        let json = serde_json::to_string(&app).unwrap();
+        let deserialized: Application = serde_json::from_str(&json).unwrap();
+        assert_eq!(app.id, deserialized.id);
+        assert_eq!(app.name, deserialized.name);
+        assert_eq!(app.slug, deserialized.slug);
+        assert_eq!(app.required_roles, deserialized.required_roles);
+        assert_eq!(app.enabled, deserialized.enabled);
+    }
 }

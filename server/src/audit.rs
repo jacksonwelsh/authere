@@ -613,4 +613,169 @@ mod tests {
         assert_eq!(entry.user_agent, Some("Mozilla/5.0".to_string()));
         assert!(entry.details.is_some());
     }
+
+    #[test]
+    fn test_all_event_types_have_str() {
+        let all_types = [
+            (AuditEventType::LoginSuccess, "login_success"),
+            (AuditEventType::LoginFailed, "login_failed"),
+            (AuditEventType::Logout, "logout"),
+            (AuditEventType::TokenRefresh, "token_refresh"),
+            (AuditEventType::UserCreated, "user_created"),
+            (AuditEventType::UserUpdated, "user_updated"),
+            (AuditEventType::UserDeleted, "user_deleted"),
+            (AuditEventType::PasswordChanged, "password_changed"),
+            (AuditEventType::RoleAssigned, "role_assigned"),
+            (AuditEventType::RoleRemoved, "role_removed"),
+            (AuditEventType::MfaEnabled, "mfa_enabled"),
+            (AuditEventType::MfaDisabled, "mfa_disabled"),
+            (AuditEventType::AdminCreateUser, "admin_create_user"),
+            (AuditEventType::AdminUpdateUser, "admin_update_user"),
+            (AuditEventType::AdminDeleteUser, "admin_delete_user"),
+            (AuditEventType::AdminPasswordReset, "admin_password_reset"),
+            (AuditEventType::AdminRoleAssigned, "admin_role_assigned"),
+            (AuditEventType::AdminRoleRemoved, "admin_role_removed"),
+            (AuditEventType::UserRegistered, "user_registered"),
+            (AuditEventType::InvitationCreated, "invitation_created"),
+            (AuditEventType::InvitationDeleted, "invitation_deleted"),
+            (AuditEventType::InvitationConsumed, "invitation_consumed"),
+            (AuditEventType::SettingsUpdated, "settings_updated"),
+        ];
+
+        for (event_type, expected_str) in all_types {
+            assert_eq!(event_type.as_str(), expected_str);
+        }
+    }
+
+    #[test]
+    fn test_entry_builder_defaults() {
+        let entry = AuditLogEntry::new(AuditEventType::Logout);
+        assert_eq!(entry.event_type, AuditEventType::Logout);
+        assert!(entry.user_id.is_none());
+        assert!(entry.actor_id.is_none());
+        assert!(entry.ip_address.is_none());
+        assert!(entry.user_agent.is_none());
+        assert!(entry.details.is_none());
+    }
+
+    #[test]
+    fn test_entry_builder_chaining() {
+        let uid = Uuid::now_v7();
+        let entry = AuditLogEntry::new(AuditEventType::LoginSuccess)
+            .user(uid)
+            .ip("10.0.0.1");
+
+        assert_eq!(entry.user_id, Some(uid));
+        assert_eq!(entry.ip_address, Some("10.0.0.1".to_string()));
+        assert!(entry.actor_id.is_none());
+    }
+
+    #[test]
+    fn test_audit_log_query_builder() {
+        let uid = Uuid::now_v7();
+        let query = AuditLogQuery::new()
+            .for_user(uid)
+            .since(1000)
+            .until(2000)
+            .limit(50)
+            .offset(10);
+
+        assert_eq!(query.user_id, Some(uid));
+        assert_eq!(query.since, Some(1000));
+        assert_eq!(query.until, Some(2000));
+        assert_eq!(query.limit, Some(50));
+        assert_eq!(query.offset, Some(10));
+    }
+
+    #[test]
+    fn test_audit_log_query_defaults() {
+        let query = AuditLogQuery::new();
+        assert!(query.user_id.is_none());
+        assert!(query.event_types.is_none());
+        assert!(query.since.is_none());
+        assert!(query.until.is_none());
+        assert!(query.limit.is_none());
+        assert!(query.offset.is_none());
+    }
+
+    #[test]
+    fn test_audit_log_query_event_types() {
+        let query = AuditLogQuery::new().event_types(vec![
+            AuditEventType::LoginSuccess,
+            AuditEventType::LoginFailed,
+        ]);
+        let types = query.event_types.unwrap();
+        assert_eq!(types.len(), 2);
+        assert_eq!(types[0], AuditEventType::LoginSuccess);
+        assert_eq!(types[1], AuditEventType::LoginFailed);
+    }
+
+    #[test]
+    fn test_serialize_json_string_none() {
+        let val: Option<String> = None;
+        let result = serde_json::to_string(&SerHelper(&val)).unwrap();
+        assert_eq!(result, "null");
+    }
+
+    #[test]
+    fn test_serialize_json_string_valid_json() {
+        let val = Some(r#"{"key":"value"}"#.to_string());
+        let result = serde_json::to_string(&SerHelper(&val)).unwrap();
+        assert_eq!(result, r#"{"key":"value"}"#);
+    }
+
+    #[test]
+    fn test_serialize_json_string_plain_string() {
+        let val = Some("not-json".to_string());
+        let result = serde_json::to_string(&SerHelper(&val)).unwrap();
+        assert_eq!(result, r#""not-json""#);
+    }
+
+    struct SerHelper<'a>(&'a Option<String>);
+    impl serde::Serialize for SerHelper<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            serialize_json_string(self.0, serializer)
+        }
+    }
+
+    #[test]
+    fn test_audit_log_record_serialization() {
+        let record = AuditLogRecord {
+            id: Uuid::nil(),
+            timestamp: 1700000000,
+            event_type: "login_success".into(),
+            user_id: Some(Uuid::nil()),
+            actor_id: None,
+            ip_address: Some("127.0.0.1".into()),
+            user_agent: Some("test".into()),
+            details: Some(r#"{"foo":"bar"}"#.into()),
+            username: Some("testuser".into()),
+            actor_username: None,
+        };
+
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(json.contains("login_success"));
+        assert!(json.contains("127.0.0.1"));
+        assert!(json.contains("testuser"));
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["details"]["foo"], "bar");
+    }
+
+    #[test]
+    fn test_extract_client_ip_no_proxies() {
+        let peer = "192.168.1.100".parse().unwrap();
+        let result = extract_client_ip(Some("10.0.0.1"), peer);
+        assert_eq!(result, peer);
+    }
+
+    #[test]
+    fn test_audit_context_default_ip() {
+        let ctx = AuditContext {
+            ip: "127.0.0.1".parse().unwrap(),
+            ip_address: "127.0.0.1".into(),
+            user_agent: None,
+        };
+        assert_eq!(ctx.ip_address, "127.0.0.1");
+        assert!(ctx.user_agent.is_none());
+    }
 }

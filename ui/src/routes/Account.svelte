@@ -18,7 +18,7 @@
   async function load() {
     try {
       // me prop has user_id + roles; fetch full profile for name/email
-      const res = await fetch('/user/' + me.user_id, { credentials: 'same-origin' });
+      const res = await fetch('/api/user/' + me.user_id, { credentials: 'same-origin' });
       if (res.ok) {
         const user = await res.json();
         name = user.name ?? '';

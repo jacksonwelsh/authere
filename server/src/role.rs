@@ -6,6 +6,9 @@ use uuid::Uuid;
 use crate::db::DbEntity;
 use crate::errors::AppError;
 
+pub const ROLE_ADMIN: &str = "admin";
+pub const ROLE_USER: &str = "user";
+
 #[derive(Debug, Serialize, Deserialize, ToSchema, sqlx::FromRow)]
 pub struct Role {
     pub id: Uuid,
@@ -73,7 +76,7 @@ impl Role {
         // Prevent deletion of built-in roles
         let role = Role::get(id, &mut *conn).await?;
         if let Some(r) = &role {
-            if r.name == "admin" || r.name == "user" {
+            if r.name == ROLE_ADMIN || r.name == ROLE_USER {
                 return Err(AppError::InputError(vec![
                     "Cannot delete built-in roles (admin, user)".to_string()
                 ]));
@@ -267,5 +270,75 @@ mod tests {
         };
         let result = Role::validate_input(&input);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_role_name_special_chars() {
+        for name in ["admin@role", "role.name", "role/name", "role name"] {
+            let input = CreateRoleInput {
+                name: name.to_string(),
+                description: None,
+            };
+            assert!(
+                Role::validate_input(&input).is_err(),
+                "{name} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_role_max_length_name() {
+        let input = CreateRoleInput {
+            name: "a".repeat(64),
+            description: None,
+        };
+        assert!(Role::validate_input(&input).is_ok());
+    }
+
+    #[test]
+    fn test_validate_role_max_length_description() {
+        let input = CreateRoleInput {
+            name: "valid".to_string(),
+            description: Some("a".repeat(256)),
+        };
+        assert!(Role::validate_input(&input).is_ok());
+    }
+
+    #[test]
+    fn test_validate_role_multiple_errors() {
+        let input = CreateRoleInput {
+            name: "".to_string(),
+            description: Some("a".repeat(257)),
+        };
+        let err = Role::validate_input(&input).unwrap_err();
+        if let AppError::InputError(errs) = err {
+            assert!(errs.len() >= 2);
+        } else {
+            panic!("Expected InputError");
+        }
+    }
+
+    #[test]
+    fn test_role_new() {
+        let role = Role::new("editor".into(), Some("Can edit".into()));
+        assert_eq!(role.name, "editor");
+        assert_eq!(role.description, Some("Can edit".into()));
+    }
+
+    #[test]
+    fn test_role_new_no_description() {
+        let role = Role::new("viewer".into(), None);
+        assert_eq!(role.name, "viewer");
+        assert!(role.description.is_none());
+    }
+
+    #[test]
+    fn test_role_serialization_roundtrip() {
+        let role = Role::new("test-role".into(), Some("desc".into()));
+        let json = serde_json::to_string(&role).unwrap();
+        let deserialized: Role = serde_json::from_str(&json).unwrap();
+        assert_eq!(role.id, deserialized.id);
+        assert_eq!(role.name, deserialized.name);
+        assert_eq!(role.description, deserialized.description);
     }
 }

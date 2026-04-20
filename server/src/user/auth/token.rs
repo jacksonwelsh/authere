@@ -4,7 +4,7 @@ use aes_gcm::{
     Aes256Gcm, Key, Nonce,
     aead::{Aead, KeyInit},
 };
-use ed25519_dalek::{SigningKey, VerifyingKey, pkcs8::EncodePrivateKey};
+use ed25519_dalek::{SigningKey, pkcs8::EncodePrivateKey};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
@@ -162,7 +162,8 @@ async fn initialize(conn: &mut SqliteConnection) -> Result<(), AppError> {
     Ok(())
 }
 
-async fn get_signing_key(conn: &mut SqliteConnection) -> Result<SigningKey, AppError> {
+/// Load the signing key from the database, decrypting it. Intended for startup caching.
+pub async fn load_signing_key(conn: &mut SqliteConnection) -> Result<SigningKey, AppError> {
     let row = query!("SELECT private_key, key_nonce FROM keys WHERE name = 'default'")
         .fetch_one(&mut *conn)
         .await?;
@@ -197,20 +198,6 @@ async fn get_signing_key(conn: &mut SqliteConnection) -> Result<SigningKey, AppE
     }
 }
 
-pub async fn get_verifying_key(conn: &mut SqliteConnection) -> Result<VerifyingKey, AppError> {
-    let row = query!("SELECT public_key FROM keys WHERE name = 'default'")
-        .fetch_one(conn)
-        .await?;
-
-    let public_key: [u8; 32] = row
-        .public_key
-        .try_into()
-        .map_err(|_| AppError::InternalError("Invalid key length".to_string()))?;
-
-    VerifyingKey::from_bytes(&public_key)
-        .map_err(|e| AppError::InternalError(format!("Invalid public key: {e}")))
-}
-
 fn current_timestamp() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -222,13 +209,12 @@ fn current_timestamp() -> i64 {
 // Token Generation
 // ============================================================================
 
-/// Generates an access token for the given user
-pub async fn generate_access_token(
+/// Generates an access token for the given user using a cached signing key.
+pub fn generate_access_token(
     user_id: Uuid,
     roles: Vec<String>,
-    conn: &mut SqliteConnection,
+    signing_key: &SigningKey,
 ) -> Result<String, AppError> {
-    let signing_key = get_signing_key(conn).await?;
     let now = current_timestamp();
 
     let claims = Claims {
@@ -254,9 +240,9 @@ pub async fn generate_access_token(
 /// Generates a refresh token and stores it in the database
 pub async fn generate_refresh_token(
     user_id: Uuid,
+    signing_key: &SigningKey,
     conn: &mut SqliteConnection,
 ) -> Result<String, AppError> {
-    let signing_key = get_signing_key(conn).await?;
     let now = current_timestamp();
 
     let claims = Claims {
@@ -300,10 +286,11 @@ pub async fn generate_refresh_token(
 pub async fn generate_token_pair(
     user_id: Uuid,
     roles: Vec<String>,
+    signing_key: &SigningKey,
     conn: &mut SqliteConnection,
 ) -> Result<TokenPair, AppError> {
-    let access_token = generate_access_token(user_id, roles, &mut *conn).await?;
-    let refresh_token = generate_refresh_token(user_id, conn).await?;
+    let access_token = generate_access_token(user_id, roles, signing_key)?;
+    let refresh_token = generate_refresh_token(user_id, signing_key, conn).await?;
 
     Ok(TokenPair {
         access_token,
@@ -321,9 +308,10 @@ pub async fn generate_token_pair(
 /// Also checks user-level revocations so logout takes effect immediately.
 pub async fn verify_access_token(
     token: &str,
+    signing_key: &SigningKey,
     conn: &mut SqliteConnection,
 ) -> Result<Claims, AppError> {
-    let verifying_key = get_verifying_key(&mut *conn).await?;
+    let verifying_key = signing_key.verifying_key();
     let decoding_key = DecodingKey::from_ed_der(&verifying_key.to_bytes());
 
     let mut validation = Validation::new(Algorithm::EdDSA);
@@ -358,13 +346,12 @@ pub async fn verify_access_token(
 }
 
 /// Atomically verifies a refresh token and revokes it in a single DB operation.
-/// This eliminates the race condition where two concurrent requests could both
-/// pass the verify check before either revocation is recorded.
 pub async fn verify_and_revoke_refresh_token(
     token: &str,
+    signing_key: &SigningKey,
     conn: &mut SqliteConnection,
 ) -> Result<Uuid, AppError> {
-    let verifying_key = get_verifying_key(&mut *conn).await?;
+    let verifying_key = signing_key.verifying_key();
     let decoding_key = DecodingKey::from_ed_der(&verifying_key.to_bytes());
 
     let mut validation = Validation::new(Algorithm::EdDSA);
@@ -382,9 +369,6 @@ pub async fn verify_and_revoke_refresh_token(
     let token_hash = hash_token(token);
     let now = current_timestamp();
 
-    // Single atomic UPDATE: only succeeds if the token is present, unexpired, and not yet revoked.
-    // SQLite serializes writes, so concurrent requests with the same token will see rows_affected=0
-    // after the first one wins.
     let result = query!(
         "UPDATE refresh_tokens SET revoked_at = ? WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > ?",
         now,
@@ -395,7 +379,6 @@ pub async fn verify_and_revoke_refresh_token(
     .await?;
 
     if result.rows_affected() != 1 {
-        // Token was already revoked — possible theft. Check if hash exists (reuse detection).
         let exists = query!(
             "SELECT user_id as \"user_id: Uuid\" FROM refresh_tokens WHERE token_hash = ?",
             token_hash
@@ -420,7 +403,6 @@ pub async fn verify_and_revoke_refresh_token(
 // ============================================================================
 
 /// Revokes all access tokens for a user issued at or before now.
-/// Uses INSERT OR REPLACE so repeated calls always advance the revocation timestamp.
 pub async fn revoke_user_access_tokens(
     user_id: Uuid,
     conn: &mut SqliteConnection,
@@ -461,4 +443,151 @@ fn hash_token(token: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(token.as_bytes());
     hex::encode(hasher.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encrypt_decrypt_roundtrip() {
+        let key_bytes: [u8; 32] = [42u8; 32];
+        let kek: [u8; 32] = [99u8; 32];
+
+        let (ciphertext, nonce) = encrypt_private_key(&key_bytes, &kek).unwrap();
+        let decrypted = decrypt_private_key(&ciphertext, &nonce, &kek).unwrap();
+
+        assert_eq!(key_bytes, decrypted);
+    }
+
+    #[test]
+    fn decrypt_with_wrong_kek_fails() {
+        let key_bytes: [u8; 32] = [42u8; 32];
+        let kek: [u8; 32] = [99u8; 32];
+        let wrong_kek: [u8; 32] = [1u8; 32];
+
+        let (ciphertext, nonce) = encrypt_private_key(&key_bytes, &kek).unwrap();
+        let result = decrypt_private_key(&ciphertext, &nonce, &wrong_kek);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn encrypt_produces_different_ciphertexts() {
+        let key_bytes: [u8; 32] = [42u8; 32];
+        let kek: [u8; 32] = [99u8; 32];
+
+        let (ct1, _) = encrypt_private_key(&key_bytes, &kek).unwrap();
+        let (ct2, _) = encrypt_private_key(&key_bytes, &kek).unwrap();
+
+        assert_ne!(ct1, ct2, "random nonces should produce different ciphertexts");
+    }
+
+    #[test]
+    fn hash_token_deterministic() {
+        let h1 = hash_token("test-token");
+        let h2 = hash_token("test-token");
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn hash_token_different_inputs() {
+        let h1 = hash_token("token-a");
+        let h2 = hash_token("token-b");
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn hash_token_is_hex_sha256() {
+        let h = hash_token("hello");
+        assert_eq!(h.len(), 64);
+        assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn claims_serialization_roundtrip() {
+        let claims = Claims {
+            sub: "user-123".into(),
+            iss: TOKEN_ISSUER.into(),
+            aud: TOKEN_AUDIENCE.into(),
+            roles: vec!["admin".into(), "user".into()],
+            exp: 1700000000,
+            iat: 1699999000,
+            jti: "jti-abc".into(),
+            typ: "access".into(),
+        };
+
+        let json = serde_json::to_string(&claims).unwrap();
+        let deserialized: Claims = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(claims.sub, deserialized.sub);
+        assert_eq!(claims.iss, deserialized.iss);
+        assert_eq!(claims.aud, deserialized.aud);
+        assert_eq!(claims.roles, deserialized.roles);
+        assert_eq!(claims.exp, deserialized.exp);
+        assert_eq!(claims.iat, deserialized.iat);
+        assert_eq!(claims.jti, deserialized.jti);
+        assert_eq!(claims.typ, deserialized.typ);
+    }
+
+    #[test]
+    fn token_pair_serialization() {
+        let pair = TokenPair {
+            access_token: "at".into(),
+            refresh_token: "rt".into(),
+            expires_in: 900,
+            token_type: "Bearer".into(),
+        };
+        let json = serde_json::to_string(&pair).unwrap();
+        let deserialized: TokenPair = serde_json::from_str(&json).unwrap();
+        assert_eq!(pair.access_token, deserialized.access_token);
+        assert_eq!(pair.refresh_token, deserialized.refresh_token);
+        assert_eq!(pair.expires_in, deserialized.expires_in);
+        assert_eq!(pair.token_type, deserialized.token_type);
+    }
+
+    #[test]
+    fn constants_are_sensible() {
+        assert_eq!(ACCESS_TOKEN_LIFETIME, 15 * 60);
+        assert_eq!(REFRESH_TOKEN_LIFETIME, 7 * 24 * 60 * 60);
+        assert!(ACCESS_TOKEN_LIFETIME < REFRESH_TOKEN_LIFETIME);
+    }
+
+    #[test]
+    fn current_timestamp_is_reasonable() {
+        let ts = current_timestamp();
+        assert!(ts > 1_700_000_000, "timestamp should be after 2023");
+        assert!(ts < 2_000_000_000, "timestamp should be before 2033");
+    }
+
+    #[test]
+    fn generate_key_produces_valid_key() {
+        let key = generate_key();
+        let verifying = key.verifying_key();
+        let message = b"test message";
+
+        use ed25519_dalek::Signer;
+        let signature = key.sign(message);
+
+        use ed25519_dalek::Verifier;
+        assert!(verifying.verify(message, &signature).is_ok());
+    }
+
+    #[test]
+    fn generate_access_token_is_sync() {
+        let key = generate_key();
+        let result = generate_access_token(Uuid::new_v4(), vec!["user".into()], &key);
+        assert!(result.is_ok());
+        let token = result.unwrap();
+        assert!(!token.is_empty());
+    }
+
+    #[test]
+    fn generate_access_token_different_each_time() {
+        let key = generate_key();
+        let uid = Uuid::new_v4();
+        let t1 = generate_access_token(uid, vec![], &key).unwrap();
+        let t2 = generate_access_token(uid, vec![], &key).unwrap();
+        assert_ne!(t1, t2, "each token should have a unique jti");
+    }
 }
