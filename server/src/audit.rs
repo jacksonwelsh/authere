@@ -1,9 +1,82 @@
+use axum::extract::{ConnectInfo, FromRequestParts};
+use axum::http::request::Parts;
+use axum_extra::TypedHeader;
+use headers::UserAgent;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::SqliteConnection;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::LazyLock;
 use uuid::Uuid;
 
 use crate::errors::AppError;
+
+static TRUSTED_PROXIES: LazyLock<Vec<IpAddr>> = LazyLock::new(|| {
+    std::env::var("AUTHERE_TRUSTED_PROXIES")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|s| s.trim().parse::<IpAddr>().ok())
+        .collect()
+});
+
+/// Extract the real client IP from X-Forwarded-For, skipping trusted proxies from the right.
+fn extract_client_ip(xff: Option<&str>, peer_ip: IpAddr) -> IpAddr {
+    if TRUSTED_PROXIES.is_empty() {
+        return peer_ip;
+    }
+    if !TRUSTED_PROXIES.contains(&peer_ip) {
+        return peer_ip;
+    }
+    if let Some(xff) = xff {
+        let addrs: Vec<&str> = xff.split(',').map(|s| s.trim()).collect();
+        for addr_str in addrs.iter().rev() {
+            if let Ok(addr) = addr_str.parse::<IpAddr>() {
+                if !TRUSTED_PROXIES.contains(&addr) {
+                    return addr;
+                }
+            }
+        }
+    }
+    peer_ip
+}
+
+/// Request context for audit logging — IP address and user agent, extracted once per request.
+#[derive(Debug, Clone)]
+pub struct AuditContext {
+    pub ip: IpAddr,
+    pub ip_address: String,
+    pub user_agent: Option<String>,
+}
+
+impl<S: Send + Sync> FromRequestParts<S> for AuditContext {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let peer_ip = parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|ci| ci.0.ip())
+            .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+
+        let xff = parts
+            .headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok());
+
+        let ip = extract_client_ip(xff, peer_ip);
+
+        let user_agent = TypedHeader::<UserAgent>::from_request_parts(parts, state)
+            .await
+            .ok()
+            .map(|h| h.to_string());
+
+        Ok(AuditContext {
+            ip,
+            ip_address: ip.to_string(),
+            user_agent,
+        })
+    }
+}
 
 /// Types of audit events
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,6 +227,7 @@ pub struct AuditLogQuery {
     since: Option<i64>,
     until: Option<i64>,
     limit: Option<i64>,
+    offset: Option<i64>,
 }
 
 impl AuditLogQuery {
@@ -186,37 +260,42 @@ impl AuditLogQuery {
         self
     }
 
+    pub fn offset(mut self, offset: i64) -> Self {
+        self.offset = Some(offset);
+        self
+    }
+
     pub async fn execute(self, conn: &mut SqliteConnection) -> Result<Vec<AuditLogRecord>, AppError> {
-        let mut query = String::from(
-            "SELECT al.id, al.timestamp, al.event_type, al.user_id, al.actor_id, al.ip_address, al.user_agent, al.details, \
+        let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> = sqlx::QueryBuilder::new(
+            "SELECT al.id, al.timestamp, al.event_type, al.user_id, al.actor_id, \
+             al.ip_address, al.user_agent, al.details, \
              u.username as username, actor.username as actor_username \
              FROM audit_log al \
              LEFT JOIN users u ON al.user_id = u.id \
              LEFT JOIN users actor ON al.actor_id = actor.id \
-             WHERE 1=1"
+             WHERE 1=1",
         );
 
-        if self.user_id.is_some() {
-            query.push_str(" AND al.user_id = ?");
+        if let Some(uid) = self.user_id {
+            qb.push(" AND al.user_id = ").push_bind(uid);
         }
-        if self.since.is_some() {
-            query.push_str(" AND al.timestamp >= ?");
+        if let Some(ts) = self.since {
+            qb.push(" AND al.timestamp >= ").push_bind(ts);
         }
-        if self.until.is_some() {
-            query.push_str(" AND al.timestamp <= ?");
+        if let Some(ts) = self.until {
+            qb.push(" AND al.timestamp <= ").push_bind(ts);
         }
 
-        query.push_str(" ORDER BY al.timestamp DESC");
+        qb.push(" ORDER BY al.timestamp DESC");
 
         if let Some(limit) = self.limit {
-            query.push_str(&format!(" LIMIT {}", limit));
+            qb.push(" LIMIT ").push_bind(limit);
+        }
+        if let Some(offset) = self.offset {
+            qb.push(" OFFSET ").push_bind(offset);
         }
 
-        let records: Vec<AuditLogRecord> = sqlx::query_as(&query)
-            .fetch_all(conn)
-            .await?;
-
-        Ok(records)
+        Ok(qb.build_query_as().fetch_all(conn).await?)
     }
 }
 
@@ -252,40 +331,17 @@ pub struct AuditLogRecord {
     pub actor_username: Option<String>,
 }
 
-/// Paginated audit log listing for the admin UI
-pub async fn list_audit_log(
-    limit: i64,
-    offset: i64,
-    conn: &mut SqliteConnection,
-) -> Result<Vec<AuditLogRecord>, AppError> {
-    let records: Vec<AuditLogRecord> = sqlx::query_as(
-        "SELECT al.id, al.timestamp, al.event_type, al.user_id, al.actor_id, al.ip_address, al.user_agent, al.details, \
-         u.username as username, actor.username as actor_username \
-         FROM audit_log al \
-         LEFT JOIN users u ON al.user_id = u.id \
-         LEFT JOIN users actor ON al.actor_id = actor.id \
-         ORDER BY al.timestamp DESC \
-         LIMIT ? OFFSET ?",
-    )
-    .bind(limit)
-    .bind(offset)
-    .fetch_all(conn)
-    .await?;
-    Ok(records)
-}
-
 /// Convenience function to log a login success
 pub async fn log_login_success(
     user_id: Uuid,
-    ip: impl Into<String>,
-    user_agent: Option<String>,
+    ctx: &AuditContext,
     conn: &mut SqliteConnection,
 ) -> Result<(), AppError> {
     let mut entry = AuditLogEntry::new(AuditEventType::LoginSuccess)
         .user(user_id)
-        .ip(ip);
+        .ip(&ctx.ip_address);
 
-    if let Some(ua) = user_agent {
+    if let Some(ref ua) = ctx.user_agent {
         entry = entry.user_agent(ua);
     }
 
@@ -297,8 +353,7 @@ pub async fn log_login_success(
 pub async fn log_login_failed(
     username: &str,
     user_id: Option<Uuid>,
-    ip: impl Into<String>,
-    user_agent: Option<String>,
+    ctx: &AuditContext,
     conn: &mut SqliteConnection,
 ) -> Result<(), AppError> {
     let details = if user_id.is_some() {
@@ -308,14 +363,14 @@ pub async fn log_login_failed(
     };
 
     let mut entry = AuditLogEntry::new(AuditEventType::LoginFailed)
-        .ip(ip)
+        .ip(&ctx.ip_address)
         .details(details);
 
     if let Some(uid) = user_id {
         entry = entry.user(uid);
     }
 
-    if let Some(ua) = user_agent {
+    if let Some(ref ua) = ctx.user_agent {
         entry = entry.user_agent(ua);
     }
 
@@ -325,12 +380,12 @@ pub async fn log_login_failed(
 /// Convenience function to log a logout
 pub async fn log_logout(
     user_id: Uuid,
-    ip: impl Into<String>,
+    ctx: &AuditContext,
     conn: &mut SqliteConnection,
 ) -> Result<(), AppError> {
     AuditLogEntry::new(AuditEventType::Logout)
         .user(user_id)
-        .ip(ip)
+        .ip(&ctx.ip_address)
         .save(conn)
         .await
 }
@@ -338,12 +393,12 @@ pub async fn log_logout(
 /// Convenience function to log a token refresh
 pub async fn log_token_refresh(
     user_id: Uuid,
-    ip: impl Into<String>,
+    ctx: &AuditContext,
     conn: &mut SqliteConnection,
 ) -> Result<(), AppError> {
     AuditLogEntry::new(AuditEventType::TokenRefresh)
         .user(user_id)
-        .ip(ip)
+        .ip(&ctx.ip_address)
         .save(conn)
         .await
 }
@@ -352,12 +407,12 @@ pub async fn log_token_refresh(
 pub async fn log_user_created(
     user_id: Uuid,
     actor_id: Option<Uuid>,
-    ip: impl Into<String>,
+    ctx: &AuditContext,
     conn: &mut SqliteConnection,
 ) -> Result<(), AppError> {
     let mut entry = AuditLogEntry::new(AuditEventType::UserCreated)
         .user(user_id)
-        .ip(ip);
+        .ip(&ctx.ip_address);
 
     if let Some(actor) = actor_id {
         entry = entry.actor(actor);
@@ -370,7 +425,7 @@ pub async fn log_user_created(
 pub async fn log_password_changed(
     user_id: Uuid,
     actor_id: Option<Uuid>,
-    ip: impl Into<String>,
+    ctx: &AuditContext,
     conn: &mut SqliteConnection,
 ) -> Result<(), AppError> {
     let event_type = if actor_id.is_some() {
@@ -381,7 +436,7 @@ pub async fn log_password_changed(
 
     let mut entry = AuditLogEntry::new(event_type)
         .user(user_id)
-        .ip(ip);
+        .ip(&ctx.ip_address);
 
     if let Some(actor) = actor_id {
         entry = entry.actor(actor);
@@ -394,13 +449,13 @@ pub async fn log_password_changed(
 pub async fn log_admin_update_user(
     user_id: Uuid,
     actor_id: Uuid,
-    ip: impl Into<String>,
+    ctx: &AuditContext,
     conn: &mut SqliteConnection,
 ) -> Result<(), AppError> {
     AuditLogEntry::new(AuditEventType::AdminUpdateUser)
         .user(user_id)
         .actor(actor_id)
-        .ip(ip)
+        .ip(&ctx.ip_address)
         .save(conn)
         .await
 }
@@ -411,13 +466,13 @@ pub async fn log_admin_role_assigned(
     actor_id: Uuid,
     role_id: Uuid,
     role_name: &str,
-    ip: impl Into<String>,
+    ctx: &AuditContext,
     conn: &mut SqliteConnection,
 ) -> Result<(), AppError> {
     AuditLogEntry::new(AuditEventType::AdminRoleAssigned)
         .user(user_id)
         .actor(actor_id)
-        .ip(ip)
+        .ip(&ctx.ip_address)
         .details(json!({ "role_id": role_id, "role_name": role_name }))
         .save(conn)
         .await
@@ -428,13 +483,13 @@ pub async fn log_admin_role_removed(
     user_id: Uuid,
     actor_id: Uuid,
     role_id: Uuid,
-    ip: impl Into<String>,
+    ctx: &AuditContext,
     conn: &mut SqliteConnection,
 ) -> Result<(), AppError> {
     AuditLogEntry::new(AuditEventType::AdminRoleRemoved)
         .user(user_id)
         .actor(actor_id)
-        .ip(ip)
+        .ip(&ctx.ip_address)
         .details(json!({ "role_id": role_id }))
         .save(conn)
         .await
@@ -444,7 +499,7 @@ pub async fn log_admin_role_removed(
 pub async fn log_user_registered(
     user_id: Uuid,
     invite_id: Option<&str>,
-    ip: impl Into<String>,
+    ctx: &AuditContext,
     conn: &mut SqliteConnection,
 ) -> Result<(), AppError> {
     let details = if let Some(id) = invite_id {
@@ -454,7 +509,7 @@ pub async fn log_user_registered(
     };
     AuditLogEntry::new(AuditEventType::UserRegistered)
         .user(user_id)
-        .ip(ip)
+        .ip(&ctx.ip_address)
         .details(details)
         .save(conn)
         .await
@@ -465,12 +520,12 @@ pub async fn log_invitation_created(
     actor_id: Uuid,
     invite_id: &str,
     label: Option<&str>,
-    ip: impl Into<String>,
+    ctx: &AuditContext,
     conn: &mut SqliteConnection,
 ) -> Result<(), AppError> {
     AuditLogEntry::new(AuditEventType::InvitationCreated)
         .actor(actor_id)
-        .ip(ip)
+        .ip(&ctx.ip_address)
         .details(json!({ "invite_id": invite_id, "label": label }))
         .save(conn)
         .await
@@ -480,12 +535,12 @@ pub async fn log_invitation_created(
 pub async fn log_invitation_deleted(
     actor_id: Uuid,
     invite_id: &str,
-    ip: impl Into<String>,
+    ctx: &AuditContext,
     conn: &mut SqliteConnection,
 ) -> Result<(), AppError> {
     AuditLogEntry::new(AuditEventType::InvitationDeleted)
         .actor(actor_id)
-        .ip(ip)
+        .ip(&ctx.ip_address)
         .details(json!({ "invite_id": invite_id }))
         .save(conn)
         .await
@@ -495,12 +550,12 @@ pub async fn log_invitation_deleted(
 pub async fn log_invitation_consumed(
     user_id: Uuid,
     invite_id: &str,
-    ip: impl Into<String>,
+    ctx: &AuditContext,
     conn: &mut SqliteConnection,
 ) -> Result<(), AppError> {
     AuditLogEntry::new(AuditEventType::InvitationConsumed)
         .user(user_id)
-        .ip(ip)
+        .ip(&ctx.ip_address)
         .details(json!({ "invite_id": invite_id }))
         .save(conn)
         .await
@@ -510,12 +565,12 @@ pub async fn log_invitation_consumed(
 pub async fn log_settings_updated(
     actor_id: Uuid,
     changes: serde_json::Value,
-    ip: impl Into<String>,
+    ctx: &AuditContext,
     conn: &mut SqliteConnection,
 ) -> Result<(), AppError> {
     AuditLogEntry::new(AuditEventType::SettingsUpdated)
         .actor(actor_id)
-        .ip(ip)
+        .ip(&ctx.ip_address)
         .details(changes)
         .save(conn)
         .await

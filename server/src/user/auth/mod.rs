@@ -1,3 +1,5 @@
+use std::sync::LazyLock;
+
 use crate::User;
 use crate::{db::DbEntity, errors::AppError};
 
@@ -81,6 +83,21 @@ impl Authenticator {
                     .into(),
             )
         }
+    }
+
+    /// Perform a dummy Argon2 verify to prevent timing side-channels on login
+    /// when the requested user does not exist.
+    pub fn dummy_password_check() {
+        static DUMMY_HASH: LazyLock<String> = LazyLock::new(|| {
+            let argon2 = Argon2::default();
+            let salt = SaltString::generate(&mut OsRng);
+            argon2
+                .hash_password(b"dummy", &salt)
+                .expect("Failed to create dummy hash")
+                .to_string()
+        });
+        let hash = PasswordHash::new(&DUMMY_HASH).expect("Failed to parse dummy hash");
+        let _ = Argon2::default().verify_password(b"not-the-password", &hash);
     }
 
     pub fn validate_password(password_cleartext: &str) -> Result<(), String> {
@@ -170,7 +187,15 @@ impl<'r> FromRow<'r, SqliteRow> for Authenticator {
         let scheme = match scheme_type {
             "password" => AuthenticationScheme::Password(scheme_value),
             "totp" => AuthenticationScheme::Totp(scheme_value),
-            _ => panic!("Invalid authentication scheme"),
+            other => {
+                return Err(sqlx::Error::ColumnDecode {
+                    index: "type".to_string(),
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("Unknown authentication scheme: {other}"),
+                    )),
+                });
+            }
         };
 
         Ok(Authenticator {

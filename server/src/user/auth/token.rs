@@ -18,10 +18,17 @@ pub const ACCESS_TOKEN_LIFETIME: i64 = 15 * 60;
 /// Refresh token lifetime in seconds (7 days)
 pub const REFRESH_TOKEN_LIFETIME: i64 = 7 * 24 * 60 * 60;
 
+const TOKEN_ISSUER: &str = "authere";
+const TOKEN_AUDIENCE: &str = "authere";
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Claims {
     /// Subject (user ID)
     pub sub: String,
+    /// Issuer
+    pub iss: String,
+    /// Audience
+    pub aud: String,
     /// User's roles
     pub roles: Vec<String>,
     /// Expiration time (Unix timestamp)
@@ -226,6 +233,8 @@ pub async fn generate_access_token(
 
     let claims = Claims {
         sub: user_id.to_string(),
+        iss: TOKEN_ISSUER.to_string(),
+        aud: TOKEN_AUDIENCE.to_string(),
         roles,
         exp: now + ACCESS_TOKEN_LIFETIME,
         iat: now,
@@ -252,6 +261,8 @@ pub async fn generate_refresh_token(
 
     let claims = Claims {
         sub: user_id.to_string(),
+        iss: TOKEN_ISSUER.to_string(),
+        aud: TOKEN_AUDIENCE.to_string(),
         roles: vec![], // Refresh tokens don't carry roles
         exp: now + REFRESH_TOKEN_LIFETIME,
         iat: now,
@@ -316,7 +327,9 @@ pub async fn verify_access_token(
     let decoding_key = DecodingKey::from_ed_der(&verifying_key.to_bytes());
 
     let mut validation = Validation::new(Algorithm::EdDSA);
-    validation.set_required_spec_claims(&["sub", "exp", "iat", "jti", "typ"]);
+    validation.set_required_spec_claims(&["sub", "exp", "iat", "jti", "typ", "iss", "aud"]);
+    validation.set_issuer(&[TOKEN_ISSUER]);
+    validation.set_audience(&[TOKEN_AUDIENCE]);
 
     let token_data = decode::<Claims>(token, &decoding_key, &validation)
         .map_err(|_| AppError::AuthenticationRequired)?;
@@ -355,7 +368,9 @@ pub async fn verify_and_revoke_refresh_token(
     let decoding_key = DecodingKey::from_ed_der(&verifying_key.to_bytes());
 
     let mut validation = Validation::new(Algorithm::EdDSA);
-    validation.set_required_spec_claims(&["sub", "exp", "iat", "jti", "typ"]);
+    validation.set_required_spec_claims(&["sub", "exp", "iat", "jti", "typ", "iss", "aud"]);
+    validation.set_issuer(&[TOKEN_ISSUER]);
+    validation.set_audience(&[TOKEN_AUDIENCE]);
 
     let token_data = decode::<Claims>(token, &decoding_key, &validation)
         .map_err(|_| AppError::AuthenticationRequired)?;
@@ -376,10 +391,22 @@ pub async fn verify_and_revoke_refresh_token(
         token_hash,
         now
     )
-    .execute(conn)
+    .execute(&mut *conn)
     .await?;
 
     if result.rows_affected() != 1 {
+        // Token was already revoked — possible theft. Check if hash exists (reuse detection).
+        let exists = query!(
+            "SELECT user_id as \"user_id: Uuid\" FROM refresh_tokens WHERE token_hash = ?",
+            token_hash
+        )
+        .fetch_optional(&mut *conn)
+        .await?;
+
+        if let Some(row) = exists {
+            let _ = revoke_all_user_tokens(row.user_id, conn).await;
+        }
+
         return Err(AppError::AuthenticationRequired);
     }
 

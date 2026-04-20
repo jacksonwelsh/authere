@@ -1,4 +1,4 @@
-use regex::Regex;
+use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
 use sqlx::SqliteConnection;
 use utoipa::ToSchema;
@@ -155,15 +155,16 @@ impl Application {
     pub fn matches(&self, host: &str, path: &str) -> bool {
         // Check host pattern
         if let Some(pattern) = &self.host_pattern {
-            // Try exact match first
             if pattern == host {
-                // Host matches, check path
-            } else if let Ok(re) = Regex::new(pattern) {
+                // Exact match, check path
+            } else if let Ok(re) = RegexBuilder::new(&format!("^(?:{pattern})$"))
+                .size_limit(10_000)
+                .build()
+            {
                 if !re.is_match(host) {
                     return false;
                 }
             } else {
-                // Invalid regex, treat as literal that doesn't match
                 return false;
             }
         }
@@ -267,7 +268,7 @@ impl Application {
 
         // Validate host pattern as regex if provided
         if let Some(pattern) = &input.host_pattern {
-            if Regex::new(pattern).is_err() {
+            if RegexBuilder::new(&format!("^(?:{pattern})$")).size_limit(10_000).build().is_err() {
                 errors.push("Invalid host pattern regex".to_string());
             }
         }

@@ -23,3 +23,5 @@ target
 *.db
 .sqlx
 tarpaulin-report.html
+
+.env

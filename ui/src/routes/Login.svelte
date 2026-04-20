@@ -8,7 +8,8 @@
   let error = $state('');
   let loading = $state(false);
 
-  const redirectUri = new URLSearchParams(window.location.search).get('redirect_uri') ?? '/';
+  const rawRedirect = new URLSearchParams(window.location.search).get('redirect_uri') ?? '/';
+  const redirectUri = rawRedirect.startsWith('/') && !rawRedirect.startsWith('//') ? rawRedirect : '/';
 
   async function handleSubmit(e: SubmitEvent) {
     e.preventDefault();

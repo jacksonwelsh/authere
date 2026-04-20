@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use crate::application::{Application, CreateApplicationInput, UpdateApplicationInput};
-use crate::audit::{list_audit_log, log_admin_role_assigned, log_admin_role_removed, log_admin_update_user, log_invitation_consumed, log_invitation_created, log_invitation_deleted, log_login_failed, log_login_success, log_logout, log_password_changed, log_settings_updated, log_token_refresh, log_user_created, log_user_registered, AuditLogRecord};
+use crate::audit::{AuditContext, AuditLogQuery, AuditLogRecord, log_admin_role_assigned, log_admin_role_removed, log_admin_update_user, log_invitation_consumed, log_invitation_created, log_invitation_deleted, log_login_failed, log_login_success, log_logout, log_password_changed, log_settings_updated, log_token_refresh, log_user_created, log_user_registered};
 use crate::auth_middleware::{AdminUser, AuthUser};
 use crate::cli::{Cli, Commands};
 use crate::db::DbEntity;
@@ -16,12 +16,10 @@ use crate::user::auth::token::{self, TokenPair, generate_token_pair, verify_acce
 use crate::user::auth::Authenticator;
 use crate::user::{CreateUserInput, LoginInput, User};
 
-use axum::extract::{self, ConnectInfo, Path, Query, State};
-use axum::http::StatusCode;
+use axum::extract::{self, Path, Query, State};
+use axum::http::{self, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum_extra::TypedHeader;
 use clap::Parser;
-use headers::UserAgent;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use utoipa::{OpenApi, ToSchema};
@@ -221,8 +219,11 @@ async fn main() -> Result<(), AppError> {
         .with_state(state)
         .split_for_parts();
 
+    let mut router = router;
+    if cfg!(debug_assertions) || env::var("AUTHERE_SWAGGER_ENABLED").is_ok() {
+        router = router.merge(SwaggerUi::new("/docs").url("/apidoc/openapi.json", api));
+    }
     let router = router
-        .merge(SwaggerUi::new("/docs").url("/apidoc/openapi.json", api))
         // Static assets (hashed filenames — long cache)
         .route("/assets/{*path}", axum::routing::get(static_files::serve_asset))
         // SPA shell — served for all UI routes
@@ -233,6 +234,25 @@ async fn main() -> Result<(), AppError> {
         .route("/account", axum::routing::get(static_files::serve_spa))
         .route("/credentials", axum::routing::get(static_files::serve_spa))
         .route("/register", axum::routing::get(static_files::serve_spa));
+
+    // CORS: restrict to configured origins, default to same-origin only
+    let cors = if let Ok(origins) = env::var("AUTHERE_ALLOWED_ORIGINS") {
+        let allowed: Vec<http::HeaderValue> = origins
+            .split(',')
+            .filter_map(|o| o.trim().parse().ok())
+            .collect();
+        tower_http::cors::CorsLayer::new()
+            .allow_origin(allowed)
+            .allow_methods([http::Method::GET, http::Method::POST, http::Method::PUT, http::Method::DELETE])
+            .allow_headers([http::header::CONTENT_TYPE, http::header::AUTHORIZATION])
+            .allow_credentials(true)
+    } else {
+        tower_http::cors::CorsLayer::new()
+            .allow_origin(tower_http::cors::AllowOrigin::exact("null".parse().unwrap()))
+            .allow_methods([http::Method::GET, http::Method::POST, http::Method::PUT, http::Method::DELETE])
+            .allow_headers([http::header::CONTENT_TYPE, http::header::AUTHORIZATION])
+    };
+    let router = router.layer(cors);
 
     println!("Starting server on 0.0.0.0:3000");
     println!("Swagger UI available at http://localhost:3000/docs");
@@ -263,11 +283,10 @@ async fn main() -> Result<(), AppError> {
 )]
 async fn create_user(
     State(state): State<AppState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    audit_ctx: AuditContext,
     admin: AdminUser,
     extract::Json(input): extract::Json<CreateUserInput>,
 ) -> Result<(StatusCode, axum::Json<User>), AppError> {
-    let ip_str = addr.ip().to_string();
     User::validate_create_input(&input)?;
 
     let user = User::new(input.username, input.name, input.email);
@@ -286,7 +305,7 @@ async fn create_user(
     tx.commit().await?;
 
     let mut conn = state.db_pool.acquire().await?;
-    let _ = log_user_created(user.id, Some(admin.0.user_id), &ip_str, &mut conn).await;
+    let _ = log_user_created(user.id, Some(admin.0.user_id), &audit_ctx, &mut conn).await;
 
     Ok((StatusCode::CREATED, axum::Json(user)))
 }
@@ -365,16 +384,15 @@ pub struct UpdateUserInput {
 )]
 async fn update_user(
     State(state): State<AppState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    audit_ctx: AuditContext,
     admin: AdminUser,
     Path(id): Path<Uuid>,
     extract::Json(input): extract::Json<UpdateUserInput>,
 ) -> Result<axum::Json<User>, AppError> {
-    let ip_str = addr.ip().to_string();
     let mut conn = state.db_pool.acquire().await?;
     let mut user = User::get(id, &mut conn).await?.ok_or(AppError::NotFound)?;
     user.update(input.name, input.email, input.username, &mut conn).await?;
-    let _ = log_admin_update_user(id, admin.0.user_id, &ip_str, &mut conn).await;
+    let _ = log_admin_update_user(id, admin.0.user_id, &audit_ctx, &mut conn).await;
     Ok(axum::Json(user))
 }
 
@@ -426,12 +444,10 @@ pub struct AdminChangePasswordInput {
 )]
 async fn change_my_password(
     State(state): State<AppState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    audit_ctx: AuditContext,
     auth: AuthUser,
     extract::Json(input): extract::Json<ChangePasswordInput>,
 ) -> Result<StatusCode, AppError> {
-    let ip_str = addr.ip().to_string();
-
     Authenticator::validate_password(&input.new_password)
         .map_err(|e| AppError::InputError(vec![e]))?;
 
@@ -441,7 +457,7 @@ async fn change_my_password(
     Authenticator::try_password_login(&user, input.current_password, &mut conn).await?;
     Authenticator::update_password(auth.user_id, input.new_password, &mut conn).await?;
     revoke_all_user_tokens(auth.user_id, &mut conn).await?;
-    let _ = log_password_changed(auth.user_id, None, &ip_str, &mut conn).await;
+    let _ = log_password_changed(auth.user_id, None, &audit_ctx, &mut conn).await;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -462,13 +478,11 @@ async fn change_my_password(
 )]
 async fn admin_change_user_password(
     State(state): State<AppState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    audit_ctx: AuditContext,
     admin: AdminUser,
     Path(id): Path<Uuid>,
     extract::Json(input): extract::Json<AdminChangePasswordInput>,
 ) -> Result<StatusCode, AppError> {
-    let ip_str = addr.ip().to_string();
-
     Authenticator::validate_password(&input.new_password)
         .map_err(|e| AppError::InputError(vec![e]))?;
 
@@ -477,7 +491,7 @@ async fn admin_change_user_password(
 
     Authenticator::update_password(id, input.new_password, &mut conn).await?;
     revoke_all_user_tokens(id, &mut conn).await?;
-    let _ = log_password_changed(id, Some(admin.0.user_id), &ip_str, &mut conn).await;
+    let _ = log_password_changed(id, Some(admin.0.user_id), &audit_ctx, &mut conn).await;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -503,16 +517,11 @@ async fn admin_change_user_password(
 )]
 async fn login(
     State(state): State<AppState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    user_agent: Option<TypedHeader<UserAgent>>,
+    audit_ctx: AuditContext,
     extract::Json(input): extract::Json<LoginInput>,
 ) -> Result<axum::Json<TokenPair>, LoginError> {
-    let client_ip = addr.ip();
-    let ip_str = client_ip.to_string();
-    let ua_str = user_agent.map(|h| h.to_string());
-
     // Check rate limit before processing
-    if let Err(retry_after) = state.login_rate_limiter.check(client_ip).await {
+    if let Err(retry_after) = state.login_rate_limiter.check(audit_ctx.ip).await {
         return Err(LoginError::RateLimit(RateLimitExceeded { retry_after }));
     }
 
@@ -526,9 +535,9 @@ async fn login(
     let user = match User::login(input, &mut conn).await {
         Ok(user) => user,
         Err(e) => {
-            state.login_rate_limiter.record_failure(client_ip).await;
+            state.login_rate_limiter.record_failure(audit_ctx.ip).await;
             let failed_user_id = User::get_by_username(&username, &mut conn).await.ok().flatten().map(|u| u.id);
-            let _ = log_login_failed(&username, failed_user_id, &ip_str, ua_str, &mut conn).await;
+            let _ = log_login_failed(&username, failed_user_id, &audit_ctx, &mut conn).await;
             return Err(e.into());
         }
     };
@@ -537,7 +546,7 @@ async fn login(
     let token_pair = generate_token_pair(user.id, roles, &mut conn).await?;
 
     // Log successful login
-    let _ = log_login_success(user.id, &ip_str, ua_str, &mut conn).await;
+    let _ = log_login_success(user.id, &audit_ctx, &mut conn).await;
 
     Ok(axum::Json(token_pair))
 }
@@ -562,7 +571,7 @@ fn build_auth_cookie(token: &str, max_age_secs: i64) -> String {
 /// Build Set-Cookie header for refresh token
 fn build_refresh_cookie(token: &str, max_age_secs: i64) -> String {
     format!(
-        "{}={}; HttpOnly; Secure; SameSite=Lax; Path=/auth; Max-Age={}",
+        "{}={}; HttpOnly; Secure; SameSite=Strict; Path=/auth; Max-Age={}",
         REFRESH_COOKIE_NAME, token, max_age_secs
     )
 }
@@ -571,7 +580,7 @@ fn build_refresh_cookie(token: &str, max_age_secs: i64) -> String {
 fn clear_auth_cookies() -> Vec<String> {
     vec![
         format!("{}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0", AUTH_COOKIE_NAME),
-        format!("{}=; HttpOnly; Secure; SameSite=Lax; Path=/auth; Max-Age=0", REFRESH_COOKIE_NAME),
+        format!("{}=; HttpOnly; Secure; SameSite=Strict; Path=/auth; Max-Age=0", REFRESH_COOKIE_NAME),
     ]
 }
 
@@ -588,10 +597,9 @@ fn clear_auth_cookies() -> Vec<String> {
 )]
 async fn refresh_token(
     State(state): State<AppState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    audit_ctx: AuditContext,
     extract::Json(input): extract::Json<RefreshTokenInput>,
 ) -> Result<axum::Json<TokenPair>, AppError> {
-    let ip_str = addr.ip().to_string();
     let mut conn = state.db_pool.acquire().await?;
 
     // Atomically verify and revoke the refresh token (prevents replay via race condition)
@@ -607,7 +615,7 @@ async fn refresh_token(
     let token_pair = generate_token_pair(user_id, roles, &mut conn).await?;
 
     // Log the token refresh
-    let _ = log_token_refresh(user_id, &ip_str, &mut conn).await;
+    let _ = log_token_refresh(user_id, &audit_ctx, &mut conn).await;
 
     Ok(axum::Json(token_pair))
 }
@@ -625,10 +633,9 @@ async fn refresh_token(
 )]
 async fn logout(
     State(state): State<AppState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    audit_ctx: AuditContext,
     extract::Json(input): extract::Json<RefreshTokenInput>,
 ) -> Result<StatusCode, AppError> {
-    let ip_str = addr.ip().to_string();
     let mut conn = state.db_pool.acquire().await?;
 
     // Atomically verify and revoke the refresh token
@@ -638,7 +645,7 @@ async fn logout(
     let _ = revoke_user_access_tokens(user_id, &mut conn).await;
 
     // Log the logout
-    let _ = log_logout(user_id, &ip_str, &mut conn).await;
+    let _ = log_logout(user_id, &audit_ctx, &mut conn).await;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -785,12 +792,11 @@ pub struct AssignRoleInput {
 )]
 async fn assign_role(
     State(state): State<AppState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    audit_ctx: AuditContext,
     admin: AdminUser,
     Path(user_id): Path<Uuid>,
     extract::Json(input): extract::Json<AssignRoleInput>,
 ) -> Result<StatusCode, AppError> {
-    let ip_str = addr.ip().to_string();
     let mut conn = state.db_pool.acquire().await?;
 
     // Check user exists
@@ -803,7 +809,8 @@ async fn assign_role(
     let role = Role::get(input.role_id, &mut conn).await?.ok_or(AppError::NotFound)?;
 
     UserRole::assign(user_id, input.role_id, &mut conn).await?;
-    let _ = log_admin_role_assigned(user_id, admin.0.user_id, input.role_id, &role.name, &ip_str, &mut conn).await;
+    let _ = revoke_user_access_tokens(user_id, &mut conn).await;
+    let _ = log_admin_role_assigned(user_id, admin.0.user_id, input.role_id, &role.name, &audit_ctx, &mut conn).await;
     Ok(StatusCode::CREATED)
 }
 
@@ -825,16 +832,33 @@ async fn assign_role(
 )]
 async fn remove_role(
     State(state): State<AppState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    audit_ctx: AuditContext,
     admin: AdminUser,
     Path((user_id, role_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, AppError> {
-    let ip_str = addr.ip().to_string();
     let mut conn = state.db_pool.acquire().await?;
+
+    // Prevent removing the last admin
+    if let Some(role) = Role::get(role_id, &mut conn).await? {
+        if role.name == "admin" {
+            let admin_count: i64 = sqlx::query_scalar!(
+                "SELECT COUNT(*) FROM user_roles ur INNER JOIN roles r ON r.id = ur.role_id WHERE r.name = 'admin'"
+            )
+            .fetch_one(&mut *conn)
+            .await?;
+
+            if admin_count <= 1 {
+                return Err(AppError::InputError(vec![
+                    "Cannot remove the last admin role".to_string(),
+                ]));
+            }
+        }
+    }
 
     let removed = UserRole::remove(user_id, role_id, &mut conn).await?;
     if removed {
-        let _ = log_admin_role_removed(user_id, admin.0.user_id, role_id, &ip_str, &mut conn).await;
+        let _ = revoke_user_access_tokens(user_id, &mut conn).await;
+        let _ = log_admin_role_removed(user_id, admin.0.user_id, role_id, &audit_ctx, &mut conn).await;
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(AppError::NotFound)
@@ -1132,17 +1156,12 @@ pub struct BrowserLoginResponse {
 )]
 async fn browser_login(
     State(state): State<AppState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    user_agent: Option<TypedHeader<UserAgent>>,
+    audit_ctx: AuditContext,
     Query(query): Query<BrowserLoginQuery>,
     extract::Json(input): extract::Json<LoginInput>,
 ) -> Result<Response, LoginError> {
-    let client_ip = addr.ip();
-    let ip_str = client_ip.to_string();
-    let ua_str = user_agent.map(|h| h.to_string());
-
     // Check rate limit
-    if let Err(retry_after) = state.login_rate_limiter.check(client_ip).await {
+    if let Err(retry_after) = state.login_rate_limiter.check(audit_ctx.ip).await {
         return Err(LoginError::RateLimit(RateLimitExceeded { retry_after }));
     }
 
@@ -1156,9 +1175,9 @@ async fn browser_login(
     let user = match User::login(input, &mut conn).await {
         Ok(user) => user,
         Err(e) => {
-            state.login_rate_limiter.record_failure(client_ip).await;
+            state.login_rate_limiter.record_failure(audit_ctx.ip).await;
             let failed_user_id = User::get_by_username(&username, &mut conn).await.ok().flatten().map(|u| u.id);
-            let _ = log_login_failed(&username, failed_user_id, &ip_str, ua_str, &mut conn).await;
+            let _ = log_login_failed(&username, failed_user_id, &audit_ctx, &mut conn).await;
             return Err(e.into());
         }
     };
@@ -1166,7 +1185,7 @@ async fn browser_login(
     let roles = user.get_roles(&mut conn).await?;
     let token_pair = generate_token_pair(user.id, roles, &mut conn).await?;
 
-    let _ = log_login_success(user.id, &ip_str, ua_str, &mut conn).await;
+    let _ = log_login_success(user.id, &audit_ctx, &mut conn).await;
 
     // Build response with cookies
     let access_cookie = build_auth_cookie(&token_pair.access_token, token_pair.expires_in);
@@ -1231,11 +1250,10 @@ pub struct BrowserLogoutQuery {
 )]
 async fn browser_logout(
     State(state): State<AppState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    audit_ctx: AuditContext,
     headers: HeaderMap,
     Query(query): Query<BrowserLogoutQuery>,
 ) -> Result<Response, AppError> {
-    let ip_str = addr.ip().to_string();
     let mut conn = state.db_pool.acquire().await?;
 
     // Try to get the refresh token from cookies to revoke it
@@ -1254,7 +1272,7 @@ async fn browser_logout(
     if let Some(token) = refresh_token {
         if let Ok(user_id) = verify_and_revoke_refresh_token(token, &mut conn).await {
             let _ = revoke_user_access_tokens(user_id, &mut conn).await;
-            let _ = log_logout(user_id, &ip_str, &mut conn).await;
+            let _ = log_logout(user_id, &audit_ctx, &mut conn).await;
         }
     }
 
@@ -1303,10 +1321,9 @@ async fn browser_logout(
 )]
 async fn browser_refresh(
     State(state): State<AppState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    audit_ctx: AuditContext,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    let ip_str = addr.ip().to_string();
     let mut conn = state.db_pool.acquire().await?;
 
     let refresh_token_str = headers
@@ -1330,7 +1347,7 @@ async fn browser_refresh(
     let roles = user.get_roles(&mut conn).await?;
     let token_pair = generate_token_pair(user_id, roles, &mut conn).await?;
 
-    let _ = log_token_refresh(user_id, &ip_str, &mut conn).await;
+    let _ = log_token_refresh(user_id, &audit_ctx, &mut conn).await;
 
     let access_cookie = build_auth_cookie(&token_pair.access_token, token_pair.expires_in);
     let refresh_cookie = build_refresh_cookie(
@@ -1375,6 +1392,9 @@ async fn get_me(auth: AuthUser) -> axum::Json<MeResponse> {
 struct AuditLogParams {
     limit: Option<i64>,
     offset: Option<i64>,
+    user_id: Option<Uuid>,
+    since: Option<i64>,
+    until: Option<i64>,
 }
 
 #[utoipa::path(
@@ -1394,8 +1414,20 @@ async fn get_audit_log(
 ) -> Result<axum::Json<Vec<AuditLogRecord>>, AppError> {
     let limit = params.limit.unwrap_or(50).clamp(1, 200);
     let offset = params.offset.unwrap_or(0).max(0);
+
+    let mut query = AuditLogQuery::new().limit(limit).offset(offset);
+    if let Some(uid) = params.user_id {
+        query = query.for_user(uid);
+    }
+    if let Some(ts) = params.since {
+        query = query.since(ts);
+    }
+    if let Some(ts) = params.until {
+        query = query.until(ts);
+    }
+
     let mut conn = state.db_pool.acquire().await?;
-    let records = list_audit_log(limit, offset, &mut conn).await?;
+    let records = query.execute(&mut conn).await?;
     Ok(axum::Json(records))
 }
 
@@ -1438,13 +1470,10 @@ pub struct ValidateInviteResponse {
 )]
 async fn register(
     State(state): State<AppState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    audit_ctx: AuditContext,
     extract::Json(input): extract::Json<RegisterInput>,
 ) -> Result<Response, RegisterError> {
-    let client_ip = addr.ip();
-    let ip_str = client_ip.to_string();
-
-    if let Err(retry_after) = state.register_rate_limiter.check(client_ip).await {
+    if let Err(retry_after) = state.register_rate_limiter.check(audit_ctx.ip).await {
         return Err(RegisterError::RateLimit(RateLimitExceeded { retry_after }));
     }
 
@@ -1504,9 +1533,9 @@ async fn register(
     tx.commit().await?;
 
     let invite_id = consumed_invite.as_ref().map(|i| i.id.as_str());
-    let _ = log_user_registered(user.id, invite_id, &ip_str, &mut conn).await;
+    let _ = log_user_registered(user.id, invite_id, &audit_ctx, &mut conn).await;
     if let Some(invite) = &consumed_invite {
-        let _ = log_invitation_consumed(user.id, &invite.id, &ip_str, &mut conn).await;
+        let _ = log_invitation_consumed(user.id, &invite.id, &audit_ctx, &mut conn).await;
     }
 
     let token_pair = generate_token_pair(user.id, vec!["user".to_string()], &mut conn).await?;
@@ -1597,11 +1626,10 @@ async fn get_settings(
 )]
 async fn update_settings(
     State(state): State<AppState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    audit_ctx: AuditContext,
     admin: AdminUser,
     extract::Json(input): extract::Json<UpdateSettingsInput>,
 ) -> Result<axum::Json<SettingsResponse>, AppError> {
-    let ip_str = addr.ip().to_string();
     let mut conn = state.db_pool.acquire().await?;
 
     let mut changes = serde_json::json!({});
@@ -1612,7 +1640,7 @@ async fn update_settings(
         changes["open_registration"] = serde_json::json!(open_reg);
     }
 
-    let _ = log_settings_updated(admin.0.user_id, changes, &ip_str, &mut conn).await;
+    let _ = log_settings_updated(admin.0.user_id, changes, &audit_ctx, &mut conn).await;
 
     let open_registration = open_registration_enabled(&mut conn).await?;
     Ok(axum::Json(SettingsResponse { open_registration }))
@@ -1655,18 +1683,17 @@ async fn list_invitations(
 )]
 async fn create_invitation(
     State(state): State<AppState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    audit_ctx: AuditContext,
     admin: AdminUser,
     extract::Json(input): extract::Json<CreateInvitationInput>,
 ) -> Result<(StatusCode, axum::Json<Invitation>), AppError> {
-    let ip_str = addr.ip().to_string();
     Invitation::validate_input(&input)?;
 
     let invitation = Invitation::new(input, admin.0.user_id);
     let mut conn = state.db_pool.acquire().await?;
     invitation.save(&mut conn).await?;
 
-    let _ = log_invitation_created(admin.0.user_id, &invitation.id, invitation.label.as_deref(), &ip_str, &mut conn).await;
+    let _ = log_invitation_created(admin.0.user_id, &invitation.id, invitation.label.as_deref(), &audit_ctx, &mut conn).await;
 
     Ok((StatusCode::CREATED, axum::Json(invitation)))
 }
@@ -1687,11 +1714,10 @@ async fn create_invitation(
 )]
 async fn delete_invitation(
     State(state): State<AppState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    audit_ctx: AuditContext,
     admin: AdminUser,
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    let ip_str = addr.ip().to_string();
     let mut conn = state.db_pool.acquire().await?;
 
     let deleted = Invitation::delete(&id, &mut conn).await?;
@@ -1699,7 +1725,7 @@ async fn delete_invitation(
         return Err(AppError::NotFound);
     }
 
-    let _ = log_invitation_deleted(admin.0.user_id, &id, &ip_str, &mut conn).await;
+    let _ = log_invitation_deleted(admin.0.user_id, &id, &audit_ctx, &mut conn).await;
 
     Ok(StatusCode::NO_CONTENT)
 }

@@ -89,6 +89,7 @@ impl User {
                 Err(_) => Err(AppError::AuthenticationRequired),
             }
         } else {
+            Authenticator::dummy_password_check();
             Err(AppError::AuthenticationRequired)
         }
     }
