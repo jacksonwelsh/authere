@@ -95,6 +95,26 @@ impl Authenticator {
         }
     }
 
+    pub async fn update_password(
+        user_id: Uuid,
+        new_password: String,
+        conn: &mut SqliteConnection,
+    ) -> Result<(), AppError> {
+        let new_auth = Authenticator::new_password(new_password, user_id)
+            .map_err(|e| AppError::InternalError(format!("Failed to hash password: {e}")))?;
+        let AuthenticationScheme::Password(hash) = new_auth.scheme else {
+            return Err(AppError::InternalError("Unexpected scheme".into()));
+        };
+        sqlx::query!(
+            "UPDATE authenticators SET value = ? WHERE owner_id = ? AND type = 'password'",
+            hash,
+            user_id
+        )
+        .execute(conn)
+        .await?;
+        Ok(())
+    }
+
     async fn get_password_for(
         user: &User,
         conn: &mut SqliteConnection,

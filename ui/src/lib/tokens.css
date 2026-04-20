@@ -1,0 +1,76 @@
+/* Authere Design System — canonical tokens */
+
+:root {
+  /* Slate scale */
+  --slate-0: #05080f;
+  --slate-1: #0a0f1c;
+  --slate-2: #0f1524;
+  --slate-3: #141b2d;
+  --slate-4: #1c2438;
+  --slate-5: #232b42;
+  --slate-6: #2e3850;
+  --slate-7: #3d4866;
+  --slate-8: #5b6685;
+  --slate-9: #8390ad;
+  --slate-10: #b4bcd0;
+  --slate-11: #dce1ed;
+  --slate-12: #f4f6fa;
+
+  /* Background tokens */
+  --bg-0: #05080f;
+  --bg-1: #0a0f1c;
+  --bg-2: #0f1524;
+  --bg-3: #141b2d;
+  --bg-4: #1c2438;
+
+  /* Foreground tokens */
+  --fg-0: #ffffff;
+  --fg-1: #f4f6fa;
+  --fg-2: #dce1ed;
+  --fg-3: #b4bcd0;
+  --fg-4: #8390ad;
+  --fg-5: #3d4866;
+
+  /* Border tokens */
+  --border-0: rgba(255, 255, 255, 0.06);
+  --border-1: rgba(255, 255, 255, 0.10);
+  --border-2: rgba(255, 255, 255, 0.16);
+  --border-focus: #3b82f6;
+
+  /* Accent */
+  --accent: #3b82f6;
+  --accent-hover: #2563eb;
+  --accent-pressed: #1d4ed8;
+  --accent-subtle: #0b1a3a;
+
+  /* Semantic */
+  --success: #10b981;
+  --warning: #f59e0b;
+  --danger: #ef4444;
+  --danger-hover: #dc2626;
+  --danger-subtle: #2d0a0a;
+
+  /* Spacing (4px grid) */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+  --sp-6: 24px;
+  --sp-8: 32px;
+  --sp-10: 40px;
+  --sp-14: 56px;
+  --sp-18: 72px;
+
+  /* Motion */
+  --ease-out: cubic-bezier(0.2, 0, 0, 1);
+  --duration-micro: 80ms;
+  --duration-default: 140ms;
+  --duration-large: 220ms;
+
+  /* Radius — sharp everywhere */
+  --radius: 2px;
+
+  /* Shadow (raised surfaces only) */
+  --shadow-raised: 0 0 0 1px rgba(255, 255, 255, 0.02), 0 12px 32px -16px rgba(0, 0, 0, 0.8);
+}

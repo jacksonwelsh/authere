@@ -111,7 +111,7 @@ impl User {
         }
     }
 
-    async fn get_by_username(
+    pub async fn get_by_username(
         username: &str,
         conn: &mut SqliteConnection,
     ) -> AppResult<Option<Self>> {
@@ -160,6 +160,35 @@ impl User {
             Some(email) if EMAIL_REGEX.is_match(email) => Ok(()),
             _ => Err(String::from("Email is not valid")),
         }
+    }
+
+    pub async fn update(
+        &mut self,
+        name: Option<String>,
+        email: Option<Option<String>>,
+        username: Option<String>,
+        conn: &mut SqliteConnection,
+    ) -> AppResult<()> {
+        if let Some(ref n) = name { Self::validate_name(n).map_err(|e| AppError::InputError(vec![e]))?; }
+        if let Some(ref e) = email { Self::validate_email(e).map_err(|e| AppError::InputError(vec![e]))?; }
+        if let Some(ref u) = username { Self::validate_username(u).map_err(|e| AppError::InputError(vec![e]))?; }
+
+        if let Some(n) = name { self.name = n; }
+        if let Some(e) = email { self.email = e; }
+        if let Some(u) = username { self.username = u; }
+
+        sqlx::query!(
+            "UPDATE users SET name = ?, email = ?, username = ? WHERE id = ?",
+            self.name, self.email, self.username, self.id
+        )
+        .execute(conn)
+        .await
+        .map_err(|e| match e {
+            sqlx::Error::Database(ref db) if db.message().contains("UNIQUE") =>
+                AppError::UniqueError("Username already taken".to_string()),
+            _ => e.into(),
+        })?;
+        Ok(())
     }
 }
 

@@ -1,8 +1,12 @@
 use crate::errors::AppError;
 
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use aes_gcm::{
+    Aes256Gcm, Key, Nonce,
+    aead::{Aead, KeyInit},
+};
+use ed25519_dalek::{SigningKey, VerifyingKey, pkcs8::EncodePrivateKey};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
-use rand::rngs::OsRng;
+use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{FromRow, SqliteConnection, query};
@@ -48,9 +52,67 @@ pub struct RefreshTokenRecord {
     pub revoked_at: Option<i64>,
 }
 
+// ============================================================================
+// Key Encryption
+// ============================================================================
+
+/// Returns the 32-byte key-encryption key from AUTHERE_KEY_SECRET (hex-encoded).
+fn get_kek() -> Result<[u8; 32], AppError> {
+    let secret = std::env::var("AUTHERE_KEY_SECRET").map_err(|_| {
+        AppError::InternalError(
+            "AUTHERE_KEY_SECRET environment variable is required (32 random bytes, hex-encoded)"
+                .to_string(),
+        )
+    })?;
+    let bytes = hex::decode(secret.trim()).map_err(|_| {
+        AppError::InternalError(
+            "AUTHERE_KEY_SECRET must be hex-encoded (64 hex characters = 32 bytes)".to_string(),
+        )
+    })?;
+    bytes.try_into().map_err(|_| {
+        AppError::InternalError(
+            "AUTHERE_KEY_SECRET must be exactly 32 bytes (64 hex characters)".to_string(),
+        )
+    })
+}
+
+fn encrypt_private_key(
+    key_bytes: &[u8; 32],
+    kek: &[u8; 32],
+) -> Result<(Vec<u8>, [u8; 12]), AppError> {
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(kek));
+    let mut nonce_bytes = [0u8; 12];
+    OsRng.fill_bytes(&mut nonce_bytes);
+    let ciphertext = cipher
+        .encrypt(Nonce::from_slice(&nonce_bytes), key_bytes.as_slice())
+        .map_err(|e| AppError::InternalError(format!("Key encryption failed: {e}")))?;
+    Ok((ciphertext, nonce_bytes))
+}
+
+fn decrypt_private_key(
+    ciphertext: &[u8],
+    nonce: &[u8; 12],
+    kek: &[u8; 32],
+) -> Result<[u8; 32], AppError> {
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(kek));
+    let plaintext = cipher
+        .decrypt(Nonce::from_slice(nonce), ciphertext)
+        .map_err(|_| {
+            AppError::InternalError(
+                "Key decryption failed — check AUTHERE_KEY_SECRET".to_string(),
+            )
+        })?;
+    plaintext
+        .try_into()
+        .map_err(|_| AppError::InternalError("Decrypted key has invalid length".to_string()))
+}
+
+// ============================================================================
+// Key Management
+// ============================================================================
+
 fn generate_key() -> SigningKey {
-    let mut rng = OsRng;
-    SigningKey::generate(&mut rng)
+    SigningKey::generate(&mut OsRng)
 }
 
 /// Initializes the database with a signing key if not present. Returns Ok(true) if work was done,
@@ -70,19 +132,22 @@ pub async fn try_initialize(conn: &mut SqliteConnection) -> Result<bool, AppErro
 
 async fn initialize(conn: &mut SqliteConnection) -> Result<(), AppError> {
     let key = generate_key();
+    let kek = get_kek()?;
 
     let id = Uuid::now_v7();
     let public_key = key.verifying_key().to_bytes();
     let private_key = key.to_bytes();
-
     let pubk_slice = &public_key[..];
-    let privk_slice = &private_key[..];
+
+    let (ciphertext, nonce) = encrypt_private_key(&private_key, &kek)?;
+    let nonce_slice = &nonce[..];
 
     query!(
-        "INSERT INTO keys (id, name, public_key, private_key) VALUES (?, 'default', ?, ?)",
+        "INSERT INTO keys (id, name, public_key, private_key, key_nonce) VALUES (?, 'default', ?, ?, ?)",
         id,
         pubk_slice,
-        privk_slice,
+        ciphertext,
+        nonce_slice,
     )
     .execute(conn)
     .await?;
@@ -91,16 +156,38 @@ async fn initialize(conn: &mut SqliteConnection) -> Result<(), AppError> {
 }
 
 async fn get_signing_key(conn: &mut SqliteConnection) -> Result<SigningKey, AppError> {
-    let row = query!("SELECT private_key FROM keys WHERE name = 'default'")
-        .fetch_one(conn)
+    let row = query!("SELECT private_key, key_nonce FROM keys WHERE name = 'default'")
+        .fetch_one(&mut *conn)
         .await?;
 
-    let private_key: [u8; 32] = row
-        .private_key
-        .try_into()
-        .map_err(|_| AppError::InternalError("Invalid key length".to_string()))?;
-
-    Ok(SigningKey::from_bytes(&private_key))
+    match row.key_nonce {
+        None => {
+            // Legacy plaintext key — re-encrypt in place on first use
+            let kek = get_kek()?;
+            let private_key: [u8; 32] = row
+                .private_key
+                .try_into()
+                .map_err(|_| AppError::InternalError("Invalid key length".to_string()))?;
+            let (ciphertext, nonce) = encrypt_private_key(&private_key, &kek)?;
+            let nonce_slice = &nonce[..];
+            query!(
+                "UPDATE keys SET private_key = ?, key_nonce = ? WHERE name = 'default'",
+                ciphertext,
+                nonce_slice,
+            )
+            .execute(conn)
+            .await?;
+            Ok(SigningKey::from_bytes(&private_key))
+        }
+        Some(nonce_bytes) => {
+            let kek = get_kek()?;
+            let nonce: [u8; 12] = nonce_bytes
+                .try_into()
+                .map_err(|_| AppError::InternalError("Invalid nonce length".to_string()))?;
+            let private_key = decrypt_private_key(&row.private_key, &nonce, &kek)?;
+            Ok(SigningKey::from_bytes(&private_key))
+        }
+    }
 }
 
 pub async fn get_verifying_key(conn: &mut SqliteConnection) -> Result<VerifyingKey, AppError> {
@@ -124,6 +211,10 @@ fn current_timestamp() -> i64 {
         .as_secs() as i64
 }
 
+// ============================================================================
+// Token Generation
+// ============================================================================
+
 /// Generates an access token for the given user
 pub async fn generate_access_token(
     user_id: Uuid,
@@ -138,12 +229,14 @@ pub async fn generate_access_token(
         roles,
         exp: now + ACCESS_TOKEN_LIFETIME,
         iat: now,
-        jti: Uuid::now_v7().to_string(),
+        jti: Uuid::new_v4().to_string(),
         typ: "access".to_string(),
     };
 
     let header = Header::new(Algorithm::EdDSA);
-    let encoding_key = EncodingKey::from_ed_der(&signing_key.to_keypair_bytes());
+    let pkcs8_der = signing_key.to_pkcs8_der()
+        .map_err(|e| AppError::InternalError(format!("Failed to encode signing key: {e}")))?;
+    let encoding_key = EncodingKey::from_ed_der(pkcs8_der.as_bytes());
 
     encode(&header, &claims, &encoding_key)
         .map_err(|e| AppError::InternalError(format!("Failed to encode JWT: {e}")))
@@ -156,27 +249,25 @@ pub async fn generate_refresh_token(
 ) -> Result<String, AppError> {
     let signing_key = get_signing_key(conn).await?;
     let now = current_timestamp();
-    let token_id = Uuid::now_v7();
 
     let claims = Claims {
         sub: user_id.to_string(),
         roles: vec![], // Refresh tokens don't carry roles
         exp: now + REFRESH_TOKEN_LIFETIME,
         iat: now,
-        jti: token_id.to_string(),
+        jti: Uuid::new_v4().to_string(),
         typ: "refresh".to_string(),
     };
 
     let header = Header::new(Algorithm::EdDSA);
-    let encoding_key = EncodingKey::from_ed_der(&signing_key.to_keypair_bytes());
+    let pkcs8_der = signing_key.to_pkcs8_der()
+        .map_err(|e| AppError::InternalError(format!("Failed to encode signing key: {e}")))?;
+    let encoding_key = EncodingKey::from_ed_der(pkcs8_der.as_bytes());
 
     let token = encode(&header, &claims, &encoding_key)
         .map_err(|e| AppError::InternalError(format!("Failed to encode JWT: {e}")))?;
 
-    // Hash the token for storage
     let token_hash = hash_token(&token);
-
-    // Store in database
     let id = Uuid::now_v7();
     let expires_at = now + REFRESH_TOKEN_LIFETIME;
 
@@ -211,12 +302,17 @@ pub async fn generate_token_pair(
     })
 }
 
-/// Verifies an access token and returns the claims
+// ============================================================================
+// Token Verification
+// ============================================================================
+
+/// Verifies an access token and returns the claims.
+/// Also checks user-level revocations so logout takes effect immediately.
 pub async fn verify_access_token(
     token: &str,
     conn: &mut SqliteConnection,
 ) -> Result<Claims, AppError> {
-    let verifying_key = get_verifying_key(conn).await?;
+    let verifying_key = get_verifying_key(&mut *conn).await?;
     let decoding_key = DecodingKey::from_ed_der(&verifying_key.to_bytes());
 
     let mut validation = Validation::new(Algorithm::EdDSA);
@@ -225,20 +321,37 @@ pub async fn verify_access_token(
     let token_data = decode::<Claims>(token, &decoding_key, &validation)
         .map_err(|_| AppError::AuthenticationRequired)?;
 
-    // Verify it's an access token
     if token_data.claims.typ != "access" {
         return Err(AppError::AuthenticationRequired);
+    }
+
+    let user_id = Uuid::parse_str(&token_data.claims.sub)
+        .map_err(|_| AppError::InternalError("Invalid user ID in token".to_string()))?;
+
+    let revocation = query!(
+        "SELECT revoked_before FROM user_access_revocations WHERE user_id = ?",
+        user_id
+    )
+    .fetch_optional(conn)
+    .await?;
+
+    if let Some(r) = revocation {
+        if token_data.claims.iat <= r.revoked_before {
+            return Err(AppError::AuthenticationRequired);
+        }
     }
 
     Ok(token_data.claims)
 }
 
-/// Verifies a refresh token and returns the user ID if valid
-pub async fn verify_refresh_token(
+/// Atomically verifies a refresh token and revokes it in a single DB operation.
+/// This eliminates the race condition where two concurrent requests could both
+/// pass the verify check before either revocation is recorded.
+pub async fn verify_and_revoke_refresh_token(
     token: &str,
     conn: &mut SqliteConnection,
 ) -> Result<Uuid, AppError> {
-    let verifying_key = get_verifying_key(conn).await?;
+    let verifying_key = get_verifying_key(&mut *conn).await?;
     let decoding_key = DecodingKey::from_ed_der(&verifying_key.to_bytes());
 
     let mut validation = Validation::new(Algorithm::EdDSA);
@@ -247,51 +360,61 @@ pub async fn verify_refresh_token(
     let token_data = decode::<Claims>(token, &decoding_key, &validation)
         .map_err(|_| AppError::AuthenticationRequired)?;
 
-    // Verify it's a refresh token
     if token_data.claims.typ != "refresh" {
         return Err(AppError::AuthenticationRequired);
     }
 
-    // Check if token is in the database and not revoked
     let token_hash = hash_token(token);
     let now = current_timestamp();
 
-    let record = query!(
-        "SELECT id, revoked_at FROM refresh_tokens WHERE token_hash = ? AND expires_at > ?",
+    // Single atomic UPDATE: only succeeds if the token is present, unexpired, and not yet revoked.
+    // SQLite serializes writes, so concurrent requests with the same token will see rows_affected=0
+    // after the first one wins.
+    let result = query!(
+        "UPDATE refresh_tokens SET revoked_at = ? WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > ?",
+        now,
         token_hash,
         now
-    )
-    .fetch_optional(&mut *conn)
-    .await?;
-
-    match record {
-        Some(r) if r.revoked_at.is_none() => {
-            let user_id = Uuid::parse_str(&token_data.claims.sub)
-                .map_err(|_| AppError::InternalError("Invalid user ID in token".to_string()))?;
-            Ok(user_id)
-        }
-        _ => Err(AppError::AuthenticationRequired),
-    }
-}
-
-/// Revokes a refresh token
-pub async fn revoke_refresh_token(token: &str, conn: &mut SqliteConnection) -> Result<(), AppError> {
-    let token_hash = hash_token(token);
-    let now = current_timestamp();
-
-    query!(
-        "UPDATE refresh_tokens SET revoked_at = ? WHERE token_hash = ?",
-        now,
-        token_hash
     )
     .execute(conn)
     .await?;
 
+    if result.rows_affected() != 1 {
+        return Err(AppError::AuthenticationRequired);
+    }
+
+    let user_id = Uuid::parse_str(&token_data.claims.sub)
+        .map_err(|_| AppError::InternalError("Invalid user ID in token".to_string()))?;
+    Ok(user_id)
+}
+
+// ============================================================================
+// Token Revocation
+// ============================================================================
+
+/// Revokes all access tokens for a user issued at or before now.
+/// Uses INSERT OR REPLACE so repeated calls always advance the revocation timestamp.
+pub async fn revoke_user_access_tokens(
+    user_id: Uuid,
+    conn: &mut SqliteConnection,
+) -> Result<(), AppError> {
+    let now = current_timestamp();
+    query!(
+        "INSERT INTO user_access_revocations (user_id, revoked_before) VALUES (?, ?)
+         ON CONFLICT(user_id) DO UPDATE SET revoked_before = excluded.revoked_before",
+        user_id,
+        now
+    )
+    .execute(conn)
+    .await?;
     Ok(())
 }
 
-/// Revokes all refresh tokens for a user
-pub async fn revoke_all_user_tokens(user_id: Uuid, conn: &mut SqliteConnection) -> Result<(), AppError> {
+/// Revokes all refresh tokens and access tokens for a user (e.g. on password change)
+pub async fn revoke_all_user_tokens(
+    user_id: Uuid,
+    conn: &mut SqliteConnection,
+) -> Result<(), AppError> {
     let now = current_timestamp();
 
     query!(
@@ -299,8 +422,10 @@ pub async fn revoke_all_user_tokens(user_id: Uuid, conn: &mut SqliteConnection) 
         now,
         user_id
     )
-    .execute(conn)
+    .execute(&mut *conn)
     .await?;
+
+    revoke_user_access_tokens(user_id, conn).await?;
 
     Ok(())
 }

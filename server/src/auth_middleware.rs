@@ -8,6 +8,33 @@ use uuid::Uuid;
 use crate::errors::AppError;
 use crate::user::auth::token::verify_access_token;
 
+/// Extract a token string from either the Authorization header or the authere_token cookie.
+fn extract_token(parts: &Parts) -> Option<String> {
+    // Authorization: Bearer <token>
+    if let Some(bearer) = parts
+        .headers
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+    {
+        return Some(bearer.to_owned());
+    }
+
+    // Cookie: authere_token=<token>
+    parts
+        .headers
+        .get(axum::http::header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|cookies| {
+            cookies
+                .split(';')
+                .map(|s| s.trim())
+                .find(|s| s.starts_with("authere_token="))
+                .and_then(|s| s.strip_prefix("authere_token="))
+                .map(|s| s.to_owned())
+        })
+}
+
 /// Authenticated user information extracted from JWT
 #[derive(Debug, Clone)]
 pub struct AuthUser {
@@ -37,21 +64,10 @@ where
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         let pool = SqlitePool::from_ref(state);
 
-        // Extract the Authorization header
-        let auth_header = parts
-            .headers
-            .get(AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .ok_or(AppError::AuthenticationRequired)?;
+        let token = extract_token(parts).ok_or(AppError::AuthenticationRequired)?;
 
-        // Parse Bearer token
-        let token = auth_header
-            .strip_prefix("Bearer ")
-            .ok_or(AppError::AuthenticationRequired)?;
-
-        // Verify the token
         let mut conn = pool.acquire().await?;
-        let claims = verify_access_token(token, &mut conn).await?;
+        let claims = verify_access_token(&token, &mut conn).await?;
 
         let user_id = Uuid::parse_str(&claims.sub)
             .map_err(|_| AppError::InternalError("Invalid user ID in token".to_string()))?;

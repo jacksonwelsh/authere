@@ -3,14 +3,16 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use crate::application::{Application, CreateApplicationInput, UpdateApplicationInput};
-use crate::audit::{log_login_failed, log_login_success, log_logout, log_token_refresh, log_user_created};
-use crate::auth_middleware::AdminUser;
+use crate::audit::{list_audit_log, log_admin_role_assigned, log_admin_role_removed, log_admin_update_user, log_invitation_consumed, log_invitation_created, log_invitation_deleted, log_login_failed, log_login_success, log_logout, log_password_changed, log_settings_updated, log_token_refresh, log_user_created, log_user_registered, AuditLogRecord};
+use crate::auth_middleware::{AdminUser, AuthUser};
 use crate::cli::{Cli, Commands};
 use crate::db::DbEntity;
 use crate::errors::AppError;
+use crate::invitation::{CreateInvitationInput, Invitation, InvitationWithStatus};
 use crate::rate_limit::{RateLimitConfig, RateLimitExceeded, RateLimiter};
 use crate::role::{CreateRoleInput, Role, UserRole};
-use crate::user::auth::token::{self, TokenPair, generate_token_pair, verify_access_token, verify_refresh_token, revoke_refresh_token};
+use crate::settings::{SettingsResponse, UpdateSettingsInput, open_registration_enabled, set_setting};
+use crate::user::auth::token::{self, TokenPair, generate_token_pair, verify_access_token, verify_and_revoke_refresh_token, revoke_user_access_tokens, revoke_all_user_tokens};
 use crate::user::auth::Authenticator;
 use crate::user::{CreateUserInput, LoginInput, User};
 
@@ -37,8 +39,11 @@ pub mod auth_middleware;
 pub mod cli;
 pub mod db;
 pub mod errors;
+pub mod invitation;
 pub mod rate_limit;
 pub mod role;
+pub mod settings;
+pub mod static_files;
 pub mod user;
 
 #[derive(OpenApi)]
@@ -54,6 +59,7 @@ struct ApiDoc;
 struct AppState {
     db_pool: SqlitePool,
     login_rate_limiter: RateLimiter,
+    register_rate_limiter: RateLimiter,
 }
 
 impl axum::extract::FromRef<AppState> for SqlitePool {
@@ -89,8 +95,36 @@ impl From<sqlx::Error> for LoginError {
     }
 }
 
+pub enum RegisterError {
+    App(AppError),
+    RateLimit(RateLimitExceeded),
+}
+
+impl IntoResponse for RegisterError {
+    fn into_response(self) -> Response {
+        match self {
+            RegisterError::App(e) => e.into_response(),
+            RegisterError::RateLimit(e) => e.into_response(),
+        }
+    }
+}
+
+impl From<AppError> for RegisterError {
+    fn from(e: AppError) -> Self {
+        RegisterError::App(e)
+    }
+}
+
+impl From<sqlx::Error> for RegisterError {
+    fn from(e: sqlx::Error) -> Self {
+        RegisterError::App(AppError::from(e))
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), AppError> {
+    dotenvy::dotenv().ok(); // load .env from working directory if present
+
     let cli = Cli::parse();
 
     let database_url = env::var("DATABASE_URL").unwrap_or_else(|_| {
@@ -133,17 +167,27 @@ async fn main() -> Result<(), AppError> {
         window: Duration::from_secs(60),
     });
 
+    // 3 registration attempts per hour per IP
+    let register_rate_limiter = RateLimiter::new(RateLimitConfig {
+        max_requests: 3,
+        window: Duration::from_secs(3600),
+    });
+
     let state = AppState {
         db_pool,
         login_rate_limiter,
+        register_rate_limiter,
     };
 
     let (router, api) = OpenApiRouter::with_openapi(ApiDoc::openapi())
         .routes(routes!(create_user, get_users))
-        .routes(routes!(get_user))
+        .routes(routes!(get_user, update_user))
         .routes(routes!(login))
         .routes(routes!(refresh_token))
         .routes(routes!(logout))
+        // Registration
+        .routes(routes!(register))
+        .routes(routes!(validate_invite))
         // Role management
         .routes(routes!(list_roles))
         .routes(routes!(create_role))
@@ -163,10 +207,32 @@ async fn main() -> Result<(), AppError> {
         // Browser-friendly auth
         .routes(routes!(browser_login))
         .routes(routes!(browser_logout))
+        .routes(routes!(browser_refresh))
+        // Admin UI API
+        .routes(routes!(get_me, update_me))
+        .routes(routes!(change_my_password))
+        .routes(routes!(admin_change_user_password))
+        .routes(routes!(get_audit_log))
+        // Admin settings
+        .routes(routes!(get_settings, update_settings))
+        // Admin invitations
+        .routes(routes!(list_invitations, create_invitation))
+        .routes(routes!(delete_invitation))
         .with_state(state)
         .split_for_parts();
 
-    let router = router.merge(SwaggerUi::new("/docs").url("/apidoc/openapi.json", api));
+    let router = router
+        .merge(SwaggerUi::new("/docs").url("/apidoc/openapi.json", api))
+        // Static assets (hashed filenames — long cache)
+        .route("/assets/{*path}", axum::routing::get(static_files::serve_asset))
+        // SPA shell — served for all UI routes
+        .route("/", axum::routing::get(static_files::serve_spa))
+        .route("/login", axum::routing::get(static_files::serve_spa))
+        .route("/admin", axum::routing::get(static_files::serve_spa))
+        .route("/admin/{*path}", axum::routing::get(static_files::serve_spa))
+        .route("/account", axum::routing::get(static_files::serve_spa))
+        .route("/credentials", axum::routing::get(static_files::serve_spa))
+        .route("/register", axum::routing::get(static_files::serve_spa));
 
     println!("Starting server on 0.0.0.0:3000");
     println!("Swagger UI available at http://localhost:3000/docs");
@@ -198,6 +264,7 @@ async fn main() -> Result<(), AppError> {
 async fn create_user(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    admin: AdminUser,
     extract::Json(input): extract::Json<CreateUserInput>,
 ) -> Result<(StatusCode, axum::Json<User>), AppError> {
     let ip_str = addr.ip().to_string();
@@ -213,11 +280,13 @@ async fn create_user(
     let mut tx = state.db_pool.begin().await?;
     user.save(&mut tx).await?;
     authenticator.save(&mut tx).await?;
+    if let Some(user_role) = Role::get_by_name("user", &mut tx).await? {
+        let _ = UserRole::assign(user.id, user_role.id, &mut tx).await;
+    }
     tx.commit().await?;
 
-    // Log user creation (no actor_id since this is self-registration or unauthenticated)
     let mut conn = state.db_pool.acquire().await?;
-    let _ = log_user_created(user.id, None, &ip_str, &mut conn).await;
+    let _ = log_user_created(user.id, Some(admin.0.user_id), &ip_str, &mut conn).await;
 
     Ok((StatusCode::CREATED, axum::Json(user)))
 }
@@ -272,6 +341,147 @@ async fn get_user(
     }
 }
 
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateUserInput {
+    pub name: Option<String>,
+    pub email: Option<Option<String>>,
+    pub username: Option<String>,
+}
+
+#[utoipa::path(
+    patch,
+    path = "/user/{id}",
+    params(("id" = Uuid, Path, description = "User ID")),
+    request_body(content = UpdateUserInput),
+    responses(
+        (status = 200, description = "User updated", body = User),
+        (status = 400, description = "Invalid input"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Admin access required"),
+        (status = 404, description = "User not found"),
+        (status = 409, description = "Username already taken"),
+    ),
+    tag = ADMIN_TAG
+)]
+async fn update_user(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    admin: AdminUser,
+    Path(id): Path<Uuid>,
+    extract::Json(input): extract::Json<UpdateUserInput>,
+) -> Result<axum::Json<User>, AppError> {
+    let ip_str = addr.ip().to_string();
+    let mut conn = state.db_pool.acquire().await?;
+    let mut user = User::get(id, &mut conn).await?.ok_or(AppError::NotFound)?;
+    user.update(input.name, input.email, input.username, &mut conn).await?;
+    let _ = log_admin_update_user(id, admin.0.user_id, &ip_str, &mut conn).await;
+    Ok(axum::Json(user))
+}
+
+#[utoipa::path(
+    patch,
+    path = "/me",
+    request_body(content = UpdateUserInput),
+    responses(
+        (status = 200, description = "Profile updated", body = User),
+        (status = 400, description = "Invalid input"),
+        (status = 401, description = "Authentication required"),
+        (status = 409, description = "Username already taken"),
+    ),
+    tag = AUTH_TAG
+)]
+async fn update_me(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    extract::Json(input): extract::Json<UpdateUserInput>,
+) -> Result<axum::Json<User>, AppError> {
+    let mut conn = state.db_pool.acquire().await?;
+    let mut user = User::get(auth.user_id, &mut conn).await?.ok_or(AppError::NotFound)?;
+    user.update(input.name, input.email, input.username, &mut conn).await?;
+    Ok(axum::Json(user))
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ChangePasswordInput {
+    pub current_password: String,
+    pub new_password: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct AdminChangePasswordInput {
+    pub new_password: String,
+}
+
+#[utoipa::path(
+    patch,
+    path = "/me/password",
+    request_body(content = ChangePasswordInput),
+    responses(
+        (status = 204, description = "Password changed, all sessions revoked"),
+        (status = 400, description = "New password does not meet requirements"),
+        (status = 401, description = "Authentication required or current password incorrect"),
+        (status = 404, description = "User not found"),
+    ),
+    tag = AUTH_TAG
+)]
+async fn change_my_password(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    auth: AuthUser,
+    extract::Json(input): extract::Json<ChangePasswordInput>,
+) -> Result<StatusCode, AppError> {
+    let ip_str = addr.ip().to_string();
+
+    Authenticator::validate_password(&input.new_password)
+        .map_err(|e| AppError::InputError(vec![e]))?;
+
+    let mut conn = state.db_pool.acquire().await?;
+    let user = User::get(auth.user_id, &mut conn).await?.ok_or(AppError::NotFound)?;
+
+    Authenticator::try_password_login(&user, input.current_password, &mut conn).await?;
+    Authenticator::update_password(auth.user_id, input.new_password, &mut conn).await?;
+    revoke_all_user_tokens(auth.user_id, &mut conn).await?;
+    let _ = log_password_changed(auth.user_id, None, &ip_str, &mut conn).await;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    put,
+    path = "/user/{id}/password",
+    params(("id" = Uuid, Path, description = "User ID")),
+    request_body(content = AdminChangePasswordInput),
+    responses(
+        (status = 204, description = "Password changed, all user sessions revoked"),
+        (status = 400, description = "New password does not meet requirements"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Admin access required"),
+        (status = 404, description = "User not found"),
+    ),
+    tag = ADMIN_TAG
+)]
+async fn admin_change_user_password(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    admin: AdminUser,
+    Path(id): Path<Uuid>,
+    extract::Json(input): extract::Json<AdminChangePasswordInput>,
+) -> Result<StatusCode, AppError> {
+    let ip_str = addr.ip().to_string();
+
+    Authenticator::validate_password(&input.new_password)
+        .map_err(|e| AppError::InputError(vec![e]))?;
+
+    let mut conn = state.db_pool.acquire().await?;
+    User::get(id, &mut conn).await?.ok_or(AppError::NotFound)?;
+
+    Authenticator::update_password(id, input.new_password, &mut conn).await?;
+    revoke_all_user_tokens(id, &mut conn).await?;
+    let _ = log_password_changed(id, Some(admin.0.user_id), &ip_str, &mut conn).await;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[utoipa::path(
     post,
     path = "/login",
@@ -316,10 +526,9 @@ async fn login(
     let user = match User::login(input, &mut conn).await {
         Ok(user) => user,
         Err(e) => {
-            // Record the failure for rate limiting purposes
             state.login_rate_limiter.record_failure(client_ip).await;
-            // Log the failed login attempt
-            let _ = log_login_failed(&username, &ip_str, ua_str, &mut conn).await;
+            let failed_user_id = User::get_by_username(&username, &mut conn).await.ok().flatten().map(|u| u.id);
+            let _ = log_login_failed(&username, failed_user_id, &ip_str, ua_str, &mut conn).await;
             return Err(e.into());
         }
     };
@@ -385,11 +594,8 @@ async fn refresh_token(
     let ip_str = addr.ip().to_string();
     let mut conn = state.db_pool.acquire().await?;
 
-    // Verify the refresh token and get the user ID
-    let user_id = verify_refresh_token(&input.refresh_token, &mut conn).await?;
-
-    // Revoke the old refresh token (rotation)
-    revoke_refresh_token(&input.refresh_token, &mut conn).await?;
+    // Atomically verify and revoke the refresh token (prevents replay via race condition)
+    let user_id = verify_and_revoke_refresh_token(&input.refresh_token, &mut conn).await?;
 
     // Get user and their roles
     let user = User::get(user_id, &mut conn)
@@ -425,11 +631,11 @@ async fn logout(
     let ip_str = addr.ip().to_string();
     let mut conn = state.db_pool.acquire().await?;
 
-    // Verify the refresh token to get the user ID for logging
-    let user_id = verify_refresh_token(&input.refresh_token, &mut conn).await?;
+    // Atomically verify and revoke the refresh token
+    let user_id = verify_and_revoke_refresh_token(&input.refresh_token, &mut conn).await?;
 
-    // Revoke the refresh token
-    revoke_refresh_token(&input.refresh_token, &mut conn).await?;
+    // Revoke all in-flight access tokens for this user
+    let _ = revoke_user_access_tokens(user_id, &mut conn).await;
 
     // Log the logout
     let _ = log_logout(user_id, &ip_str, &mut conn).await;
@@ -579,10 +785,12 @@ pub struct AssignRoleInput {
 )]
 async fn assign_role(
     State(state): State<AppState>,
-    _admin: AdminUser,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    admin: AdminUser,
     Path(user_id): Path<Uuid>,
     extract::Json(input): extract::Json<AssignRoleInput>,
 ) -> Result<StatusCode, AppError> {
+    let ip_str = addr.ip().to_string();
     let mut conn = state.db_pool.acquire().await?;
 
     // Check user exists
@@ -592,12 +800,10 @@ async fn assign_role(
     }
 
     // Check role exists
-    let role = Role::get(input.role_id, &mut conn).await?;
-    if role.is_none() {
-        return Err(AppError::NotFound);
-    }
+    let role = Role::get(input.role_id, &mut conn).await?.ok_or(AppError::NotFound)?;
 
     UserRole::assign(user_id, input.role_id, &mut conn).await?;
+    let _ = log_admin_role_assigned(user_id, admin.0.user_id, input.role_id, &role.name, &ip_str, &mut conn).await;
     Ok(StatusCode::CREATED)
 }
 
@@ -619,13 +825,16 @@ async fn assign_role(
 )]
 async fn remove_role(
     State(state): State<AppState>,
-    _admin: AdminUser,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    admin: AdminUser,
     Path((user_id, role_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, AppError> {
+    let ip_str = addr.ip().to_string();
     let mut conn = state.db_pool.acquire().await?;
 
     let removed = UserRole::remove(user_id, role_id, &mut conn).await?;
     if removed {
+        let _ = log_admin_role_removed(user_id, admin.0.user_id, role_id, &ip_str, &mut conn).await;
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(AppError::NotFound)
@@ -948,7 +1157,8 @@ async fn browser_login(
         Ok(user) => user,
         Err(e) => {
             state.login_rate_limiter.record_failure(client_ip).await;
-            let _ = log_login_failed(&username, &ip_str, ua_str, &mut conn).await;
+            let failed_user_id = User::get_by_username(&username, &mut conn).await.ok().flatten().map(|u| u.id);
+            let _ = log_login_failed(&username, failed_user_id, &ip_str, ua_str, &mut conn).await;
             return Err(e.into());
         }
     };
@@ -1042,8 +1252,8 @@ async fn browser_logout(
 
     // If we have a refresh token, try to revoke it and log the logout
     if let Some(token) = refresh_token {
-        if let Ok(user_id) = verify_refresh_token(token, &mut conn).await {
-            let _ = revoke_refresh_token(token, &mut conn).await;
+        if let Ok(user_id) = verify_and_revoke_refresh_token(token, &mut conn).await {
+            let _ = revoke_user_access_tokens(user_id, &mut conn).await;
             let _ = log_logout(user_id, &ip_str, &mut conn).await;
         }
     }
@@ -1078,4 +1288,418 @@ async fn browser_logout(
         axum::Json(serde_json::json!({ "success": true })),
     )
         .into_response())
+}
+
+/// Browser-friendly token refresh that reads the refresh token from a cookie
+#[utoipa::path(
+    post,
+    path = "/auth/browser-refresh",
+    responses(
+        (status = 200, description = "Token refreshed, new cookies set"),
+        (status = 401, description = "Missing or invalid refresh token"),
+        (status = 500, description = "Internal server error")
+    ),
+    tag = AUTH_TAG,
+)]
+async fn browser_refresh(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    let ip_str = addr.ip().to_string();
+    let mut conn = state.db_pool.acquire().await?;
+
+    let refresh_token_str = headers
+        .get("cookie")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|cookies| {
+            cookies
+                .split(';')
+                .map(|s| s.trim())
+                .find(|s| s.starts_with("authere_refresh="))
+                .and_then(|s| s.strip_prefix("authere_refresh="))
+                .map(|s| s.to_owned())
+        })
+        .ok_or(AppError::AuthenticationRequired)?;
+
+    let user_id = verify_and_revoke_refresh_token(&refresh_token_str, &mut conn).await?;
+
+    let user = User::get(user_id, &mut conn)
+        .await?
+        .ok_or(AppError::AuthenticationRequired)?;
+    let roles = user.get_roles(&mut conn).await?;
+    let token_pair = generate_token_pair(user_id, roles, &mut conn).await?;
+
+    let _ = log_token_refresh(user_id, &ip_str, &mut conn).await;
+
+    let access_cookie = build_auth_cookie(&token_pair.access_token, token_pair.expires_in);
+    let refresh_cookie = build_refresh_cookie(
+        &token_pair.refresh_token,
+        crate::user::auth::token::REFRESH_TOKEN_LIFETIME,
+    );
+
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(axum::http::header::SET_COOKIE, access_cookie.parse().unwrap());
+    response_headers.append(axum::http::header::SET_COOKIE, refresh_cookie.parse().unwrap());
+
+    Ok((StatusCode::OK, response_headers, axum::Json(serde_json::json!({ "ok": true }))).into_response())
+}
+
+// ============================================================================
+// Admin UI endpoints
+// ============================================================================
+
+#[derive(Serialize, ToSchema)]
+struct MeResponse {
+    user_id: String,
+    roles: Vec<String>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/me",
+    responses(
+        (status = 200, description = "Current user info", body = MeResponse),
+        (status = 401, description = "Authentication required"),
+    ),
+    tag = AUTH_TAG,
+)]
+async fn get_me(auth: AuthUser) -> axum::Json<MeResponse> {
+    axum::Json(MeResponse {
+        user_id: auth.user_id.to_string(),
+        roles: auth.roles,
+    })
+}
+
+#[derive(Deserialize)]
+struct AuditLogParams {
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/audit",
+    responses(
+        (status = 200, description = "Audit log entries"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Admin required"),
+    ),
+    tag = ADMIN_TAG,
+)]
+async fn get_audit_log(
+    _admin: AdminUser,
+    State(state): State<AppState>,
+    Query(params): Query<AuditLogParams>,
+) -> Result<axum::Json<Vec<AuditLogRecord>>, AppError> {
+    let limit = params.limit.unwrap_or(50).clamp(1, 200);
+    let offset = params.offset.unwrap_or(0).max(0);
+    let mut conn = state.db_pool.acquire().await?;
+    let records = list_audit_log(limit, offset, &mut conn).await?;
+    Ok(axum::Json(records))
+}
+
+// ============================================================================
+// Registration
+// ============================================================================
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct RegisterInput {
+    pub username: String,
+    pub name: String,
+    pub email: Option<String>,
+    pub password: String,
+    pub confirm_password: String,
+    pub invite_code: Option<String>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ValidateInviteQuery {
+    pub code: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ValidateInviteResponse {
+    pub valid: bool,
+}
+
+#[utoipa::path(
+    post,
+    path = "/register",
+    request_body(content = RegisterInput),
+    responses(
+        (status = 200, description = "Registration successful, cookies set"),
+        (status = 400, description = "Invalid input, registration closed, or invalid invite"),
+        (status = 409, description = "Username already taken"),
+        (status = 429, description = "Too many registration attempts"),
+        (status = 500, description = "Internal server error")
+    ),
+    tag = AUTH_TAG,
+)]
+async fn register(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    extract::Json(input): extract::Json<RegisterInput>,
+) -> Result<Response, RegisterError> {
+    let client_ip = addr.ip();
+    let ip_str = client_ip.to_string();
+
+    if let Err(retry_after) = state.register_rate_limiter.check(client_ip).await {
+        return Err(RegisterError::RateLimit(RateLimitExceeded { retry_after }));
+    }
+
+    if input.password != input.confirm_password {
+        return Err(AppError::InputError(vec!["Passwords do not match".to_string()]).into());
+    }
+
+    let create_input = CreateUserInput {
+        username: input.username.clone(),
+        name: input.name.clone(),
+        email: input.email.clone(),
+        password: input.password.clone(),
+    };
+    User::validate_create_input(&create_input)?;
+
+    let mut conn = state.db_pool.acquire().await?;
+    let open = open_registration_enabled(&mut conn).await?;
+
+    if !open {
+        let code = input.invite_code.as_deref().ok_or_else(|| {
+            AppError::InputError(vec!["Registration is by invitation only".to_string()])
+        })?;
+
+        let invite = Invitation::get(code, &mut conn)
+            .await?
+            .ok_or_else(|| AppError::InputError(vec!["Invitation is invalid or expired".to_string()]))?;
+
+        if !invite.is_valid() {
+            return Err(AppError::InputError(vec!["Invitation is invalid or expired".to_string()]).into());
+        }
+    }
+
+    let user = User::new(input.username, input.name, input.email);
+    let authenticator = Authenticator::new_password(input.password, user.id).map_err(|e| {
+        AppError::InternalError(format!("Failed to create authenticator ({e})"))
+    })?;
+
+    let mut tx = state.db_pool.begin().await?;
+
+    let consumed_invite = if !open {
+        let code = input.invite_code.as_deref().unwrap();
+        let consumed = Invitation::consume(code, &mut tx).await?.ok_or_else(|| {
+            AppError::InputError(vec!["Invitation is invalid or expired".to_string()])
+        })?;
+        Some(consumed)
+    } else {
+        None
+    };
+
+    user.save(&mut tx).await?;
+    authenticator.save(&mut tx).await?;
+
+    if let Some(user_role) = Role::get_by_name("user", &mut tx).await? {
+        let _ = UserRole::assign(user.id, user_role.id, &mut tx).await;
+    }
+
+    tx.commit().await?;
+
+    let invite_id = consumed_invite.as_ref().map(|i| i.id.as_str());
+    let _ = log_user_registered(user.id, invite_id, &ip_str, &mut conn).await;
+    if let Some(invite) = &consumed_invite {
+        let _ = log_invitation_consumed(user.id, &invite.id, &ip_str, &mut conn).await;
+    }
+
+    let token_pair = generate_token_pair(user.id, vec!["user".to_string()], &mut conn).await?;
+
+    let access_cookie = build_auth_cookie(&token_pair.access_token, token_pair.expires_in);
+    let refresh_cookie = build_refresh_cookie(
+        &token_pair.refresh_token,
+        crate::user::auth::token::REFRESH_TOKEN_LIFETIME,
+    );
+
+    let mut headers = axum::http::header::HeaderMap::new();
+    headers.insert(
+        axum::http::header::SET_COOKIE,
+        access_cookie.parse().unwrap(),
+    );
+    headers.append(
+        axum::http::header::SET_COOKIE,
+        refresh_cookie.parse().unwrap(),
+    );
+
+    Ok((
+        StatusCode::OK,
+        headers,
+        axum::Json(BrowserLoginResponse {
+            success: true,
+            redirect_uri: Some("/account".to_string()),
+        }),
+    )
+        .into_response())
+}
+
+#[utoipa::path(
+    get,
+    path = "/register/validate-invite",
+    params(
+        ("code" = String, Query, description = "Invitation code to validate")
+    ),
+    responses(
+        (status = 200, description = "Validation result", body = ValidateInviteResponse),
+    ),
+    tag = AUTH_TAG,
+)]
+async fn validate_invite(
+    State(state): State<AppState>,
+    Query(query): Query<ValidateInviteQuery>,
+) -> Result<axum::Json<ValidateInviteResponse>, AppError> {
+    let mut conn = state.db_pool.acquire().await?;
+    let valid = match Invitation::get(&query.code, &mut conn).await? {
+        Some(invite) => invite.is_valid(),
+        None => false,
+    };
+    Ok(axum::Json(ValidateInviteResponse { valid }))
+}
+
+// ============================================================================
+// Admin: Settings
+// ============================================================================
+
+#[utoipa::path(
+    get,
+    path = "/admin/settings",
+    responses(
+        (status = 200, description = "Current system settings", body = SettingsResponse),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Admin required"),
+    ),
+    tag = ADMIN_TAG,
+)]
+async fn get_settings(
+    State(state): State<AppState>,
+    _admin: AdminUser,
+) -> Result<axum::Json<SettingsResponse>, AppError> {
+    let mut conn = state.db_pool.acquire().await?;
+    let open_registration = open_registration_enabled(&mut conn).await?;
+    Ok(axum::Json(SettingsResponse { open_registration }))
+}
+
+#[utoipa::path(
+    patch,
+    path = "/admin/settings",
+    request_body(content = UpdateSettingsInput),
+    responses(
+        (status = 200, description = "Updated settings", body = SettingsResponse),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Admin required"),
+    ),
+    tag = ADMIN_TAG,
+)]
+async fn update_settings(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    admin: AdminUser,
+    extract::Json(input): extract::Json<UpdateSettingsInput>,
+) -> Result<axum::Json<SettingsResponse>, AppError> {
+    let ip_str = addr.ip().to_string();
+    let mut conn = state.db_pool.acquire().await?;
+
+    let mut changes = serde_json::json!({});
+
+    if let Some(open_reg) = input.open_registration {
+        let val = if open_reg { "true" } else { "false" };
+        set_setting("open_registration", val, &mut conn).await?;
+        changes["open_registration"] = serde_json::json!(open_reg);
+    }
+
+    let _ = log_settings_updated(admin.0.user_id, changes, &ip_str, &mut conn).await;
+
+    let open_registration = open_registration_enabled(&mut conn).await?;
+    Ok(axum::Json(SettingsResponse { open_registration }))
+}
+
+// ============================================================================
+// Admin: Invitations
+// ============================================================================
+
+#[utoipa::path(
+    get,
+    path = "/admin/invitations",
+    responses(
+        (status = 200, description = "List of invitations"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Admin required"),
+    ),
+    tag = ADMIN_TAG,
+)]
+async fn list_invitations(
+    State(state): State<AppState>,
+    _admin: AdminUser,
+) -> Result<axum::Json<Vec<InvitationWithStatus>>, AppError> {
+    let mut conn = state.db_pool.acquire().await?;
+    let invitations = Invitation::list(&mut conn).await?;
+    Ok(axum::Json(invitations))
+}
+
+#[utoipa::path(
+    post,
+    path = "/admin/invitations",
+    request_body(content = CreateInvitationInput),
+    responses(
+        (status = 201, description = "Created invitation"),
+        (status = 400, description = "Invalid input"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Admin required"),
+    ),
+    tag = ADMIN_TAG,
+)]
+async fn create_invitation(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    admin: AdminUser,
+    extract::Json(input): extract::Json<CreateInvitationInput>,
+) -> Result<(StatusCode, axum::Json<Invitation>), AppError> {
+    let ip_str = addr.ip().to_string();
+    Invitation::validate_input(&input)?;
+
+    let invitation = Invitation::new(input, admin.0.user_id);
+    let mut conn = state.db_pool.acquire().await?;
+    invitation.save(&mut conn).await?;
+
+    let _ = log_invitation_created(admin.0.user_id, &invitation.id, invitation.label.as_deref(), &ip_str, &mut conn).await;
+
+    Ok((StatusCode::CREATED, axum::Json(invitation)))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/admin/invitations/{id}",
+    params(
+        ("id" = String, Path, description = "Invitation ID")
+    ),
+    responses(
+        (status = 204, description = "Invitation deleted"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Admin required"),
+        (status = 404, description = "Invitation not found"),
+    ),
+    tag = ADMIN_TAG,
+)]
+async fn delete_invitation(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    admin: AdminUser,
+    Path(id): Path<String>,
+) -> Result<StatusCode, AppError> {
+    let ip_str = addr.ip().to_string();
+    let mut conn = state.db_pool.acquire().await?;
+
+    let deleted = Invitation::delete(&id, &mut conn).await?;
+    if !deleted {
+        return Err(AppError::NotFound);
+    }
+
+    let _ = log_invitation_deleted(admin.0.user_id, &id, &ip_str, &mut conn).await;
+
+    Ok(StatusCode::NO_CONTENT)
 }
