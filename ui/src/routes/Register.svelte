@@ -66,6 +66,7 @@
         confirm_password: confirmPassword,
         invite_code: inviteCode || undefined,
       });
+      sessionStorage.setItem('authere:registrationSuccess', '1');
       window.location.href = result.redirect_uri ?? '/account';
     } catch (err) {
       if (err instanceof ApiError) {

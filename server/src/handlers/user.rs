@@ -38,8 +38,11 @@ pub struct AdminChangePasswordInput {
 
 #[derive(Serialize, ToSchema)]
 pub struct MeResponse {
-    user_id: String,
-    roles: Vec<String>,
+    pub user_id: String,
+    pub username: String,
+    pub name: String,
+    pub email: Option<String>,
+    pub roles: Vec<String>,
 }
 
 #[utoipa::path(
@@ -177,14 +180,23 @@ pub async fn update_user(
     responses(
         (status = 200, description = "Current user info", body = MeResponse),
         (status = 401, description = "Authentication required"),
+        (status = 404, description = "User not found"),
     ),
     tag = AUTH_TAG,
 )]
-pub async fn get_me(auth: AuthUser) -> axum::Json<MeResponse> {
-    axum::Json(MeResponse {
+pub async fn get_me(
+    State(state): State<AppState>,
+    auth: AuthUser,
+) -> Result<axum::Json<MeResponse>, AppError> {
+    let mut conn = state.db_pool.acquire().await?;
+    let user = User::get(auth.user_id, &mut conn).await?.ok_or(AppError::NotFound)?;
+    Ok(axum::Json(MeResponse {
         user_id: auth.user_id.to_string(),
+        username: user.username,
+        name: user.name,
+        email: user.email,
         roles: auth.roles,
-    })
+    }))
 }
 
 #[utoipa::path(
@@ -278,4 +290,40 @@ pub async fn admin_change_user_password(
     let _ = log_password_changed(id, Some(admin.0.user_id), &audit_ctx, &mut conn).await;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn me_response_serializes_profile_fields() {
+        let resp = MeResponse {
+            user_id: "00000000-0000-0000-0000-000000000001".into(),
+            username: "alice".into(),
+            name: "Alice Example".into(),
+            email: Some("alice@example.com".into()),
+            roles: vec!["user".into(), "admin".into()],
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["user_id"], "00000000-0000-0000-0000-000000000001");
+        assert_eq!(json["username"], "alice");
+        assert_eq!(json["name"], "Alice Example");
+        assert_eq!(json["email"], "alice@example.com");
+        assert_eq!(json["roles"], serde_json::json!(["user", "admin"]));
+    }
+
+    #[test]
+    fn me_response_serializes_null_email() {
+        let resp = MeResponse {
+            user_id: "00000000-0000-0000-0000-000000000002".into(),
+            username: "bob".into(),
+            name: "Bob".into(),
+            email: None,
+            roles: vec![],
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert!(json["email"].is_null());
+        assert_eq!(json["roles"], serde_json::json!([]));
+    }
 }

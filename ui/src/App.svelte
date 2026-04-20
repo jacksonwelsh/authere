@@ -62,6 +62,11 @@
       }
     }
     ready = true;
+
+    if (sessionStorage.getItem('authere:registrationSuccess') === '1') {
+      sessionStorage.removeItem('authere:registrationSuccess');
+      toasts.success('Account created successfully.');
+    }
   });
 
   // Handle browser back/forward

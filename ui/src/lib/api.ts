@@ -44,6 +44,9 @@ export interface TokenPair {
 
 export interface Me {
   user_id: string;
+  username: string;
+  name: string;
+  email: string | null;
   roles: string[];
 }
 
