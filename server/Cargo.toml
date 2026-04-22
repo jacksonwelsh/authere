@@ -32,6 +32,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 utoipa = { version = "5", features = ["uuid"] }
 utoipa-axum = "0.2.0"
 utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
+url = "2"
 urlencoding = "2"
 uuid = { version = "1.19.0", features = ["serde", "v4", "v7"] }
 ldap3_proto = "0.5"

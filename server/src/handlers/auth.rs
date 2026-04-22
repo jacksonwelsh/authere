@@ -423,7 +423,7 @@ fn build_forward_auth_redirect(origin: &str, headers: &HeaderMap) -> Response {
     };
 
     let location = format!(
-        "{origin}/login?redirect_uri={}",
+        "{origin}/api/auth/forward-redirect?redirect_uri={}",
         urlencoding::encode(&redirect_uri)
     );
 
@@ -513,6 +513,163 @@ pub async fn verify_auth(
     Ok((StatusCode::OK, response_headers).into_response())
 }
 
+// ============================================================================
+// Forward Auth Redirect Flow
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct ForwardRedirectQuery {
+    pub redirect_uri: String,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/auth/forward-redirect",
+    params(
+        ("redirect_uri" = String, Query, description = "Full external URL to redirect to after setting cookies")
+    ),
+    responses(
+        (status = 307, description = "Redirect to callback on target domain with forward token"),
+        (status = 401, description = "Not authenticated"),
+        (status = 500, description = "Internal server error")
+    ),
+    tag = AUTH_TAG,
+)]
+pub async fn forward_redirect(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ForwardRedirectQuery>,
+) -> Result<Response, AppError> {
+    let mut conn = state.db_pool.acquire().await?;
+
+    let cookie_token = headers
+        .get("cookie")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|cookies| {
+            cookies
+                .split(';')
+                .map(|s| s.trim())
+                .find(|s| s.starts_with("authere_token="))
+                .map(|s| s.strip_prefix("authere_token=").unwrap_or(""))
+        });
+
+    let claims = match cookie_token {
+        Some(t) => match token::verify_access_token(t, &state.signing_key, &mut conn).await {
+            Ok(c) => c,
+            Err(_) => {
+                let login_url = format!(
+                    "/login?redirect_uri={}",
+                    urlencoding::encode(&format!(
+                        "/api/auth/forward-redirect?redirect_uri={}",
+                        urlencoding::encode(&query.redirect_uri)
+                    ))
+                );
+                return Ok((
+                    StatusCode::TEMPORARY_REDIRECT,
+                    [(header::LOCATION, login_url)],
+                ).into_response());
+            }
+        },
+        None => {
+            let login_url = format!(
+                "/login?redirect_uri={}",
+                urlencoding::encode(&format!(
+                    "/api/auth/forward-redirect?redirect_uri={}",
+                    urlencoding::encode(&query.redirect_uri)
+                ))
+            );
+            return Ok((
+                StatusCode::TEMPORARY_REDIRECT,
+                [(header::LOCATION, login_url)],
+            ).into_response());
+        }
+    };
+
+    let parsed = url::Url::parse(&query.redirect_uri)
+        .map_err(|_| AppError::InputError(vec!["Invalid redirect_uri".into()]))?;
+    let target_host = parsed.host_str()
+        .ok_or_else(|| AppError::InputError(vec!["redirect_uri has no host".into()]))?
+        .to_string();
+    let target_scheme = parsed.scheme();
+    let target_path = parsed.path();
+
+    let user_id = Uuid::parse_str(&claims.sub)
+        .map_err(|_| AppError::InternalError("Invalid user ID in token".into()))?;
+
+    let forward_token = token::generate_forward_token(
+        user_id,
+        claims.roles,
+        &target_host,
+        &state.signing_key,
+    )?;
+
+    let callback_url = format!(
+        "{target_scheme}://{target_host}/.authere/callback?token={}&redirect_uri={}",
+        urlencoding::encode(&forward_token),
+        urlencoding::encode(target_path),
+    );
+
+    Ok((
+        StatusCode::TEMPORARY_REDIRECT,
+        [(header::LOCATION, callback_url)],
+    )
+        .into_response())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CallbackQuery {
+    pub token: String,
+    pub redirect_uri: Option<String>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/.authere/callback",
+    params(
+        ("token" = String, Query, description = "Forward auth token"),
+        ("redirect_uri" = Option<String>, Query, description = "Path to redirect to after setting cookies")
+    ),
+    responses(
+        (status = 307, description = "Cookies set, redirecting to final destination"),
+        (status = 401, description = "Invalid or expired token"),
+        (status = 403, description = "Token host mismatch"),
+        (status = 500, description = "Internal server error")
+    ),
+    tag = AUTH_TAG,
+)]
+pub async fn forward_auth_callback(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<CallbackQuery>,
+) -> Result<Response, AppError> {
+    let request_host = headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    let claims = token::verify_forward_token(&query.token, request_host, &state.signing_key)?;
+
+    let user_id = Uuid::parse_str(&claims.sub)
+        .map_err(|_| AppError::InternalError("Invalid user ID in token".into()))?;
+
+    let mut conn = state.db_pool.acquire().await?;
+    let token_pair = generate_token_pair(user_id, claims.roles, &state.signing_key, &mut conn).await?;
+
+    let access_cookie = build_auth_cookie(&token_pair.access_token, token_pair.expires_in);
+    let refresh_cookie = build_refresh_cookie(&token_pair.refresh_token, REFRESH_TOKEN_LIFETIME);
+
+    let redirect_path = query.redirect_uri
+        .filter(|p| p.starts_with('/'))
+        .unwrap_or_else(|| "/".into());
+
+    let mut resp_headers = HeaderMap::new();
+    resp_headers.insert(header::SET_COOKIE, access_cookie.parse().unwrap());
+    resp_headers.append(header::SET_COOKIE, refresh_cookie.parse().unwrap());
+    resp_headers.insert(header::LOCATION, redirect_path.parse().unwrap());
+
+    Ok((StatusCode::TEMPORARY_REDIRECT, resp_headers).into_response())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -588,7 +745,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
         assert_eq!(
             extract_location(&resp),
-            "https://auth.example.com/login?redirect_uri=https%3A%2F%2Fflood.example.com%2Fsome%2Fpath"
+            "https://auth.example.com/api/auth/forward-redirect?redirect_uri=https%3A%2F%2Fflood.example.com%2Fsome%2Fpath"
         );
     }
 
@@ -599,7 +756,7 @@ mod tests {
 
         assert_eq!(
             extract_location(&resp),
-            "https://auth.example.com/login?redirect_uri=%2F"
+            "https://auth.example.com/api/auth/forward-redirect?redirect_uri=%2F"
         );
     }
 
@@ -623,7 +780,7 @@ mod tests {
 
         assert_eq!(
             extract_location(&resp),
-            "https://auth.example.com/login?redirect_uri=https%3A%2F%2Fapp.example.com%2F"
+            "https://auth.example.com/api/auth/forward-redirect?redirect_uri=https%3A%2F%2Fapp.example.com%2F"
         );
     }
 }

@@ -190,6 +190,8 @@ async fn main() -> Result<(), AppError> {
         .routes(routes!(application::delete_application))
         // Forward auth
         .routes(routes!(auth::verify_auth))
+        .routes(routes!(auth::forward_redirect))
+        .routes(routes!(auth::forward_auth_callback))
         // Browser-friendly auth
         .routes(routes!(auth::browser_login))
         .routes(routes!(auth::browser_logout))

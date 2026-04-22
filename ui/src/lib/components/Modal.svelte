@@ -103,39 +103,47 @@
   @keyframes fadeIn { from { opacity: 0; } }
   @keyframes slideIn { from { opacity: 0; transform: translateY(-8px); } }
 
-  /* Full-screen sheet on phones — maximises form room and keeps actions above keyboard. */
+  /* Full-screen sheet on phones — maximises form room and keeps actions above keyboard.
+     100dvh (dynamic viewport height) tracks mobile Safari's collapsing URL bar,
+     so the action row lines up with the visible viewport bottom instead of being
+     hidden underneath the address-bar pill. env(safe-area-inset-bottom) adds
+     padding past the home indicator on devices that have one. */
   @media (max-width: 639.98px) {
     .overlay {
-      align-items: stretch;
-      justify-content: stretch;
+      align-items: flex-start;
+      justify-content: center;
     }
 
     .modal {
-      width: 100vw;
+      width: 100%;
       max-width: none;
-      height: 100vh;
-      max-height: 100vh;
+      height: 100dvh;
+      max-height: 100dvh;
       border: none;
       border-radius: 0;
+      overflow-x: hidden;
       animation: slideInSheet var(--duration-default) var(--ease-out);
     }
 
     .modal-header {
-      padding: var(--sp-3) var(--sp-3) var(--sp-3);
+      padding: var(--sp-3);
       margin-bottom: 0;
       border-bottom: 1px solid var(--border-0);
     }
 
     .modal-body {
       padding: var(--sp-4) var(--sp-3);
+      overflow-x: hidden;
     }
 
     .modal-actions {
       padding: var(--sp-3);
+      padding-bottom: max(var(--sp-3), env(safe-area-inset-bottom));
     }
 
     .modal-actions :global(> *) {
       flex: 1;
+      min-width: 0;
     }
   }
 

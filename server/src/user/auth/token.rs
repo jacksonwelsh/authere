@@ -445,6 +445,75 @@ fn hash_token(token: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
+// ============================================================================
+// Forward Auth Tokens
+// ============================================================================
+
+const FORWARD_TOKEN_LIFETIME: i64 = 60;
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ForwardClaims {
+    pub sub: String,
+    pub roles: Vec<String>,
+    pub target_host: String,
+    pub exp: i64,
+    pub iat: i64,
+    pub jti: String,
+    pub typ: String,
+}
+
+pub fn generate_forward_token(
+    user_id: Uuid,
+    roles: Vec<String>,
+    target_host: &str,
+    signing_key: &SigningKey,
+) -> Result<String, AppError> {
+    let now = current_timestamp();
+
+    let claims = ForwardClaims {
+        sub: user_id.to_string(),
+        roles,
+        target_host: target_host.to_string(),
+        exp: now + FORWARD_TOKEN_LIFETIME,
+        iat: now,
+        jti: Uuid::new_v4().to_string(),
+        typ: "forward".to_string(),
+    };
+
+    let header = Header::new(Algorithm::EdDSA);
+    let pkcs8_der = signing_key.to_pkcs8_der()
+        .map_err(|e| AppError::InternalError(format!("Failed to encode signing key: {e}")))?;
+    let encoding_key = EncodingKey::from_ed_der(pkcs8_der.as_bytes());
+
+    encode(&header, &claims, &encoding_key)
+        .map_err(|e| AppError::InternalError(format!("Failed to encode forward JWT: {e}")))
+}
+
+pub fn verify_forward_token(
+    token: &str,
+    expected_host: &str,
+    signing_key: &SigningKey,
+) -> Result<ForwardClaims, AppError> {
+    let verifying_key = signing_key.verifying_key();
+    let decoding_key = DecodingKey::from_ed_der(&verifying_key.to_bytes());
+
+    let mut validation = Validation::new(Algorithm::EdDSA);
+    validation.set_required_spec_claims(&["sub", "exp", "iat", "jti", "typ"]);
+
+    let token_data = decode::<ForwardClaims>(token, &decoding_key, &validation)
+        .map_err(|_| AppError::AuthenticationRequired)?;
+
+    if token_data.claims.typ != "forward" {
+        return Err(AppError::AuthenticationRequired);
+    }
+
+    if token_data.claims.target_host != expected_host {
+        return Err(AppError::Forbidden);
+    }
+
+    Ok(token_data.claims)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -589,5 +658,58 @@ mod tests {
         let t1 = generate_access_token(uid, vec![], &key).unwrap();
         let t2 = generate_access_token(uid, vec![], &key).unwrap();
         assert_ne!(t1, t2, "each token should have a unique jti");
+    }
+
+    #[test]
+    fn forward_token_roundtrip() {
+        let key = generate_key();
+        let uid = Uuid::new_v4();
+        let roles = vec!["admin".into(), "user".into()];
+
+        let token = generate_forward_token(uid, roles.clone(), "app.example.com", &key).unwrap();
+        let claims = verify_forward_token(&token, "app.example.com", &key).unwrap();
+
+        assert_eq!(claims.sub, uid.to_string());
+        assert_eq!(claims.roles, roles);
+        assert_eq!(claims.target_host, "app.example.com");
+        assert_eq!(claims.typ, "forward");
+    }
+
+    #[test]
+    fn forward_token_rejects_wrong_host() {
+        let key = generate_key();
+        let token = generate_forward_token(Uuid::new_v4(), vec![], "app.example.com", &key).unwrap();
+        let result = verify_forward_token(&token, "evil.example.com", &key);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn forward_token_rejects_wrong_key() {
+        let key = generate_key();
+        let other_key = generate_key();
+        let token = generate_forward_token(Uuid::new_v4(), vec![], "app.example.com", &key).unwrap();
+        let result = verify_forward_token(&token, "app.example.com", &other_key);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn forward_claims_serialization_roundtrip() {
+        let claims = ForwardClaims {
+            sub: "user-123".into(),
+            roles: vec!["admin".into()],
+            target_host: "app.example.com".into(),
+            exp: 1700000000,
+            iat: 1699999000,
+            jti: "jti-abc".into(),
+            typ: "forward".into(),
+        };
+
+        let json = serde_json::to_string(&claims).unwrap();
+        let deserialized: ForwardClaims = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(claims.sub, deserialized.sub);
+        assert_eq!(claims.roles, deserialized.roles);
+        assert_eq!(claims.target_host, deserialized.target_host);
+        assert_eq!(claims.typ, deserialized.typ);
     }
 }

@@ -245,10 +245,14 @@
     color: var(--fg-1);
     padding: var(--sp-2) var(--sp-3);
     font-family: inherit;
-    font-size: 13px;
+    font-size: 16px;
     width: 100%;
     box-sizing: border-box;
     color-scheme: dark;
+  }
+
+  @media (min-width: 640px) {
+    .datetime-input { font-size: 13px; }
   }
   .datetime-input:focus {
     outline: none;

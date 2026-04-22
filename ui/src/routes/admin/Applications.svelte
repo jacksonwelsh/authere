@@ -52,11 +52,15 @@
 
     return `${patternComment}${pathComment}
 ${host} {
-    forward_auth ${upstreamHost} {
-        uri /api/auth/verify
-        copy_headers X-Auth-User X-Auth-Username X-Auth-Roles X-Auth-Email${tlsLines}
+    route {
+        reverse_proxy /.authere/* ${upstreamHost}${tlsLines}
+
+        forward_auth ${upstreamHost} {
+            uri /api/auth/verify
+            copy_headers X-Auth-User X-Auth-Username X-Auth-Roles X-Auth-Email${tlsLines}
+        }
+        reverse_proxy YOUR_UPSTREAM:8080
     }
-    reverse_proxy YOUR_UPSTREAM:8080
 }`;
   }
 
