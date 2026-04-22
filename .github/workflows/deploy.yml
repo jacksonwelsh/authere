@@ -34,7 +34,7 @@ jobs:
 
       - name: Install UI dependencies
         working-directory: ui
-        run: npm ci
+        run: npm install
 
       - name: Cache cargo registry and build
         uses: actions/cache@v4
