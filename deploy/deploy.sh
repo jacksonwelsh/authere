@@ -43,7 +43,6 @@ with open(sys.argv[1], "rb") as f:
 deploy() {
   log "Starting deploy"
 
-  log "Resolving asset URL via GitHub API"
   local release_json asset_url
   if ! release_json=$(curl -fsSL \
       --connect-timeout 30 --max-time 60 \
@@ -60,21 +59,18 @@ deploy() {
     return 1
   fi
 
-  log "Downloading binary from ${asset_url}"
   local tmp_bin
   tmp_bin=$(mktemp "${INSTALL_DIR}/${BINARY_NAME}.XXXXXX")
   trap 'rm -f "$tmp_bin"' EXIT
 
-  if ! curl -fSL \
+  if ! curl -fsSL \
       --connect-timeout 30 --max-time 300 \
       --retry 3 --retry-delay 5 \
       -H "Accept: application/octet-stream" \
       -o "$tmp_bin" "$asset_url"; then
-    log "ERROR: Failed to download binary (curl exit non-zero within 300s)"
+    log "ERROR: Failed to download binary"
     return 1
   fi
-
-  log "Download complete ($(stat -c %s "$tmp_bin" 2>/dev/null || echo "?") bytes)"
 
   chmod +x "$tmp_bin"
 
@@ -86,18 +82,14 @@ deploy() {
   mv "$tmp_bin" "${INSTALL_DIR}/${BINARY_NAME}"
   trap - EXIT
 
-  log "Binary updated, restarting service"
   sudo /usr/bin/systemctl restart authere
 
-  log "Deploy complete"
+  log "Deploy complete ($(stat -c %s "${INSTALL_DIR}/${BINARY_NAME}" 2>/dev/null || echo "?") bytes)"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-  # Route stdout/stderr to syslog so bash errors, curl stderr, and set -e
-  # exits surface in journalctl — webhook.py points both at /dev/null.
+  # Route stdout/stderr to syslog so bash errors and curl stderr surface in
+  # journalctl — webhook.py points both at /dev/null.
   exec > >(logger -t "$LOG_TAG" -p user.info) 2> >(logger -t "$LOG_TAG" -p user.err)
-  # Emit a pre-curl breadcrumb so we can tell if mktemp or curl is the one
-  # that exited silently.
-  set -x
   deploy
 fi

@@ -12,7 +12,10 @@ RestartSec=5
 
 EnvironmentFile=/opt/authere/webhook.env
 
-NoNewPrivileges=true
+# NoNewPrivileges is intentionally NOT set: deploy.sh must invoke
+# `sudo systemctl restart authere`, and sudo is setuid-root so it cannot
+# escalate while NoNewPrivileges is in effect. Privilege is already tightly
+# scoped via /etc/sudoers.d/authere (only three systemctl commands).
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/opt/authere
