@@ -57,3 +57,6 @@ jobs:
       - name: Run tests
         working-directory: server
         run: cargo test --verbose
+
+      - name: Run deploy script tests
+        run: bash deploy/test_deploy.sh

@@ -503,7 +503,15 @@ pub async fn verify_auth(
     use crate::application::Application;
     if let Some(app) = Application::find_matching(host, path, &mut conn).await.map_err(|e| e.into_response())? {
         if !app.check_access(&claims.roles) {
-            warn!(user_id = %user_id, host = %host, path = %path, app = %app.name, "forward auth denied: insufficient roles");
+            warn!(
+                user_id = %user_id,
+                host = %host,
+                path = %path,
+                app = %app.name,
+                user_roles = ?claims.roles,
+                required_roles = ?app.required_roles,
+                "forward auth denied: insufficient roles"
+            );
             return Err(AppError::Forbidden.into_response());
         }
     }
@@ -653,7 +661,13 @@ pub async fn forward_auth_callback(
         .map_err(|_| AppError::InternalError("Invalid user ID in token".into()))?;
 
     let mut conn = state.db_pool.acquire().await?;
-    let token_pair = generate_token_pair(user_id, claims.roles, &state.signing_key, &mut conn).await?;
+
+    let user = User::get(user_id, &mut conn)
+        .await?
+        .ok_or(AppError::AuthenticationRequired)?;
+    let roles = user.get_roles(&mut conn).await?;
+
+    let token_pair = generate_token_pair(user_id, roles, &state.signing_key, &mut conn).await?;
 
     let access_cookie = build_auth_cookie(&token_pair.access_token, token_pair.expires_in);
     let refresh_cookie = build_refresh_cookie(&token_pair.refresh_token, REFRESH_TOKEN_LIFETIME);
