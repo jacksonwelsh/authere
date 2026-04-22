@@ -3,10 +3,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::FromRef;
 use axum::http;
 use clap::Parser;
-use ed25519_dalek::SigningKey;
 use sqlx::SqlitePool;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -15,24 +13,12 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 use utoipa_swagger_ui::SwaggerUi;
 
-use crate::cli::{Cli, Commands};
-use crate::errors::AppError;
-use crate::rate_limit::{RateLimitConfig, RateLimiter};
-use crate::user::auth::token;
-
-pub mod application;
-pub mod audit;
-pub mod auth_middleware;
-pub mod cli;
-pub mod db;
-pub mod errors;
-pub mod handlers;
-pub mod invitation;
-pub mod rate_limit;
-pub mod role;
-pub mod settings;
-pub mod static_files;
-pub mod user;
+use authere_server::AppState;
+use authere_server::cli::{self, Cli, Commands};
+use authere_server::errors::AppError;
+use authere_server::rate_limit::{RateLimitConfig, RateLimiter};
+use authere_server::static_files;
+use authere_server::user::auth::token;
 
 const ADMIN_TAG: &str = "admin";
 const AUTH_TAG: &str = "auth";
@@ -45,26 +31,6 @@ const AUTH_TAG: &str = "auth";
     )
 )]
 struct ApiDoc;
-
-#[derive(Clone)]
-pub struct AppState {
-    pub db_pool: SqlitePool,
-    pub login_rate_limiter: RateLimiter,
-    pub register_rate_limiter: RateLimiter,
-    pub signing_key: Arc<SigningKey>,
-}
-
-impl FromRef<AppState> for SqlitePool {
-    fn from_ref(state: &AppState) -> Self {
-        state.db_pool.clone()
-    }
-}
-
-impl FromRef<AppState> for Arc<SigningKey> {
-    fn from_ref(state: &AppState) -> Self {
-        state.signing_key.clone()
-    }
-}
 
 #[tokio::main]
 async fn main() -> Result<(), AppError> {
@@ -85,6 +51,12 @@ async fn main() -> Result<(), AppError> {
     let db_pool = SqlitePool::connect(&database_url)
         .await
         .expect("Could not connect to sqlite!");
+
+    sqlx::migrate!("../migrations")
+        .run(&db_pool)
+        .await
+        .expect("Failed to run database migrations");
+    info!("database migrations applied");
 
     let mut conn = db_pool.acquire().await?;
     token::try_initialize(&mut conn).await?;
@@ -123,16 +95,23 @@ async fn main() -> Result<(), AppError> {
         window: Duration::from_secs(3600),
     });
 
+    let ldap_bind_rate_limiter = RateLimiter::new(RateLimitConfig {
+        max_requests: 30,
+        window: Duration::from_secs(60),
+    });
+
     // Spawn background cleanup for rate limiters
     {
         let login_rl = login_rate_limiter.clone();
         let register_rl = register_rate_limiter.clone();
+        let ldap_rl = ldap_bind_rate_limiter.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(300));
             loop {
                 interval.tick().await;
                 login_rl.cleanup().await;
                 register_rl.cleanup().await;
+                ldap_rl.cleanup().await;
                 tracing::debug!("rate limiter cleanup completed");
             }
         });
@@ -142,10 +121,35 @@ async fn main() -> Result<(), AppError> {
         db_pool,
         login_rate_limiter,
         register_rate_limiter,
+        ldap_bind_rate_limiter,
         signing_key,
     };
 
-    use crate::handlers::{admin, application, auth, registration, role, user};
+    // Start the LDAP listener if enabled. Settings changes take effect on the next
+    // restart — rebinding to a different port at runtime is out of scope for the MVP.
+    {
+        let mut conn = state.db_pool.acquire().await?;
+        let ldap_cfg = authere_server::settings::load_ldap_config(&mut conn).await?;
+        drop(conn);
+        if ldap_cfg.enabled {
+            if ldap_cfg.service_password_hash.is_none() {
+                warn!(
+                    addr = %ldap_cfg.bind_address,
+                    "ldap enabled but service bind password is not set — users can still bind"
+                );
+            }
+            let ldap_state = state.clone();
+            tokio::spawn(async move {
+                if let Err(e) = authere_server::ldap::run(ldap_state).await {
+                    tracing::error!(error = %e, "ldap listener terminated");
+                }
+            });
+        } else {
+            info!("ldap disabled");
+        }
+    }
+
+    use authere_server::handlers::{admin, app_passwords, application, auth, registration, role, user};
 
     let (router, api) = OpenApiRouter::with_openapi(ApiDoc::openapi())
         .routes(routes!(user::create_user, user::get_users))
@@ -183,9 +187,19 @@ async fn main() -> Result<(), AppError> {
         .routes(routes!(admin::get_audit_log))
         // Admin settings
         .routes(routes!(admin::get_settings, admin::update_settings))
+        .routes(routes!(admin::regenerate_ldap_bind_password))
         // Admin invitations
         .routes(routes!(admin::list_invitations, admin::create_invitation))
         .routes(routes!(admin::delete_invitation))
+        // App passwords (user self-service)
+        .routes(routes!(
+            app_passwords::list_my_app_passwords,
+            app_passwords::create_my_app_password
+        ))
+        .routes(routes!(app_passwords::delete_my_app_password))
+        // App passwords (admin)
+        .routes(routes!(app_passwords::admin_list_app_passwords))
+        .routes(routes!(app_passwords::admin_delete_app_password))
         .with_state(state)
         .split_for_parts();
 
@@ -229,8 +243,10 @@ async fn main() -> Result<(), AppError> {
 
     let router = router.layer(cors).layer(trace_layer);
 
-    info!("starting server on 0.0.0.0:3000");
+    let bind_addr =
+        env::var("AUTHERE_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
+    info!("starting server on {bind_addr}");
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
+    let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     Ok(axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).await?)
 }

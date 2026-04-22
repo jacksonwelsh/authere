@@ -1,0 +1,22 @@
+[Unit]
+Description=Authere GitHub webhook receiver
+After=network.target
+
+[Service]
+Type=simple
+User=authere
+Group=authere
+ExecStart=/usr/bin/python3 /opt/authere/webhook.py
+Restart=on-failure
+RestartSec=5
+
+EnvironmentFile=/opt/authere/webhook.env
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/authere
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

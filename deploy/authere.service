@@ -1,0 +1,26 @@
+[Unit]
+Description=Authere authentication server
+After=network.target
+
+[Service]
+Type=simple
+User=authere
+Group=authere
+WorkingDirectory=/opt/authere
+ExecStart=/opt/authere/authere_server
+Restart=on-failure
+RestartSec=5
+
+EnvironmentFile=/opt/authere/.env
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/authere/data
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

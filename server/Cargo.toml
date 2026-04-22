@@ -33,6 +33,12 @@ utoipa = { version = "5", features = ["uuid"] }
 utoipa-axum = "0.2.0"
 utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
 uuid = { version = "1.19.0", features = ["serde", "v4", "v7"] }
+ldap3_proto = "0.5"
+tokio-util = { version = "0.7", features = ["codec"] }
+futures-util = "0.3"
+
+[dev-dependencies]
+ldap3 = { version = "0.11", default-features = false, features = ["tls-rustls"] }
 
 [lints.rust]
 async_fn_in_trait = "allow"

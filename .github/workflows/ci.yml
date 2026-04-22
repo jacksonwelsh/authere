@@ -47,6 +47,9 @@ jobs:
           sqlx database create
           sqlx migrate run --source migrations
 
+      - name: Create ui/dist for rust-embed
+        run: mkdir -p ui/dist
+
       - name: Build
         working-directory: server
         run: cargo build --verbose

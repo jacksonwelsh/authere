@@ -16,6 +16,20 @@ use crate::user::User;
 
 const ADMIN_TAG: &str = "admin";
 
+/// Guard against an admin removing a role from their own account. Removing `admin` from
+/// yourself would lock you out of management, and removing any other role leaves the
+/// account in a non-obvious state. Assignment to yourself is still allowed — the footgun
+/// is only on removal.
+fn ensure_not_self_role_removal(actor_id: Uuid, target_id: Uuid) -> Result<(), AppError> {
+    if actor_id == target_id {
+        Err(AppError::InputError(vec![
+            "You cannot remove roles from your own account. Ask another admin.".to_string(),
+        ]))
+    } else {
+        Ok(())
+    }
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct AssignRoleInput {
     pub role_id: Uuid,
@@ -200,6 +214,8 @@ pub async fn remove_role(
     admin: AdminUser,
     Path((user_id, role_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, AppError> {
+    ensure_not_self_role_removal(admin.0.user_id, user_id)?;
+
     let mut conn = state.db_pool.acquire().await?;
 
     if let Some(role) = Role::get(role_id, &mut conn).await? {
@@ -226,5 +242,30 @@ pub async fn remove_role(
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(AppError::NotFound)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn self_role_removal_is_rejected() {
+        let me = Uuid::now_v7();
+        let err = ensure_not_self_role_removal(me, me).unwrap_err();
+        match err {
+            AppError::InputError(msgs) => {
+                assert_eq!(msgs.len(), 1);
+                assert!(msgs[0].contains("your own account"));
+            }
+            other => panic!("expected InputError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn removing_from_another_user_is_allowed() {
+        let me = Uuid::now_v7();
+        let other = Uuid::now_v7();
+        ensure_not_self_role_removal(me, other).unwrap();
     }
 }

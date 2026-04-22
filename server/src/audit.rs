@@ -106,6 +106,11 @@ pub enum AuditEventType {
     InvitationDeleted,
     InvitationConsumed,
     SettingsUpdated,
+    // LDAP
+    LdapBindSuccess,
+    LdapBindFailed,
+    LdapBindRejectedMfaRequired,
+    LdapBindPasswordRotated,
 }
 
 impl AuditEventType {
@@ -134,6 +139,10 @@ impl AuditEventType {
             AuditEventType::InvitationDeleted => "invitation_deleted",
             AuditEventType::InvitationConsumed => "invitation_consumed",
             AuditEventType::SettingsUpdated => "settings_updated",
+            AuditEventType::LdapBindSuccess => "ldap_bind_success",
+            AuditEventType::LdapBindFailed => "ldap_bind_failed",
+            AuditEventType::LdapBindRejectedMfaRequired => "ldap_bind_rejected_mfa_required",
+            AuditEventType::LdapBindPasswordRotated => "ldap_bind_password_rotated",
         }
     }
 }
@@ -557,6 +566,73 @@ pub async fn log_invitation_consumed(
         .user(user_id)
         .ip(&ctx.ip_address)
         .details(json!({ "invite_id": invite_id }))
+        .save(conn)
+        .await
+}
+
+/// Log a successful LDAP simple-bind. Sets user_id when bound as a user (not the service
+/// account), and tags the event with the password mode and credential kind used.
+pub async fn log_ldap_bind_success(
+    user_id: Option<Uuid>,
+    dn: &str,
+    ip: &str,
+    mode: &str,
+    credential: &str,
+    conn: &mut SqliteConnection,
+) -> Result<(), AppError> {
+    let mut entry = AuditLogEntry::new(AuditEventType::LdapBindSuccess)
+        .ip(ip)
+        .details(json!({ "dn": dn, "mode": mode, "credential": credential }));
+    if let Some(uid) = user_id {
+        entry = entry.user(uid);
+    }
+    entry.save(conn).await
+}
+
+/// Log a failed LDAP bind. `reason` is a short machine-readable tag, e.g. "invalid_credentials".
+pub async fn log_ldap_bind_failed(
+    user_id: Option<Uuid>,
+    dn: &str,
+    ip: &str,
+    mode: &str,
+    reason: &str,
+    conn: &mut SqliteConnection,
+) -> Result<(), AppError> {
+    let mut entry = AuditLogEntry::new(AuditEventType::LdapBindFailed)
+        .ip(ip)
+        .details(json!({ "dn": dn, "mode": mode, "reason": reason }));
+    if let Some(uid) = user_id {
+        entry = entry.user(uid);
+    }
+    entry.save(conn).await
+}
+
+/// Log an LDAP bind rejected because the user has TOTP enabled and the active mode cannot
+/// accept an MFA-second-factor over simple bind.
+pub async fn log_ldap_bind_rejected_mfa_required(
+    user_id: Uuid,
+    dn: &str,
+    ip: &str,
+    mode: &str,
+    conn: &mut SqliteConnection,
+) -> Result<(), AppError> {
+    AuditLogEntry::new(AuditEventType::LdapBindRejectedMfaRequired)
+        .user(user_id)
+        .ip(ip)
+        .details(json!({ "dn": dn, "mode": mode }))
+        .save(conn)
+        .await
+}
+
+/// Log an admin rotating the LDAP service-account bind password.
+pub async fn log_ldap_bind_password_rotated(
+    actor_id: Uuid,
+    ctx: &AuditContext,
+    conn: &mut SqliteConnection,
+) -> Result<(), AppError> {
+    AuditLogEntry::new(AuditEventType::LdapBindPasswordRotated)
+        .actor(actor_id)
+        .ip(&ctx.ip_address)
         .save(conn)
         .await
 }

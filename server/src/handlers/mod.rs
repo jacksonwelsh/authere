@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod app_passwords;
 pub mod application;
 pub mod auth;
 pub mod registration;
