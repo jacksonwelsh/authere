@@ -8,6 +8,7 @@
   import Badge from '../../lib/components/Badge.svelte';
   import Input from '../../lib/components/Input.svelte';
   import Modal from '../../lib/components/Modal.svelte';
+  import ResponsiveTable from '../../lib/components/ResponsiveTable.svelte';
   import { toasts } from '../../lib/toast.svelte';
 
   let apps = $state<Application[]>([]);
@@ -53,12 +54,7 @@
 ${host} {
     forward_auth ${upstreamHost} {
         uri /api/auth/verify
-        copy_headers X-Auth-User X-Auth-Username X-Auth-Roles X-Auth-Email
-
-        @unauth status 401 403
-        handle_response @unauth {
-            redir ${origin}/login?redirect_uri={http.request.uri} 302
-        }${tlsLines}
+        copy_headers X-Auth-User X-Auth-Username X-Auth-Roles X-Auth-Email${tlsLines}
     }
     reverse_proxy YOUR_UPSTREAM:8080
 }`;
@@ -170,46 +166,39 @@ ${host} {
       <i class="ph ph-circle-notch spin"></i> Loading…
     </div>
   {:else}
-    <div class="table-wrap">
-      <table>
-        <thead>
-          <tr>
-            <th>Name</th>
-            <th>Slug</th>
-            <th>Host pattern</th>
-            <th>Required roles</th>
-            <th></th>
-          </tr>
-        </thead>
-        <tbody>
-          {#each apps as app (app.id)}
-            <tr data-testid={`row-${app.id}`}>
-              <td class="au-fg-1 font-medium">{app.name}</td>
-              <td class="au-mono au-code-sm au-fg-3">{app.slug}</td>
-              <td class="au-code-sm au-fg-3">{app.host_pattern}</td>
-              <td>
-                <div class="roles-cell">
-                  {#each app.required_roles as roleId}
-                    <Badge>{roleMap[roleId] ?? roleId}</Badge>
-                  {/each}
-                  {#if app.required_roles.length === 0}
-                    <span class="au-fg-5 au-micro">public</span>
-                  {/if}
-                </div>
-              </td>
-              <td class="actions-cell">
-                <Button size="sm" variant="ghost" onclick={() => configApp = app}>Config</Button>
-                <Button size="sm" variant="ghost" onclick={() => openEdit(app)}>Edit</Button>
-                <Button size="sm" variant="ghost" onclick={() => confirmDelete = app}>Delete</Button>
-              </td>
-            </tr>
-          {/each}
-          {#if apps.length === 0}
-            <tr><td colspan="5" class="empty-row au-fg-4 au-small">No applications yet.</td></tr>
-          {/if}
-        </tbody>
-      </table>
-    </div>
+    <ResponsiveTable
+      label="Applications"
+      items={apps}
+      getKey={(a) => a.id}
+      columns={[
+        { key: 'name',    label: 'Name',          tdClass: 'au-fg-1 font-medium' },
+        { key: 'slug',    label: 'Slug',          tdClass: 'au-mono au-code-sm au-fg-3' },
+        { key: 'host',    label: 'Host pattern',  tdClass: 'au-code-sm au-fg-3' },
+        { key: 'roles',   label: 'Required roles' },
+      ]}
+    >
+      {#snippet cell({ item, column })}
+        {#if column.key === 'name'}{item.name}
+        {:else if column.key === 'slug'}{item.slug}
+        {:else if column.key === 'host'}{item.host_pattern}
+        {:else if column.key === 'roles'}
+          <div class="roles-cell">
+            {#each item.required_roles as roleId}
+              <Badge>{roleMap[roleId] ?? roleId}</Badge>
+            {/each}
+            {#if item.required_roles.length === 0}
+              <span class="au-fg-5 au-micro">public</span>
+            {/if}
+          </div>
+        {/if}
+      {/snippet}
+      {#snippet actions({ item })}
+        <Button size="sm" variant="ghost" onclick={() => configApp = item}>Config</Button>
+        <Button size="sm" variant="ghost" onclick={() => openEdit(item)}>Edit</Button>
+        <Button size="sm" variant="ghost" onclick={() => confirmDelete = item}>Delete</Button>
+      {/snippet}
+      {#snippet empty()}No applications yet.{/snippet}
+    </ResponsiveTable>
   {/if}
 </div>
 
@@ -253,8 +242,9 @@ ${host} {
       </p>
       <pre class="snippet au-code-sm"><code>{buildCaddySnippet(configApp)}</code></pre>
       <p class="au-micro au-fg-4">
-        Unauthenticated requests (401/403) are redirected to authere's login page with a
-        <span class="au-mono">redirect_uri</span> that sends users back after signing in.
+        Unauthenticated requests are automatically redirected to authere's login page.
+        After signing in, users are sent back to the original URL. Make sure
+        <span class="au-mono">AUTHERE_ORIGIN</span> is set on the server.
       </p>
     </div>
     {#snippet actions()}
@@ -283,21 +273,18 @@ ${host} {
 
 <style>
   .page { padding: var(--sp-6); max-width: 960px; margin: 0 auto; }
-  .page-header { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: var(--sp-6); }
+  .page-header { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: var(--sp-6); gap: var(--sp-3); }
   .page-loading { display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-8); }
-  .table-wrap { border: 1px solid var(--border-0); border-radius: var(--radius); overflow: hidden; }
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  thead th {
-    height: 32px; padding: 0 var(--sp-3); text-align: left;
-    background: var(--bg-1); color: var(--fg-4);
-    font-size: 11px; font-weight: 500; letter-spacing: 0.06em; text-transform: uppercase;
-    border-bottom: 1px solid var(--border-0); white-space: nowrap;
+
+  @media (max-width: 639.98px) {
+    .page { padding: var(--sp-4); }
+    .page-header {
+      flex-direction: column;
+      align-items: stretch;
+      margin-bottom: var(--sp-4);
+    }
   }
-  tbody tr { height: 32px; border-bottom: 1px solid var(--border-0); transition: background var(--duration-micro) var(--ease-out); }
-  tbody tr:last-child { border-bottom: none; }
-  tbody tr:hover { background: var(--bg-1); }
-  td { padding: 0 var(--sp-3); overflow: hidden; text-overflow: ellipsis; }
-  .actions-cell { text-align: right; width: 180px; white-space: nowrap; }
+
   .config-body { display: flex; flex-direction: column; gap: var(--sp-3); }
   .snippet {
     background: var(--bg-1);
@@ -309,9 +296,7 @@ ${host} {
     color: var(--fg-2);
     white-space: pre;
   }
-  .roles-cell { display: flex; align-items: center; gap: var(--sp-1); }
-  .empty-row { padding: var(--sp-8) !important; text-align: center; }
-  .font-medium { font-weight: 500; }
+  .roles-cell { display: flex; align-items: center; flex-wrap: wrap; gap: var(--sp-1); }
   .modal-form { display: flex; flex-direction: column; gap: var(--sp-3); }
   .role-picker { display: flex; flex-direction: column; gap: var(--sp-2); }
   .role-options { display: flex; flex-wrap: wrap; gap: var(--sp-2); }

@@ -199,7 +199,8 @@
   }
 
   .auth-shell {
-    width: 400px;
+    width: 100%;
+    max-width: 400px;
     background: var(--bg-1);
     border: 1px solid var(--border-1);
     border-radius: var(--radius);
@@ -207,6 +208,11 @@
     display: flex;
     flex-direction: column;
     gap: var(--sp-6);
+  }
+
+  @media (max-width: 639.98px) {
+    .auth-bg { padding: var(--sp-4); }
+    .auth-shell { padding: var(--sp-6) var(--sp-4); }
   }
 
   .auth-header { display: flex; flex-direction: column; gap: var(--sp-2); }

@@ -73,4 +73,10 @@
 
   /* Shadow (raised surfaces only) */
   --shadow-raised: 0 0 0 1px rgba(255, 255, 255, 0.02), 0 12px 32px -16px rgba(0, 0, 0, 0.8);
+
+  /* Breakpoints — referenced via literal values in @media queries throughout the codebase.
+     Convention: mobile = max-width: 639.98px, tablet-or-smaller = max-width: 1023.98px. */
+  --bp-sm: 640px;
+  --bp-md: 1024px;
+  --bp-lg: 1280px;
 }

@@ -31,7 +31,17 @@ export default defineConfig({
   projects: [
     {
       name: 'chromium',
+      testIgnore: /mobile-.*\.spec\.ts/,
       use: { ...devices['Desktop Chrome'] },
+    },
+    {
+      // Mobile viewport project — runs the mobile-tagged specs plus the smoke
+      // test, which has no layout dependencies. Desktop-layout specs (admin
+      // tables with inline action rows, sidebar nav clicks, etc.) stay on
+      // chromium to avoid duplicating assertions for both viewports.
+      name: 'mobile-chromium',
+      testMatch: /mobile-.*\.spec\.ts|smoke\.spec\.ts/,
+      use: { ...devices['Pixel 5'] },
     },
   ],
 });

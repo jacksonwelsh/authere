@@ -55,6 +55,9 @@
     box-shadow: var(--shadow-raised);
     width: 480px;
     max-width: calc(100vw - 32px);
+    display: flex;
+    flex-direction: column;
+    max-height: calc(100vh - 32px);
     animation: slideIn var(--duration-default) var(--ease-out);
   }
 
@@ -64,9 +67,15 @@
     justify-content: space-between;
     padding: var(--sp-4) var(--sp-4) 0;
     margin-bottom: var(--sp-4);
+    flex-shrink: 0;
   }
 
-  .modal-body { padding: 0 var(--sp-4) var(--sp-4); }
+  .modal-body {
+    padding: 0 var(--sp-4) var(--sp-4);
+    overflow-y: auto;
+    flex: 1;
+    min-height: 0;
+  }
 
   .modal-actions {
     display: flex;
@@ -75,6 +84,7 @@
     padding: var(--sp-3) var(--sp-4);
     border-top: 1px solid var(--border-0);
     background: var(--bg-1);
+    flex-shrink: 0;
   }
 
   .close-btn {
@@ -92,4 +102,42 @@
 
   @keyframes fadeIn { from { opacity: 0; } }
   @keyframes slideIn { from { opacity: 0; transform: translateY(-8px); } }
+
+  /* Full-screen sheet on phones — maximises form room and keeps actions above keyboard. */
+  @media (max-width: 639.98px) {
+    .overlay {
+      align-items: stretch;
+      justify-content: stretch;
+    }
+
+    .modal {
+      width: 100vw;
+      max-width: none;
+      height: 100vh;
+      max-height: 100vh;
+      border: none;
+      border-radius: 0;
+      animation: slideInSheet var(--duration-default) var(--ease-out);
+    }
+
+    .modal-header {
+      padding: var(--sp-3) var(--sp-3) var(--sp-3);
+      margin-bottom: 0;
+      border-bottom: 1px solid var(--border-0);
+    }
+
+    .modal-body {
+      padding: var(--sp-4) var(--sp-3);
+    }
+
+    .modal-actions {
+      padding: var(--sp-3);
+    }
+
+    .modal-actions :global(> *) {
+      flex: 1;
+    }
+  }
+
+  @keyframes slideInSheet { from { opacity: 0; transform: translateY(16px); } }
 </style>

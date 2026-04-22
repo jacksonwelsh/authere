@@ -5,6 +5,7 @@
   import CopyId from '../../lib/components/CopyId.svelte';
   import Input from '../../lib/components/Input.svelte';
   import Modal from '../../lib/components/Modal.svelte';
+  import ResponsiveTable from '../../lib/components/ResponsiveTable.svelte';
   import { toasts } from '../../lib/toast.svelte';
 
   let roles = $state<Role[]>([]);
@@ -77,35 +78,28 @@
       <i class="ph ph-circle-notch spin"></i> Loading…
     </div>
   {:else}
-    <div class="table-wrap">
-      <table>
-        <thead>
-          <tr>
-            <th>Name</th>
-            <th>Description</th>
-            <th>ID</th>
-            <th></th>
-          </tr>
-        </thead>
-        <tbody>
-          {#each roles as role (role.id)}
-            <tr data-testid={`row-${role.id}`}>
-              <td class="au-fg-1 font-medium">{role.name}</td>
-              <td class="au-fg-3 au-small">{role.description ?? '—'}</td>
-              <td><CopyId id={role.id} /></td>
-              <td class="actions-cell">
-                {#if !SYSTEM_ROLES.has(role.name)}
-                  <Button size="sm" variant="ghost" onclick={() => confirmDelete = role}>Delete</Button>
-                {/if}
-              </td>
-            </tr>
-          {/each}
-          {#if roles.length === 0}
-            <tr><td colspan="4" class="empty-row au-fg-4 au-small">No roles yet.</td></tr>
-          {/if}
-        </tbody>
-      </table>
-    </div>
+    <ResponsiveTable
+      label="Roles"
+      items={roles}
+      getKey={(r) => r.id}
+      hasActions={(r) => !SYSTEM_ROLES.has(r.name)}
+      columns={[
+        { key: 'name',        label: 'Name',        tdClass: 'au-fg-1 font-medium' },
+        { key: 'description', label: 'Description', tdClass: 'au-fg-3 au-small' },
+        { key: 'id',          label: 'ID' },
+      ]}
+    >
+      {#snippet cell({ item, column })}
+        {#if column.key === 'name'}{item.name}
+        {:else if column.key === 'description'}{item.description ?? '—'}
+        {:else if column.key === 'id'}<CopyId id={item.id} />
+        {/if}
+      {/snippet}
+      {#snippet actions({ item })}
+        <Button size="sm" variant="ghost" onclick={() => confirmDelete = item}>Delete</Button>
+      {/snippet}
+      {#snippet empty()}No roles yet.{/snippet}
+    </ResponsiveTable>
   {/if}
 </div>
 
@@ -141,24 +135,18 @@
 
 <style>
   .page { padding: var(--sp-6); max-width: 960px; margin: 0 auto; }
-  .page-header { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: var(--sp-6); }
+  .page-header { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: var(--sp-6); gap: var(--sp-3); }
   .page-loading { display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-8); }
-  .table-wrap { border: 1px solid var(--border-0); border-radius: var(--radius); overflow: hidden; }
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  thead th {
-    height: 32px; padding: 0 var(--sp-3); text-align: left;
-    background: var(--bg-1); color: var(--fg-4);
-    font-size: 11px; font-weight: 500; letter-spacing: 0.06em; text-transform: uppercase;
-    border-bottom: 1px solid var(--border-0); white-space: nowrap;
+
+  @media (max-width: 639.98px) {
+    .page { padding: var(--sp-4); }
+    .page-header {
+      flex-direction: column;
+      align-items: stretch;
+      margin-bottom: var(--sp-4);
+    }
   }
-  thead th:last-child { text-align: right; }
-  tbody tr { height: 32px; border-bottom: 1px solid var(--border-0); transition: background var(--duration-micro) var(--ease-out); }
-  tbody tr:last-child { border-bottom: none; }
-  tbody tr:hover { background: var(--bg-1); }
-  td { padding: 0 var(--sp-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .actions-cell { text-align: right; width: 80px; }
-  .empty-row { padding: var(--sp-8) !important; text-align: center; }
-  .font-medium { font-weight: 500; }
+
   .modal-form { display: flex; flex-direction: column; gap: var(--sp-3); }
   .spin { animation: spin 0.7s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }

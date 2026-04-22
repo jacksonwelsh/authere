@@ -263,6 +263,10 @@
 <style>
   .page { padding: var(--sp-6); max-width: 560px; margin: 0 auto; display: flex; flex-direction: column; gap: var(--sp-5); }
 
+  @media (max-width: 639.98px) {
+    .page { padding: var(--sp-4); gap: var(--sp-4); }
+  }
+
   .page-header { margin-bottom: var(--sp-2); }
 
   .credential-card {

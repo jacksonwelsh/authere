@@ -64,6 +64,10 @@
 <style>
   .page { padding: var(--sp-6); max-width: 480px; margin: 0 auto; }
 
+  @media (max-width: 639.98px) {
+    .page { padding: var(--sp-4); }
+  }
+
   .page-header {
     margin-bottom: var(--sp-6);
   }

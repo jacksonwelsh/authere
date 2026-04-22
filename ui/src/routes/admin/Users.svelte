@@ -19,6 +19,7 @@
   import CopyId from '../../lib/components/CopyId.svelte';
   import Input from '../../lib/components/Input.svelte';
   import Modal from '../../lib/components/Modal.svelte';
+  import ResponsiveTable from '../../lib/components/ResponsiveTable.svelte';
   import { toasts } from '../../lib/toast.svelte';
 
   let users = $state<User[]>([]);
@@ -236,40 +237,32 @@
       <i class="ph ph-circle-notch spin"></i> Loading…
     </div>
   {:else}
-    <div class="table-wrap">
-      <table>
-        <thead>
-          <tr>
-            <th class="col-name">Name</th>
-            <th class="col-user">Username</th>
-            <th class="col-email">Email</th>
-            <th class="col-id">ID</th>
-            <th class="col-actions"></th>
-          </tr>
-        </thead>
-        <tbody>
-          {#each users as user (user.id)}
-            <tr data-testid={`row-${user.id}`}>
-              <td class="au-fg-1 font-medium">{user.name}</td>
-              <td class="au-fg-2 au-mono au-code-sm">{user.username}</td>
-              <td class="au-fg-3 au-small">{user.email}</td>
-              <td><CopyId id={user.id} /></td>
-              <td class="actions-cell">
-                <Button size="sm" variant="ghost" onclick={() => openEdit(user)}>Edit</Button>
-                <Button size="sm" variant="ghost" onclick={() => openRoles(user.id)}>Roles</Button>
-                <Button size="sm" variant="ghost" onclick={() => openChangePassword(user)}>Password</Button>
-                <Button size="sm" variant="ghost" onclick={() => openAppPasswords(user)}>App PWs</Button>
-              </td>
-            </tr>
-          {/each}
-          {#if users.length === 0}
-            <tr>
-              <td colspan="5" class="empty-row au-fg-4 au-small">No users yet. Add one to get started.</td>
-            </tr>
-          {/if}
-        </tbody>
-      </table>
-    </div>
+    <ResponsiveTable
+      label="Users"
+      items={users}
+      getKey={(u) => u.id}
+      columns={[
+        { key: 'name',     label: 'Name',     tdClass: 'au-fg-1 font-medium' },
+        { key: 'username', label: 'Username', tdClass: 'au-fg-2 au-mono au-code-sm' },
+        { key: 'email',    label: 'Email',    tdClass: 'au-fg-3 au-small' },
+        { key: 'id',       label: 'ID',       thClass: 'col-id' },
+      ]}
+    >
+      {#snippet cell({ item, column })}
+        {#if column.key === 'name'}{item.name}
+        {:else if column.key === 'username'}{item.username}
+        {:else if column.key === 'email'}{item.email ?? ''}
+        {:else if column.key === 'id'}<CopyId id={item.id} />
+        {/if}
+      {/snippet}
+      {#snippet actions({ item })}
+        <Button size="sm" variant="ghost" onclick={() => openEdit(item)}>Edit</Button>
+        <Button size="sm" variant="ghost" onclick={() => openRoles(item.id)}>Roles</Button>
+        <Button size="sm" variant="ghost" onclick={() => openChangePassword(item)}>Password</Button>
+        <Button size="sm" variant="ghost" onclick={() => openAppPasswords(item)}>App PWs</Button>
+      {/snippet}
+      {#snippet empty()}No users yet. Add one to get started.{/snippet}
+    </ResponsiveTable>
   {/if}
 </div>
 
@@ -422,6 +415,16 @@
     align-items: flex-start;
     justify-content: space-between;
     margin-bottom: var(--sp-6);
+    gap: var(--sp-3);
+  }
+
+  @media (max-width: 639.98px) {
+    .page { padding: var(--sp-4); }
+    .page-header {
+      flex-direction: column;
+      align-items: stretch;
+      margin-bottom: var(--sp-4);
+    }
   }
 
   .page-loading {
@@ -430,52 +433,6 @@
     gap: var(--sp-2);
     padding: var(--sp-8);
   }
-
-  .table-wrap {
-    border: 1px solid var(--border-0);
-    border-radius: var(--radius);
-    overflow: hidden;
-  }
-
-  table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 13px;
-  }
-
-  thead th {
-    height: 32px;
-    padding: 0 var(--sp-3);
-    text-align: left;
-    background: var(--bg-1);
-    color: var(--fg-4);
-    font-size: 11px;
-    font-weight: 500;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    border-bottom: 1px solid var(--border-0);
-    white-space: nowrap;
-  }
-
-  thead th:last-child { text-align: right; }
-
-  tbody tr {
-    height: 32px;
-    border-bottom: 1px solid var(--border-0);
-    transition: background var(--duration-micro) var(--ease-out);
-  }
-  tbody tr:last-child { border-bottom: none; }
-  tbody tr:hover { background: var(--bg-1); }
-
-  td {
-    padding: 0 var(--sp-3);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-
-  .col-id { width: 120px; }
-  .col-actions { width: 280px; }
 
   .app-pw-list {
     list-style: none;
@@ -497,11 +454,7 @@
   }
   .app-pw-info { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
   .admin-note { margin-top: var(--sp-3); }
-  .actions-cell { text-align: right; }
 
-  .empty-row { padding: var(--sp-8) !important; text-align: center; }
-
-  .font-medium { font-weight: 500; }
 
   .modal-form { display: flex; flex-direction: column; gap: var(--sp-3); }
 

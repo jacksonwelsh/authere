@@ -1,4 +1,6 @@
 <script lang="ts">
+  import type { HTMLInputAttributes } from 'svelte/elements';
+
   interface Props {
     value?: string;
     type?: string;
@@ -7,7 +9,7 @@
     error?: string;
     disabled?: boolean;
     autofocus?: boolean;
-    autocomplete?: string;
+    autocomplete?: HTMLInputAttributes['autocomplete'];
     id?: string;
     onchange?: (v: string) => void;
     oninput?: (v: string) => void;
@@ -65,17 +67,24 @@
   }
 
   .au-input {
-    height: 32px;
+    height: 40px;
     padding: 0 var(--sp-3);
     background: var(--bg-2);
     border: 1px solid var(--border-1);
     border-radius: var(--radius);
     color: var(--fg-1);
     font-family: inherit;
-    font-size: 13px;
+    font-size: 16px;
     outline: none;
     transition: border-color var(--duration-micro) var(--ease-out);
     width: 100%;
+  }
+
+  @media (min-width: 640px) {
+    .au-input {
+      height: 32px;
+      font-size: 13px;
+    }
   }
 
   .au-input::placeholder { color: var(--fg-5); }

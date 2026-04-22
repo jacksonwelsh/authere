@@ -9,7 +9,19 @@
   let loading = $state(false);
 
   const rawRedirect = new URLSearchParams(window.location.search).get('redirect_uri') ?? '/';
-  const redirectUri = rawRedirect.startsWith('/') && !rawRedirect.startsWith('//') ? rawRedirect : '/';
+
+  function sanitizeRedirect(raw: string): string {
+    if (raw.startsWith('/') && !raw.startsWith('//')) return raw;
+    try {
+      const url = new URL(raw);
+      if (url.protocol === 'https:' || (url.protocol === 'http:' && url.hostname === 'localhost')) {
+        return url.href;
+      }
+    } catch {}
+    return '/';
+  }
+
+  const redirectUri = sanitizeRedirect(rawRedirect);
 
   async function handleSubmit(e: SubmitEvent) {
     e.preventDefault();
@@ -95,7 +107,8 @@
   }
 
   .auth-shell {
-    width: 400px;
+    width: 100%;
+    max-width: 400px;
     background: var(--bg-1);
     border: 1px solid var(--border-1);
     border-radius: var(--radius);
@@ -103,6 +116,11 @@
     display: flex;
     flex-direction: column;
     gap: var(--sp-6);
+  }
+
+  @media (max-width: 639.98px) {
+    .auth-bg { padding: var(--sp-4); }
+    .auth-shell { padding: var(--sp-6) var(--sp-4); }
   }
 
   .auth-header { display: flex; flex-direction: column; gap: var(--sp-2); }

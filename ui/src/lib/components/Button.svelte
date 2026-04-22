@@ -47,6 +47,13 @@
   .btn-md { height: 32px; padding: 0 var(--sp-3); }
   .btn-lg { height: 40px; padding: 0 var(--sp-4); font-size: 14px; }
 
+  /* Comfortable tap targets on touch. */
+  @media (max-width: 639.98px) {
+    .btn-sm { height: 36px; padding: 0 var(--sp-3); font-size: 13px; }
+    .btn-md { height: 44px; padding: 0 var(--sp-4); font-size: 14px; }
+    .btn-lg { height: 48px; font-size: 15px; }
+  }
+
   .btn-primary {
     background: var(--accent);
     color: #fff;

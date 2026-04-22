@@ -5,6 +5,7 @@
   import Button from '../../lib/components/Button.svelte';
   import Input from '../../lib/components/Input.svelte';
   import Modal from '../../lib/components/Modal.svelte';
+  import ResponsiveTable from '../../lib/components/ResponsiveTable.svelte';
   import { toasts } from '../../lib/toast.svelte';
 
   let invitations = $state<Invitation[]>([]);
@@ -114,55 +115,44 @@
       <i class="ph ph-circle-notch spin"></i> Loading…
     </div>
   {:else}
-    <div class="table-wrap">
-      <table>
-        <thead>
-          <tr>
-            <th>Code</th>
-            <th>Label</th>
-            <th>Uses</th>
-            <th>Expires</th>
-            <th>Created</th>
-            <th>Status</th>
-            <th></th>
-          </tr>
-        </thead>
-        <tbody>
-          {#each invitations as inv (inv.id)}
-            <tr data-testid={`row-${inv.id}`}>
-              <td class="code-cell">
-                <span class="au-mono au-code-sm au-fg-4">{inv.id.slice(0, 12)}…</span>
-                <button
-                  class="icon-btn"
-                  onclick={() => copyInviteLink(inv)}
-                  title="Copy invite link"
-                  aria-label={`Copy invite link for ${inv.label ?? inv.id}`}
-                >
-                  <i class="ph ph-link"></i>
-                </button>
-              </td>
-              <td class="au-fg-2">{inv.label ?? '—'}</td>
-              <td class="au-fg-3">
-                {inv.uses}{inv.max_uses != null ? ` / ${inv.max_uses}` : ''}
-              </td>
-              <td class="au-fg-3">{formatDate(inv.expires_at)}</td>
-              <td class="au-fg-3">{formatDate(inv.created_at)}</td>
-              <td>
-                <Badge variant={statusVariant(inv.status)}>
-                  {inv.status}
-                </Badge>
-              </td>
-              <td class="actions-cell">
-                <Button size="sm" variant="ghost" onclick={() => confirmDelete = inv}>Delete</Button>
-              </td>
-            </tr>
-          {/each}
-          {#if invitations.length === 0}
-            <tr><td colspan="7" class="empty-row au-fg-4 au-small">No invitations yet.</td></tr>
-          {/if}
-        </tbody>
-      </table>
-    </div>
+    <ResponsiveTable
+      label="Invitations"
+      items={invitations}
+      getKey={(i) => i.id}
+      columns={[
+        { key: 'code',    label: 'Code' },
+        { key: 'label',   label: 'Label',   tdClass: 'au-fg-2' },
+        { key: 'uses',    label: 'Uses',    tdClass: 'au-fg-3' },
+        { key: 'expires', label: 'Expires', tdClass: 'au-fg-3' },
+        { key: 'created', label: 'Created', tdClass: 'au-fg-3' },
+        { key: 'status',  label: 'Status' },
+      ]}
+    >
+      {#snippet cell({ item, column })}
+        {#if column.key === 'code'}
+          <span class="code-cell">
+            <span class="au-mono au-code-sm au-fg-4">{item.id.slice(0, 12)}…</span>
+            <button
+              class="icon-btn"
+              onclick={() => copyInviteLink(item)}
+              title="Copy invite link"
+              aria-label={`Copy invite link for ${item.label ?? item.id}`}
+            >
+              <i class="ph ph-link"></i>
+            </button>
+          </span>
+        {:else if column.key === 'label'}{item.label ?? '—'}
+        {:else if column.key === 'uses'}{item.uses}{item.max_uses != null ? ` / ${item.max_uses}` : ''}
+        {:else if column.key === 'expires'}{formatDate(item.expires_at)}
+        {:else if column.key === 'created'}{formatDate(item.created_at)}
+        {:else if column.key === 'status'}<Badge variant={statusVariant(item.status)}>{item.status}</Badge>
+        {/if}
+      {/snippet}
+      {#snippet actions({ item })}
+        <Button size="sm" variant="ghost" onclick={() => confirmDelete = item}>Delete</Button>
+      {/snippet}
+      {#snippet empty()}No invitations yet.{/snippet}
+    </ResponsiveTable>
   {/if}
 </div>
 
@@ -209,26 +199,20 @@
 
 <style>
   .page { padding: var(--sp-6); max-width: 960px; margin: 0 auto; }
-  .page-header { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: var(--sp-6); }
+  .page-header { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: var(--sp-6); gap: var(--sp-3); }
   .page-loading { display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-8); }
-  .table-wrap { border: 1px solid var(--border-0); border-radius: var(--radius); overflow: hidden; }
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  thead th {
-    height: 32px; padding: 0 var(--sp-3); text-align: left;
-    background: var(--bg-1); color: var(--fg-4);
-    font-size: 11px; font-weight: 500; letter-spacing: 0.06em; text-transform: uppercase;
-    border-bottom: 1px solid var(--border-0); white-space: nowrap;
+
+  @media (max-width: 639.98px) {
+    .page { padding: var(--sp-4); }
+    .page-header {
+      flex-direction: column;
+      align-items: stretch;
+      margin-bottom: var(--sp-4);
+    }
   }
-  thead th:last-child { text-align: right; }
-  tbody tr { height: 32px; border-bottom: 1px solid var(--border-0); transition: background var(--duration-micro) var(--ease-out); }
-  tbody tr:last-child { border-bottom: none; }
-  tbody tr:hover { background: var(--bg-1); }
-  td { padding: 0 var(--sp-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .actions-cell { text-align: right; width: 80px; }
-  .empty-row { padding: var(--sp-8) !important; text-align: center; }
 
   .code-cell {
-    display: flex;
+    display: inline-flex;
     align-items: center;
     gap: var(--sp-2);
     white-space: nowrap;
@@ -242,7 +226,7 @@
     padding: var(--sp-1);
     border-radius: var(--radius);
     font-size: 14px;
-    display: flex;
+    display: inline-flex;
     align-items: center;
     transition: color var(--duration-micro) var(--ease-out),
                 background var(--duration-micro) var(--ease-out);

@@ -56,3 +56,25 @@ html, body, #app {
 .au-success { color: var(--success); }
 .au-warning { color: var(--warning); }
 .au-danger { color: var(--danger); }
+
+/* Weight utility — used where a column needs emphasis in tables. */
+.font-medium { font-weight: 500; }
+
+/* Form controls default to 16px to prevent iOS zoom on focus. Components can still override. */
+input, select, textarea {
+  font-size: 16px;
+  font-family: inherit;
+}
+
+@media (min-width: 640px) {
+  input, select, textarea {
+    font-size: 14px;
+  }
+}
+
+/* Scale headings down on phones so they don't dominate narrow viewports. */
+@media (max-width: 639.98px) {
+  .au-h1 { font-size: 24px; }
+  .au-h2 { font-size: 20px; }
+  .au-h3 { font-size: 16px; }
+}

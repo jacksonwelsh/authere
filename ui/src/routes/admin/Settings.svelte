@@ -351,6 +351,10 @@
     gap: var(--sp-6);
   }
 
+  @media (max-width: 639.98px) {
+    .page { padding: var(--sp-4); gap: var(--sp-4); }
+  }
+
   .page-header { display: flex; flex-direction: column; gap: var(--sp-1); }
 
   .loading { padding: var(--sp-4) 0; }

@@ -113,11 +113,11 @@
               onclick={clickable ? () => { selected = entry; } : undefined}
               title={clickable ? 'Click to view actor details' : undefined}
             >
-              <td class="au-code-sm au-mono au-fg-3 au-tabular">{formatTime(entry.timestamp)}</td>
-              <td>
+              <td class="au-code-sm au-mono au-fg-3 au-tabular" data-label="Time (UTC)">{formatTime(entry.timestamp)}</td>
+              <td data-label="Event">
                 <Badge variant={eventVariant(entry.event_type)}>{entry.event_type}</Badge>
               </td>
-              <td>
+              <td data-label="User">
                 {#if ud.id}
                   <CopyId id={ud.id} />
                 {:else if ud.label === '—'}
@@ -126,8 +126,8 @@
                   <span class="au-code-sm" class:au-fg-4={ud.ghost}>{ud.label}</span>{#if ud.ghost}<span class="ghost-label au-micro au-fg-4"> (nonexistent)</span>{/if}
                 {/if}
               </td>
-              <td class="au-code-sm au-fg-3">{entry.ip_address ?? '—'}</td>
-              <td class="ua-cell au-small au-fg-4">{entry.user_agent ?? '—'}</td>
+              <td class="au-code-sm au-fg-3" data-label="IP">{entry.ip_address ?? '—'}</td>
+              <td class="ua-cell au-small au-fg-4" data-label="User agent">{entry.user_agent ?? '—'}</td>
             </tr>
           {/each}
           {#if entries.length === 0}
@@ -229,4 +229,51 @@
   .detail-list dt { color: var(--fg-4); font-size: 11px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.06em; display: flex; align-items: center; }
   .detail-list dd { margin: 0; display: flex; align-items: center; flex-wrap: wrap; gap: var(--sp-1); word-break: break-all; }
   .detail-json { white-space: pre-wrap; background: var(--bg-1); border: 1px solid var(--border-0); border-radius: var(--radius); padding: var(--sp-2); align-items: flex-start; }
+
+  @media (max-width: 639.98px) {
+    .page { padding: var(--sp-4); }
+    .page-header {
+      flex-direction: column;
+      align-items: stretch;
+      gap: var(--sp-3);
+      margin-bottom: var(--sp-4);
+    }
+
+    /* Collapse table into a stack of cards. */
+    .table-wrap {
+      border: none;
+      overflow: visible;
+    }
+    table, thead, tbody, tr, th, td {
+      display: block;
+    }
+    table { min-width: 0; }
+    thead { display: none; }
+    tbody tr {
+      height: auto;
+      border: 1px solid var(--border-0);
+      border-radius: var(--radius);
+      padding: var(--sp-3);
+      margin-bottom: var(--sp-2);
+      background: var(--bg-1);
+    }
+    tbody tr:hover { background: var(--bg-1); }
+    tbody tr td {
+      white-space: normal;
+      padding: var(--sp-1) 0;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+    tbody tr td::before {
+      content: attr(data-label);
+      font-family: 'IBM Plex Mono', monospace;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--fg-4);
+    }
+    .ua-cell { max-width: none; }
+    .col-time, .col-event, .col-user, .col-ip { width: auto; }
+  }
 </style>
