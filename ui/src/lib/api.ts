@@ -67,13 +67,25 @@ async function tryRefresh(): Promise<boolean> {
   return refreshing;
 }
 
+// Auth-related endpoints must not go through the refresh/redirect dance on
+// 401 — a 401 here *is* the meaningful answer (wrong password, expired
+// refresh token, etc.), and auto-redirecting to /login would hide the UX.
+function isAuthPath(path: string): boolean {
+  return (
+    path.startsWith('/api/auth/login') ||
+    path.startsWith('/api/auth/browser-refresh') ||
+    path.startsWith('/api/auth/browser-logout') ||
+    path.startsWith('/api/login')
+  );
+}
+
 async function request<T>(path: string, init?: RequestInit, retry = true): Promise<T> {
   const res = await fetch(path, {
     credentials: 'same-origin',
     headers: { 'Content-Type': 'application/json', ...(init?.headers ?? {}) },
     ...init,
   });
-  if (res.status === 401 && retry) {
+  if (res.status === 401 && retry && !isAuthPath(path)) {
     const refreshed = await tryRefresh();
     if (refreshed) return request<T>(path, init, false);
     window.location.href = `/login?redirect_uri=${encodeURIComponent(window.location.pathname)}`;
@@ -172,13 +184,68 @@ export const validateInvite = (code: string) =>
   request<{ valid: boolean }>(`/api/register/validate-invite?code=${encodeURIComponent(code)}`);
 
 // Settings
+export type LdapPasswordMode = 'primary_and_app' | 'app_only' | 'primary_only';
+
+export interface LdapSettings {
+  enabled: boolean;
+  base_dn: string;
+  bind_address: string;
+  service_account_dn: string;
+  service_password_set: boolean;
+  password_mode: LdapPasswordMode;
+}
+
+export interface LdapSettingsInput {
+  enabled?: boolean;
+  base_dn?: string;
+  bind_address?: string;
+  password_mode?: LdapPasswordMode;
+}
+
 export interface Settings {
   open_registration: boolean;
+  ldap: LdapSettings;
+}
+
+export interface SettingsInput {
+  open_registration?: boolean;
+  ldap?: LdapSettingsInput;
 }
 
 export const getSettings = () => request<Settings>('/api/settings');
-export const updateSettings = (data: Partial<Settings>) =>
+export const updateSettings = (data: SettingsInput) =>
   request<Settings>('/api/settings', { method: 'PATCH', body: JSON.stringify(data) });
+export const regenerateLdapBindPassword = () =>
+  request<{ password: string }>('/api/settings/ldap/regenerate-bind-password', { method: 'POST' });
+
+// App passwords
+export interface AppPassword {
+  id: string;
+  user_id: string;
+  name: string;
+  created_at: number;
+  last_used_at: number | null;
+}
+
+export interface CreateAppPasswordResponse {
+  app_password: AppPassword;
+  password: string;
+}
+
+export const listMyAppPasswords = () =>
+  request<AppPassword[]>('/api/me/app-passwords');
+export const createMyAppPassword = (name: string) =>
+  request<CreateAppPasswordResponse>('/api/me/app-passwords', {
+    method: 'POST',
+    body: JSON.stringify({ name }),
+  });
+export const deleteMyAppPassword = (id: string) =>
+  request<void>(`/api/me/app-passwords/${id}`, { method: 'DELETE' });
+
+export const listUserAppPasswords = (userId: string) =>
+  request<AppPassword[]>(`/api/users/${userId}/app-passwords`);
+export const deleteUserAppPassword = (userId: string, id: string) =>
+  request<void>(`/api/users/${userId}/app-passwords/${id}`, { method: 'DELETE' });
 
 // Invitations
 export interface Invitation {

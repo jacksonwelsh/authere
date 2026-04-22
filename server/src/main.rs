@@ -85,19 +85,23 @@ async fn main() -> Result<(), AppError> {
         Some(Commands::Serve) | None => {}
     }
 
+    fn env_override(name: &str, default: u32) -> u32 {
+        env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    }
+
     let login_rate_limiter = RateLimiter::new(RateLimitConfig {
-        max_requests: 5,
-        window: Duration::from_secs(60),
+        max_requests: env_override("AUTHERE_LOGIN_MAX_REQUESTS", 5),
+        window: Duration::from_secs(env_override("AUTHERE_LOGIN_WINDOW_SECS", 60).into()),
     });
 
     let register_rate_limiter = RateLimiter::new(RateLimitConfig {
-        max_requests: 3,
-        window: Duration::from_secs(3600),
+        max_requests: env_override("AUTHERE_REGISTER_MAX_REQUESTS", 3),
+        window: Duration::from_secs(env_override("AUTHERE_REGISTER_WINDOW_SECS", 3600).into()),
     });
 
     let ldap_bind_rate_limiter = RateLimiter::new(RateLimitConfig {
-        max_requests: 30,
-        window: Duration::from_secs(60),
+        max_requests: env_override("AUTHERE_LDAP_MAX_REQUESTS", 30),
+        window: Duration::from_secs(env_override("AUTHERE_LDAP_WINDOW_SECS", 60).into()),
     });
 
     // Spawn background cleanup for rate limiters

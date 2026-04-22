@@ -12,7 +12,7 @@
   }
 </script>
 
-<button class="copy-id au-code-sm au-fg-4" onclick={copy} title={id}>
+<button class="copy-id au-code-sm au-fg-4" onclick={copy} title={id} aria-label={`Copy ID ${id}`}>
   …{id.slice(-12)}
 </button>
 

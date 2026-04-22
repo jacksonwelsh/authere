@@ -25,3 +25,4 @@ target
 tarpaulin-report.html
 
 .env
+server/test-results

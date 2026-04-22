@@ -89,7 +89,7 @@
         </thead>
         <tbody>
           {#each roles as role (role.id)}
-            <tr>
+            <tr data-testid={`row-${role.id}`}>
               <td class="au-fg-1 font-medium">{role.name}</td>
               <td class="au-fg-3 au-small">{role.description ?? '—'}</td>
               <td><CopyId id={role.id} /></td>

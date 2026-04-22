@@ -1,6 +1,20 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { getUsers, getRoles, getUserRoles, createUser, updateUser, assignRole, removeRole, adminChangePassword, type User, type Role } from '../../lib/api';
+  import {
+    getUsers,
+    getRoles,
+    getUserRoles,
+    createUser,
+    updateUser,
+    assignRole,
+    removeRole,
+    adminChangePassword,
+    listUserAppPasswords,
+    deleteUserAppPassword,
+    type User,
+    type Role,
+    type AppPassword,
+  } from '../../lib/api';
   import Button from '../../lib/components/Button.svelte';
   import CopyId from '../../lib/components/CopyId.svelte';
   import Input from '../../lib/components/Input.svelte';
@@ -99,9 +113,9 @@
     try {
       await removeRole(userId, roleId);
       toasts.success(`Removed ${role?.name ?? 'role'}.`);
-    } catch {
+    } catch (err: any) {
       userRoles = { ...userRoles, [userId]: prev };
-      toasts.error('Failed to remove role.');
+      toasts.error(err?.message ? `Failed to remove role: ${err.message}` : 'Failed to remove role.');
     }
   }
 
@@ -162,6 +176,44 @@
     }
   }
 
+  // App passwords (admin view)
+  let appPasswordUser = $state<User | null>(null);
+  let appPasswords = $state<AppPassword[]>([]);
+  let loadingAppPws = $state(false);
+  let revokingId = $state<string | null>(null);
+
+  async function openAppPasswords(user: User) {
+    appPasswordUser = user;
+    loadingAppPws = true;
+    try {
+      appPasswords = await listUserAppPasswords(user.id);
+    } catch {
+      toasts.error('Failed to load app passwords.');
+      appPasswords = [];
+    } finally {
+      loadingAppPws = false;
+    }
+  }
+
+  async function handleRevokeAppPassword(id: string) {
+    if (!appPasswordUser || revokingId) return;
+    revokingId = id;
+    try {
+      await deleteUserAppPassword(appPasswordUser.id, id);
+      appPasswords = appPasswords.filter((p) => p.id !== id);
+      toasts.success('Revoked.');
+    } catch (err: any) {
+      toasts.error(`Failed to revoke: ${err.message}`);
+    } finally {
+      revokingId = null;
+    }
+  }
+
+  function formatDate(ts: number | null) {
+    if (!ts) return '—';
+    return new Date(ts * 1000).toLocaleDateString();
+  }
+
   const roleUser = $derived(showRoles ? users.find(u => u.id === showRoles) : null);
   const assignedRoleIds = $derived(
     showRoles ? new Set((userRoles[showRoles] ?? []).map(r => r.id)) : new Set<string>()
@@ -197,7 +249,7 @@
         </thead>
         <tbody>
           {#each users as user (user.id)}
-            <tr>
+            <tr data-testid={`row-${user.id}`}>
               <td class="au-fg-1 font-medium">{user.name}</td>
               <td class="au-fg-2 au-mono au-code-sm">{user.username}</td>
               <td class="au-fg-3 au-small">{user.email}</td>
@@ -206,6 +258,7 @@
                 <Button size="sm" variant="ghost" onclick={() => openEdit(user)}>Edit</Button>
                 <Button size="sm" variant="ghost" onclick={() => openRoles(user.id)}>Roles</Button>
                 <Button size="sm" variant="ghost" onclick={() => openChangePassword(user)}>Password</Button>
+                <Button size="sm" variant="ghost" onclick={() => openAppPasswords(user)}>App PWs</Button>
               </td>
             </tr>
           {/each}
@@ -283,6 +336,44 @@
     </div>
     {#snippet actions()}
       <Button variant="secondary" onclick={() => showRoles = null}>Done</Button>
+    {/snippet}
+  </Modal>
+{/if}
+
+<!-- App passwords modal -->
+{#if appPasswordUser}
+  <Modal title="App passwords — {appPasswordUser.name}" onclose={() => appPasswordUser = null}>
+    {#if loadingAppPws}
+      <p class="au-small au-fg-3">Loading…</p>
+    {:else if appPasswords.length === 0}
+      <p class="au-small au-fg-3">This user has not created any app passwords.</p>
+    {:else}
+      <ul class="app-pw-list">
+        {#each appPasswords as p (p.id)}
+          <li class="app-pw-row">
+            <div class="app-pw-info">
+              <span class="au-small font-medium">{p.name}</span>
+              <span class="au-micro au-fg-3">
+                Created {formatDate(p.created_at)} · Last used {formatDate(p.last_used_at)}
+              </span>
+            </div>
+            <Button
+              size="sm"
+              variant="ghost"
+              loading={revokingId === p.id}
+              onclick={() => handleRevokeAppPassword(p.id)}
+            >
+              Revoke
+            </Button>
+          </li>
+        {/each}
+      </ul>
+    {/if}
+    <p class="au-micro au-fg-4 admin-note">
+      Only the account holder can create new app passwords. You can revoke from here.
+    </p>
+    {#snippet actions()}
+      <Button variant="secondary" onclick={() => appPasswordUser = null}>Done</Button>
     {/snippet}
   </Modal>
 {/if}
@@ -384,7 +475,28 @@
   }
 
   .col-id { width: 120px; }
-  .col-actions { width: 210px; }
+  .col-actions { width: 280px; }
+
+  .app-pw-list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-2);
+  }
+  .app-pw-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: var(--sp-3);
+    padding: var(--sp-2) var(--sp-3);
+    border: 1px solid var(--border-0);
+    border-radius: var(--radius);
+    background: var(--bg-1);
+  }
+  .app-pw-info { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+  .admin-note { margin-top: var(--sp-3); }
   .actions-cell { text-align: right; }
 
   .empty-row { padding: var(--sp-8) !important; text-align: center; }

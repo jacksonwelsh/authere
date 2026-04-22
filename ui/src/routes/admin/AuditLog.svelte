@@ -199,7 +199,7 @@
 {/if}
 
 <style>
-  .page { padding: var(--sp-6); max-width: 1200px; margin: 0 auto; }
+  .page { padding: var(--sp-6); max-width: 960px; margin: 0 auto; }
   .page-header { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: var(--sp-6); }
   .page-loading { display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-8); }
   .table-wrap { border: 1px solid var(--border-0); border-radius: var(--radius); overflow-x: auto; }

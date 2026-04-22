@@ -4,8 +4,9 @@
     onclose: () => void;
     children: import('svelte').Snippet;
     actions?: import('svelte').Snippet;
+    width?: number;
   }
-  let { title, onclose, children, actions }: Props = $props();
+  let { title, onclose, children, actions, width }: Props = $props();
 
   function onkeydown(e: KeyboardEvent) {
     if (e.key === 'Escape') onclose();
@@ -17,7 +18,7 @@
 <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
 <div class="overlay" onclick={onclose}>
   <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-  <div class="modal" onclick={(e) => e.stopPropagation()} role="dialog" aria-modal="true" aria-labelledby="modal-title">
+  <div class="modal" style={width ? `width: ${width}px;` : ''} onclick={(e) => e.stopPropagation()} role="dialog" aria-modal="true" aria-labelledby="modal-title">
     <div class="modal-header">
       <h2 id="modal-title" class="au-h4">{title}</h2>
       <button class="close-btn" onclick={onclose} aria-label="Close">

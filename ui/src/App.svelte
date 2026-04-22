@@ -81,7 +81,7 @@
   {:else if page === 'register'}
     <Register />
   {:else}
-    <Shell activePage={page} username={me?.user_id ?? ''} roles={me?.roles ?? []}>
+    <Shell activePage={page} username={me?.username ?? ''} roles={me?.roles ?? []}>
       {#if page === 'users'}
         <Users />
       {:else if page === 'roles'}
