@@ -33,6 +33,7 @@ pub struct AppState {
     pub register_rate_limiter: RateLimiter,
     pub ldap_bind_rate_limiter: RateLimiter,
     pub signing_key: Arc<SigningKey>,
+    pub origin: String,
 }
 
 impl FromRef<AppState> for SqlitePool {

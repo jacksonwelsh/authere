@@ -1,5 +1,6 @@
 use std::env;
 use std::net::SocketAddr;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -48,7 +49,10 @@ async fn main() -> Result<(), AppError> {
         warn!("DATABASE_URL not set, using default: sqlite:./data.db");
         String::from("sqlite:./data.db")
     });
-    let db_pool = SqlitePool::connect(&database_url)
+    let connect_opts = sqlx::sqlite::SqliteConnectOptions::from_str(&database_url)
+        .expect("Invalid DATABASE_URL")
+        .create_if_missing(true);
+    let db_pool = SqlitePool::connect_with(connect_opts)
         .await
         .expect("Could not connect to sqlite!");
 
@@ -121,12 +125,18 @@ async fn main() -> Result<(), AppError> {
         });
     }
 
+    let origin = env::var("AUTHERE_ORIGIN").unwrap_or_else(|_| {
+        warn!("AUTHERE_ORIGIN not set — forward auth redirects will use http://localhost:3000");
+        String::from("http://localhost:3000")
+    });
+
     let state = AppState {
         db_pool,
         login_rate_limiter,
         register_rate_limiter,
         ldap_bind_rate_limiter,
         signing_key,
+        origin,
     };
 
     // Start the LDAP listener if enabled. Settings changes take effect on the next

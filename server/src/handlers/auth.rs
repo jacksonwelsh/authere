@@ -1,5 +1,5 @@
 use axum::extract::{self, Query, State};
-use axum::http::header::{HeaderMap, HeaderName, HeaderValue};
+use axum::http::header::{self, HeaderMap, HeaderName, HeaderValue};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
@@ -402,12 +402,44 @@ pub async fn browser_refresh(
 // Forward Auth Endpoint
 // ============================================================================
 
+fn build_forward_auth_redirect(origin: &str, headers: &HeaderMap) -> Response {
+    let proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("https");
+    let host = headers
+        .get("x-forwarded-host")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let uri = headers
+        .get("x-forwarded-uri")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("/");
+
+    let redirect_uri = if host.is_empty() {
+        String::from("/")
+    } else {
+        format!("{proto}://{host}{uri}")
+    };
+
+    let location = format!(
+        "{origin}/login?redirect_uri={}",
+        urlencoding::encode(&redirect_uri)
+    );
+
+    (
+        StatusCode::TEMPORARY_REDIRECT,
+        [(header::LOCATION, location)],
+    )
+        .into_response()
+}
+
 #[utoipa::path(
     get,
     path = "/api/auth/verify",
     responses(
         (status = 200, description = "Authenticated and authorized"),
-        (status = 401, description = "Not authenticated"),
+        (status = 307, description = "Not authenticated, redirect to login"),
         (status = 403, description = "Not authorized for this application"),
         (status = 500, description = "Internal server error")
     ),
@@ -416,8 +448,10 @@ pub async fn browser_refresh(
 pub async fn verify_auth(
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> Result<(StatusCode, HeaderMap), AppError> {
-    let mut conn = state.db_pool.acquire().await?;
+) -> Result<Response, Response> {
+    let mut conn = state.db_pool.acquire().await.map_err(|e| {
+        AppError::DbError(e).into_response()
+    })?;
 
     let auth_header = headers
         .get("authorization")
@@ -434,19 +468,26 @@ pub async fn verify_auth(
                 .map(|s| s.strip_prefix("authere_token=").unwrap_or(""))
         });
 
-    let token = auth_header
+    let token = match auth_header
         .and_then(|h| h.strip_prefix("Bearer "))
         .or(cookie_token)
-        .ok_or(AppError::AuthenticationRequired)?;
+    {
+        Some(t) => t,
+        None => return Err(build_forward_auth_redirect(&state.origin, &headers)),
+    };
 
-    let claims = token::verify_access_token(token, &state.signing_key, &mut conn).await?;
+    let claims = match token::verify_access_token(token, &state.signing_key, &mut conn).await {
+        Ok(c) => c,
+        Err(_) => return Err(build_forward_auth_redirect(&state.origin, &headers)),
+    };
 
     let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| AppError::InternalError("Invalid user ID in token".to_string()))?;
+        .map_err(|_| AppError::InternalError("Invalid user ID in token".to_string()).into_response())?;
 
-    let user = User::get(user_id, &mut conn)
-        .await?
-        .ok_or(AppError::AuthenticationRequired)?;
+    let user = match User::get(user_id, &mut conn).await {
+        Ok(Some(u)) => u,
+        _ => return Err(build_forward_auth_redirect(&state.origin, &headers)),
+    };
 
     let host = headers
         .get("x-forwarded-host")
@@ -460,16 +501,16 @@ pub async fn verify_auth(
         .unwrap_or("/");
 
     use crate::application::Application;
-    if let Some(app) = Application::find_matching(host, path, &mut conn).await? {
+    if let Some(app) = Application::find_matching(host, path, &mut conn).await.map_err(|e| e.into_response())? {
         if !app.check_access(&claims.roles) {
             warn!(user_id = %user_id, host = %host, path = %path, app = %app.name, "forward auth denied: insufficient roles");
-            return Err(AppError::Forbidden);
+            return Err(AppError::Forbidden.into_response());
         }
     }
 
     let response_headers = build_auth_headers(&user, &claims.roles, user.email.as_deref());
 
-    Ok((StatusCode::OK, response_headers))
+    Ok((StatusCode::OK, response_headers).into_response())
 }
 
 #[cfg(test)]
@@ -525,5 +566,64 @@ mod tests {
 
         let headers = build_auth_headers(&user, &[], None);
         assert_eq!(headers.get("x-auth-roles").unwrap(), "");
+    }
+
+    fn extract_location(resp: &Response) -> &str {
+        resp.headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+    }
+
+    #[test]
+    fn forward_auth_redirect_builds_full_url() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        headers.insert("x-forwarded-host", "flood.example.com".parse().unwrap());
+        headers.insert("x-forwarded-uri", "/some/path".parse().unwrap());
+
+        let resp = build_forward_auth_redirect("https://auth.example.com", &headers);
+
+        assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            extract_location(&resp),
+            "https://auth.example.com/login?redirect_uri=https%3A%2F%2Fflood.example.com%2Fsome%2Fpath"
+        );
+    }
+
+    #[test]
+    fn forward_auth_redirect_defaults_to_slash_when_no_host() {
+        let headers = HeaderMap::new();
+        let resp = build_forward_auth_redirect("https://auth.example.com", &headers);
+
+        assert_eq!(
+            extract_location(&resp),
+            "https://auth.example.com/login?redirect_uri=%2F"
+        );
+    }
+
+    #[test]
+    fn forward_auth_redirect_defaults_proto_to_https() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-host", "app.example.com".parse().unwrap());
+
+        let resp = build_forward_auth_redirect("https://auth.example.com", &headers);
+
+        assert!(extract_location(&resp).contains("https%3A%2F%2Fapp.example.com"));
+    }
+
+    #[test]
+    fn forward_auth_redirect_defaults_uri_to_slash() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        headers.insert("x-forwarded-host", "app.example.com".parse().unwrap());
+
+        let resp = build_forward_auth_redirect("https://auth.example.com", &headers);
+
+        assert_eq!(
+            extract_location(&resp),
+            "https://auth.example.com/login?redirect_uri=https%3A%2F%2Fapp.example.com%2F"
+        );
     }
 }

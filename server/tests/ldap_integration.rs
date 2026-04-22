@@ -196,6 +196,7 @@ async fn start_server(mode: LdapPasswordMode) -> Fixture {
         register_rate_limiter: RateLimiter::new(RateLimitConfig::default()),
         ldap_bind_rate_limiter,
         signing_key,
+        origin: String::from("http://localhost:3000"),
     };
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
