@@ -9,7 +9,7 @@ INSTALL_DIR="/opt/authere"
 BINARY_NAME="authere_server"
 LOG_TAG="authere-deploy"
 
-log() { logger -t "$LOG_TAG" "$@"; echo "[$(date -Iseconds)] $*"; }
+log() { logger -t "$LOG_TAG" "$@"; }
 
 # Read a GitHub release JSON payload from stdin and print the per-asset API
 # URL for the asset with the given name. The API URL contains a unique
@@ -30,15 +30,26 @@ sys.exit(f"asset not found: {name}")
 ' "$asset_name"
 }
 
+# Check that a file begins with the ELF magic bytes. Avoids depending on
+# the `file` command, which isn't in the minimal Debian LXC.
+is_elf() {
+  python3 -c '
+import sys
+with open(sys.argv[1], "rb") as f:
+    sys.exit(0 if f.read(4) == b"\x7fELF" else 1)
+' "$1"
+}
+
 deploy() {
   log "Starting deploy"
 
   log "Resolving asset URL via GitHub API"
   local release_json asset_url
   if ! release_json=$(curl -fsSL \
+      --connect-timeout 30 --max-time 60 \
+      --retry 3 --retry-delay 5 \
       -H "Accept: application/vnd.github+json" \
       -H "X-GitHub-Api-Version: 2022-11-28" \
-      --retry 3 --retry-delay 5 \
       "https://api.github.com/repos/${REPO}/releases/tags/latest"); then
     log "ERROR: Failed to fetch release metadata"
     return 1
@@ -54,16 +65,20 @@ deploy() {
   tmp_bin=$(mktemp "${INSTALL_DIR}/${BINARY_NAME}.XXXXXX")
   trap 'rm -f "$tmp_bin"' EXIT
 
-  if ! curl -fSL --retry 3 --retry-delay 5 \
+  if ! curl -fSL \
+      --connect-timeout 30 --max-time 300 \
+      --retry 3 --retry-delay 5 \
       -H "Accept: application/octet-stream" \
       -o "$tmp_bin" "$asset_url"; then
-    log "ERROR: Failed to download binary"
+    log "ERROR: Failed to download binary (curl exit non-zero within 300s)"
     return 1
   fi
 
+  log "Download complete ($(stat -c %s "$tmp_bin" 2>/dev/null || echo "?") bytes)"
+
   chmod +x "$tmp_bin"
 
-  if ! file "$tmp_bin" | grep -q "ELF"; then
+  if ! is_elf "$tmp_bin"; then
     log "ERROR: Downloaded file is not a valid ELF binary"
     return 1
   fi
@@ -78,5 +93,11 @@ deploy() {
 }
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  # Route stdout/stderr to syslog so bash errors, curl stderr, and set -e
+  # exits surface in journalctl — webhook.py points both at /dev/null.
+  exec > >(logger -t "$LOG_TAG" -p user.info) 2> >(logger -t "$LOG_TAG" -p user.err)
+  # Emit a pre-curl breadcrumb so we can tell if mktemp or curl is the one
+  # that exited silently.
+  set -x
   deploy
 fi

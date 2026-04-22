@@ -179,14 +179,14 @@ impl Application {
         true
     }
 
-    /// Check if the given roles satisfy this application's requirements
+    /// Check if the given roles satisfy this application's requirements.
+    /// `required_roles` may contain role IDs (UUIDs) or role names;
+    /// `user_roles` contains role names from the access token.
     pub fn check_access(&self, user_roles: &[String]) -> bool {
         if self.required_roles.is_empty() {
-            // No roles required, any authenticated user can access
             return true;
         }
 
-        // User must have at least one of the required roles
         for required in &self.required_roles {
             if user_roles.contains(required) {
                 return true;
@@ -194,6 +194,37 @@ impl Application {
         }
 
         false
+    }
+
+    /// Like `check_access`, but resolves role IDs stored in `required_roles`
+    /// to names via the database before comparing.
+    pub async fn check_access_resolved(
+        &self,
+        user_roles: &[String],
+        conn: &mut SqliteConnection,
+    ) -> Result<bool, AppError> {
+        if self.required_roles.is_empty() {
+            return Ok(true);
+        }
+
+        let mut required_names = Vec::with_capacity(self.required_roles.len());
+        for entry in &self.required_roles {
+            if let Ok(id) = Uuid::parse_str(entry) {
+                if let Some(role) = crate::role::Role::get(id, conn).await? {
+                    required_names.push(role.name);
+                }
+            } else {
+                required_names.push(entry.clone());
+            }
+        }
+
+        for name in &required_names {
+            if user_roles.contains(name) {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
     }
 
     /// Update the application

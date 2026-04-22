@@ -55,6 +55,37 @@ else
   pass=$((pass + 1))
 fi
 
+# is_elf: accepts file starting with ELF magic bytes, rejects others.
+tmpdir=$(mktemp -d)
+trap 'rm -rf "$tmpdir"' EXIT
+
+printf '\x7fELF\x02\x01\x01\x00' > "$tmpdir/elf.bin"
+if is_elf "$tmpdir/elf.bin"; then
+  echo "ok: is_elf accepts file starting with ELF magic"
+  pass=$((pass + 1))
+else
+  echo "FAIL: is_elf should accept file starting with ELF magic"
+  fail=$((fail + 1))
+fi
+
+printf '{"hello": "world"}' > "$tmpdir/notelf.json"
+if is_elf "$tmpdir/notelf.json"; then
+  echo "FAIL: is_elf should reject JSON payload"
+  fail=$((fail + 1))
+else
+  echo "ok: is_elf rejects JSON payload"
+  pass=$((pass + 1))
+fi
+
+: > "$tmpdir/empty.bin"
+if is_elf "$tmpdir/empty.bin"; then
+  echo "FAIL: is_elf should reject empty file"
+  fail=$((fail + 1))
+else
+  echo "ok: is_elf rejects empty file"
+  pass=$((pass + 1))
+fi
+
 echo ""
 echo "${pass} passed, ${fail} failed"
 exit "$fail"

@@ -502,7 +502,7 @@ pub async fn verify_auth(
 
     use crate::application::Application;
     if let Some(app) = Application::find_matching(host, path, &mut conn).await.map_err(|e| e.into_response())? {
-        if !app.check_access(&claims.roles) {
+        if !app.check_access_resolved(&claims.roles, &mut conn).await.map_err(|e| e.into_response())? {
             warn!(
                 user_id = %user_id,
                 host = %host,
