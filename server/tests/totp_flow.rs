@@ -82,6 +82,8 @@ async fn setup() -> Fixture {
         scim_rate_limiter: RateLimiter::new(RateLimitConfig::default()),
         signing_key,
         origin: "http://localhost:3000".into(),
+        shutdown: Arc::new(tokio::sync::Notify::new()),
+        provisioning_notifier: authere_server::provisioning::Notifier::new(),
     };
 
     let (router, _) = OpenApiRouter::new()

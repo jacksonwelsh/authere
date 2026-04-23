@@ -4,6 +4,7 @@ use tracing::info;
 
 use crate::db::DbEntity;
 use crate::errors::AppError;
+use crate::provisioning::{self, event::UserLifecycleEvent};
 use crate::role::{Role, ROLE_ADMIN};
 use crate::user::auth::Authenticator;
 use crate::user::User;
@@ -100,6 +101,13 @@ pub async fn init_admin(
     )
     .execute(&mut *tx)
     .await?;
+
+    // No origin is available here (CLI context); use a placeholder. The worker will still
+    // build a location URL, just against this placeholder — an admin created via CLI is
+    // typically before any targets exist, so this is effectively a no-op at bootstrap.
+    let cli_origin =
+        std::env::var("AUTHERE_ORIGIN").unwrap_or_else(|_| "http://localhost:3000".into());
+    provisioning::enqueue(&user, UserLifecycleEvent::Created, &cli_origin, &mut tx).await?;
 
     tx.commit().await?;
 

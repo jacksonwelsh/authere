@@ -158,6 +158,8 @@ async fn run() -> Result<bool, AppError> {
 
     let shutdown = Arc::new(tokio::sync::Notify::new());
 
+    let provisioning_notifier = authere_server::provisioning::Notifier::new();
+
     let state = AppState {
         db_pool,
         login_rate_limiter,
@@ -167,7 +169,28 @@ async fn run() -> Result<bool, AppError> {
         signing_key,
         origin,
         shutdown,
+        provisioning_notifier: provisioning_notifier.clone(),
     };
+
+    // Start the outbound-provisioning worker. If AUTHERE_PROVISIONING_KEY isn't set the
+    // worker can't decrypt target tokens, so we don't spawn it — admins who want this
+    // feature supply the key; other deployments run unaffected.
+    match authere_server::provisioning::targets::load_master_key() {
+        Ok(key) => {
+            let pool = state.db_pool.clone();
+            let notifier = provisioning_notifier.clone();
+            let http = reqwest::Client::builder()
+                .build()
+                .expect("failed to build reqwest client");
+            tokio::spawn(async move {
+                authere_server::provisioning::worker::run(pool, notifier, key, http).await;
+            });
+            info!("outbound provisioning worker started");
+        }
+        Err(e) => {
+            warn!(error = ?e, "outbound provisioning disabled");
+        }
+    }
 
     // Start the LDAP listener if enabled. Settings changes take effect on the next
     // restart — rebinding to a different port at runtime is out of scope for the MVP.
@@ -194,6 +217,7 @@ async fn run() -> Result<bool, AppError> {
     }
 
     use authere_server::handlers::{admin, app_passwords, application, auth, registration, role, totp, user};
+    use authere_server::provisioning::admin as provisioning_admin;
     use authere_server::scim;
 
     let shutdown_handle = state.shutdown.clone();
@@ -277,6 +301,17 @@ async fn run() -> Result<bool, AppError> {
             scim::users::patch_user,
             scim::users::delete_user
         ))
+        // Outbound provisioning (admin-only CRUD + job observability)
+        .routes(routes!(
+            provisioning_admin::create_target,
+            provisioning_admin::list_targets
+        ))
+        .routes(routes!(
+            provisioning_admin::update_target,
+            provisioning_admin::delete_target
+        ))
+        .routes(routes!(provisioning_admin::list_jobs))
+        .routes(routes!(provisioning_admin::retry_job))
         .with_state(state)
         .split_for_parts();
 

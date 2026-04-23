@@ -21,6 +21,7 @@ pub mod errors;
 pub mod handlers;
 pub mod invitation;
 pub mod ldap;
+pub mod provisioning;
 pub mod rate_limit;
 pub mod role;
 pub mod scim;
@@ -38,6 +39,8 @@ pub struct AppState {
     pub signing_key: Arc<SigningKey>,
     pub origin: String,
     pub shutdown: Arc<Notify>,
+    /// Wake the outbound-provisioning worker after a user write commits. Cheap to clone.
+    pub provisioning_notifier: provisioning::Notifier,
 }
 
 impl FromRef<AppState> for SqlitePool {

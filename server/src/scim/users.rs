@@ -17,6 +17,7 @@ use crate::audit::{
 };
 use crate::db::DbEntity;
 use crate::errors::AppError;
+use crate::provisioning::{self, event::UserLifecycleEvent};
 use crate::scim::auth::ScimAuth;
 use crate::scim::error::ScimError;
 use crate::scim::filter;
@@ -443,8 +444,10 @@ pub async fn create_user(
     user.active = body.active;
     user.external_id = body.external_id.clone();
     user.save(&mut tx).await?;
+    provisioning::enqueue(&user, UserLifecycleEvent::Created, &state.origin, &mut tx).await?;
 
     tx.commit().await.map_err(AppError::from)?;
+    state.provisioning_notifier.notify_one();
 
     let mut conn = state.db_pool.acquire().await.map_err(AppError::from)?;
     let _ = log_scim_user_created(
@@ -595,8 +598,8 @@ pub async fn replace_user(
     headers: HeaderMap,
     Json(body): Json<ScimUser>,
 ) -> Result<ScimJson<ScimUser>, ScimError> {
-    let mut conn = state.db_pool.acquire().await.map_err(AppError::from)?;
-    let mut user = User::get(id, &mut conn).await?.ok_or_else(ScimError::not_found)?;
+    let mut tx = state.db_pool.begin().await.map_err(AppError::from)?;
+    let mut user = User::get(id, &mut tx).await?.ok_or_else(ScimError::not_found)?;
 
     check_if_match(&headers, &weak_etag(user.updated_at))?;
 
@@ -612,15 +615,35 @@ pub async fn replace_user(
         new_email,
         body.active,
         body.external_id.clone(),
-        &mut conn,
+        &mut tx,
     )
     .await?;
 
+    provisioning::enqueue(
+        &user,
+        lifecycle_from_transition(transition),
+        &state.origin,
+        &mut tx,
+    )
+    .await?;
+
+    tx.commit().await.map_err(AppError::from)?;
+    state.provisioning_notifier.notify_one();
+
+    let mut conn = state.db_pool.acquire().await.map_err(AppError::from)?;
     audit_transition(user.id, &auth, transition, &mut conn).await;
 
     let etag = HeaderValue::from_str(&weak_etag(user.updated_at))
         .map_err(|e| ScimError::internal(format!("bad etag: {e}")))?;
     Ok(ScimJson::new(ScimUser::from_user(&user, &state.origin)).header(header::ETAG, etag))
+}
+
+fn lifecycle_from_transition(transition: ActiveTransition) -> UserLifecycleEvent {
+    match transition {
+        ActiveTransition::Unchanged => UserLifecycleEvent::Updated,
+        ActiveTransition::Deactivated => UserLifecycleEvent::Deactivated,
+        ActiveTransition::Reactivated => UserLifecycleEvent::Reactivated,
+    }
 }
 
 #[utoipa::path(
@@ -648,8 +671,8 @@ pub async fn patch_user(
 
     let _if_match = parse_if_match(&headers)?;
 
-    let mut conn = state.db_pool.acquire().await.map_err(AppError::from)?;
-    let mut user = User::get(id, &mut conn).await?.ok_or_else(ScimError::not_found)?;
+    let mut tx = state.db_pool.begin().await.map_err(AppError::from)?;
+    let mut user = User::get(id, &mut tx).await?.ok_or_else(ScimError::not_found)?;
     check_if_match(&headers, &weak_etag(user.updated_at))?;
 
     // Apply ops against an in-memory SCIM view of the user. If any op fails, we abort
@@ -669,10 +692,22 @@ pub async fn patch_user(
         new_email,
         working.active,
         working.external_id.clone(),
-        &mut conn,
+        &mut tx,
     )
     .await?;
 
+    provisioning::enqueue(
+        &user,
+        lifecycle_from_transition(transition),
+        &state.origin,
+        &mut tx,
+    )
+    .await?;
+
+    tx.commit().await.map_err(AppError::from)?;
+    state.provisioning_notifier.notify_one();
+
+    let mut conn = state.db_pool.acquire().await.map_err(AppError::from)?;
     audit_transition(user.id, &auth, transition, &mut conn).await;
 
     let etag = HeaderValue::from_str(&weak_etag(user.updated_at))
@@ -696,11 +731,20 @@ pub async fn delete_user(
     Path(id): Path<Uuid>,
     auth: ScimAuth,
 ) -> Result<StatusCode, ScimError> {
-    let mut conn = state.db_pool.acquire().await.map_err(AppError::from)?;
-    let deleted = User::delete(id, &mut conn).await?;
+    let mut tx = state.db_pool.begin().await.map_err(AppError::from)?;
+    // Snapshot the user before delete so we can enqueue a delete job with a populated body.
+    let Some(user) = User::get(id, &mut tx).await? else {
+        return Err(ScimError::not_found());
+    };
+    let deleted = User::delete(id, &mut tx).await?;
     if !deleted {
         return Err(ScimError::not_found());
     }
+    provisioning::enqueue(&user, UserLifecycleEvent::Deleted, &state.origin, &mut tx).await?;
+    tx.commit().await.map_err(AppError::from)?;
+    state.provisioning_notifier.notify_one();
+
+    let mut conn = state.db_pool.acquire().await.map_err(AppError::from)?;
     let _ = log_scim_user_deleted(
         id,
         auth.token.id,

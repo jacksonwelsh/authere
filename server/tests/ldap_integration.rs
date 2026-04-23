@@ -200,6 +200,8 @@ async fn start_server(mode: LdapPasswordMode) -> Fixture {
         scim_rate_limiter: RateLimiter::new(RateLimitConfig::default()),
         signing_key,
         origin: String::from("http://localhost:3000"),
+        shutdown: Arc::new(tokio::sync::Notify::new()),
+        provisioning_notifier: authere_server::provisioning::Notifier::new(),
     };
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
