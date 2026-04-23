@@ -5,9 +5,13 @@
     updateSettings,
     regenerateLdapBindPassword,
     getRoles,
+    listScimTokens,
+    createScimToken,
+    revokeScimToken,
     type Settings,
     type LdapPasswordMode,
     type Role,
+    type ScimToken,
   } from '../../lib/api';
   import { toasts } from '../../lib/toast.svelte';
   import Button from '../../lib/components/Button.svelte';
@@ -31,6 +35,15 @@
   let confirmRegenerate = $state(false);
   let regenerating = $state(false);
 
+  // SCIM token management
+  let scimTokens = $state<ScimToken[]>([]);
+  let scimLoading = $state(true);
+  let showCreateScimToken = $state(false);
+  let scimTokenName = $state('');
+  let creatingScimToken = $state(false);
+  let revokingScimToken = $state<string | null>(null);
+  let revealedScimToken = $state<{ name: string; token: string } | null>(null);
+
   onMount(async () => {
     try {
       const [s, r] = await Promise.all([getSettings(), getRoles()]);
@@ -42,6 +55,14 @@
       toasts.error('Failed to load settings.');
     } finally {
       loading = false;
+    }
+
+    try {
+      scimTokens = await listScimTokens();
+    } catch {
+      // SCIM tokens are optional — don't block the page
+    } finally {
+      scimLoading = false;
     }
   });
 
@@ -147,8 +168,43 @@
     }
   }
 
+  async function handleCreateScimToken() {
+    if (!scimTokenName.trim() || creatingScimToken) return;
+    creatingScimToken = true;
+    try {
+      const resp = await createScimToken(scimTokenName.trim());
+      scimTokens = [{ id: resp.id, name: resp.name, created_at: resp.created_at, created_by: '', last_used_at: null, revoked_at: null }, ...scimTokens];
+      revealedScimToken = { name: resp.name, token: resp.token };
+      showCreateScimToken = false;
+      scimTokenName = '';
+    } catch (err: any) {
+      toasts.error(`Failed to create: ${err.message}`);
+    } finally {
+      creatingScimToken = false;
+    }
+  }
+
+  async function handleRevokeScimToken(id: string) {
+    if (revokingScimToken) return;
+    revokingScimToken = id;
+    try {
+      await revokeScimToken(id);
+      scimTokens = scimTokens.filter((t) => t.id !== id);
+      toasts.success('Token revoked.');
+    } catch (err: any) {
+      toasts.error(`Failed to revoke: ${err.message}`);
+    } finally {
+      revokingScimToken = null;
+    }
+  }
+
   function copy(text: string) {
     navigator.clipboard.writeText(text).then(() => toasts.success('Copied.'));
+  }
+
+  function formatDate(ts: number | null) {
+    if (!ts) return '—';
+    return new Date(ts * 1000).toLocaleDateString();
   }
 
   const bindPort = $derived.by(() => {
@@ -312,6 +368,53 @@
         </div>
       </div>
     </div>
+
+    <div class="settings-section">
+      <div class="section-title au-small font-medium au-fg-2">SCIM provisioning</div>
+      <div class="settings-card">
+        <div class="setting-row">
+          <div class="setting-info">
+            <span class="au-small font-medium">Bearer tokens</span>
+            <span class="au-micro au-fg-3">
+              Create tokens for identity providers (Okta, Azure AD, OneLogin) to provision users via SCIM 2.0.
+            </span>
+          </div>
+          <Button variant="primary" size="sm" onclick={() => { showCreateScimToken = true; scimTokenName = ''; }}>
+            New token
+          </Button>
+        </div>
+        {#if scimLoading}
+          <div class="setting-block">
+            <p class="au-small au-fg-3">Loading…</p>
+          </div>
+        {:else if scimTokens.length === 0}
+          <div class="setting-block">
+            <p class="au-small au-fg-3">No SCIM tokens yet. Create one to enable identity provider provisioning.</p>
+          </div>
+        {:else}
+          <ul class="token-list">
+            {#each scimTokens as t (t.id)}
+              <li class="token-row">
+                <div class="token-info">
+                  <span class="au-small font-medium">{t.name}</span>
+                  <span class="au-micro au-fg-3">
+                    Created {formatDate(t.created_at)} · Last used {formatDate(t.last_used_at)}
+                  </span>
+                </div>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onclick={() => handleRevokeScimToken(t.id)}
+                  loading={revokingScimToken === t.id}
+                >
+                  Revoke
+                </Button>
+              </li>
+            {/each}
+          </ul>
+        {/if}
+      </div>
+    </div>
   {/if}
 </div>
 
@@ -323,6 +426,43 @@
     {#snippet actions()}
       <Button variant="ghost" onclick={() => (confirmRegenerate = false)}>Cancel</Button>
       <Button variant="danger" onclick={doRegenerate} loading={regenerating}>Regenerate</Button>
+    {/snippet}
+  </Modal>
+{/if}
+
+{#if showCreateScimToken}
+  <Modal title="New SCIM token" onclose={() => (showCreateScimToken = false)}>
+    <p class="au-small au-fg-3">Give this token a name so you can recognise which IdP it belongs to (e.g. "Okta Production").</p>
+    <div class="create-field">
+      <Input
+        label="Name"
+        bind:value={scimTokenName}
+        placeholder="Okta Production"
+        autofocus
+        onkeydown={(e) => { if (e.key === 'Enter' && scimTokenName.trim()) handleCreateScimToken(); }}
+      />
+    </div>
+    {#snippet actions()}
+      <Button variant="ghost" onclick={() => (showCreateScimToken = false)}>Cancel</Button>
+      <Button variant="primary" onclick={handleCreateScimToken} loading={creatingScimToken} disabled={!scimTokenName.trim()}>
+        Create
+      </Button>
+    {/snippet}
+  </Modal>
+{/if}
+
+{#if revealedScimToken}
+  <Modal title="SCIM token created" onclose={() => (revealedScimToken = null)}>
+    <p class="au-small">
+      Copy this token now — it won't be shown again. Paste it into the SCIM bearer token field for
+      <strong>{revealedScimToken.name}</strong>.
+    </p>
+    <div class="reveal-row">
+      <code class="reveal-code au-code-sm">{revealedScimToken.token}</code>
+      <Button variant="secondary" onclick={() => copy(revealedScimToken!.token)}>Copy</Button>
+    </div>
+    {#snippet actions()}
+      <Button variant="primary" onclick={() => (revealedScimToken = null)}>Done</Button>
     {/snippet}
   </Modal>
 {/if}
@@ -458,6 +598,32 @@
     border-radius: var(--radius);
     font-family: var(--mono, ui-monospace, monospace);
     word-break: break-all;
+  }
+
+  .token-list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+  }
+
+  .token-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--sp-4);
+    padding: var(--sp-3) var(--sp-4);
+    border-top: 1px solid var(--border-0);
+  }
+
+  .token-info {
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-1);
+    min-width: 0;
+  }
+
+  .create-field {
+    margin-top: var(--sp-3);
   }
 
   /* Toggle switch */

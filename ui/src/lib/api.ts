@@ -297,4 +297,30 @@ export const createInvitation = (data: { label?: string; max_uses?: number; expi
 export const deleteInvitation = (id: string) =>
   request<void>(`/api/invitations/${id}`, { method: 'DELETE' });
 
+// SCIM tokens (admin)
+export interface ScimToken {
+  id: string;
+  name: string;
+  created_at: number;
+  created_by: string;
+  last_used_at: number | null;
+  revoked_at: number | null;
+}
+
+export interface CreateScimTokenResponse {
+  id: string;
+  name: string;
+  created_at: number;
+  token: string;
+}
+
+export const listScimTokens = () => request<ScimToken[]>('/api/scim/tokens');
+export const createScimToken = (name: string) =>
+  request<CreateScimTokenResponse>('/api/scim/tokens', {
+    method: 'POST',
+    body: JSON.stringify({ name }),
+  });
+export const revokeScimToken = (id: string) =>
+  request<void>(`/api/scim/tokens/${id}`, { method: 'DELETE' });
+
 export { ApiError };
