@@ -222,6 +222,46 @@ fn generate_service_password() -> String {
 }
 
 // ============================================================================
+// Restart
+// ============================================================================
+
+#[utoipa::path(
+    post,
+    path = "/api/admin/restart",
+    responses(
+        (status = 202, description = "Restart initiated"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Admin required"),
+    ),
+    tag = ADMIN_TAG,
+)]
+pub async fn restart_service(
+    State(state): State<AppState>,
+    audit_ctx: AuditContext,
+    admin: AdminUser,
+) -> Result<StatusCode, AppError> {
+    info!(admin = %admin.0.user_id, "admin-initiated service restart");
+
+    let mut conn = state.db_pool.acquire().await?;
+    let _ = log_settings_updated(
+        admin.0.user_id,
+        serde_json::json!({ "action": "restart" }),
+        &audit_ctx,
+        &mut conn,
+    )
+    .await;
+    drop(conn);
+
+    let shutdown = state.shutdown.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        shutdown.notify_waiters();
+    });
+
+    Ok(StatusCode::ACCEPTED)
+}
+
+// ============================================================================
 // Invitations
 // ============================================================================
 

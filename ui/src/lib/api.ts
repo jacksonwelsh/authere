@@ -297,6 +297,10 @@ export const createInvitation = (data: { label?: string; max_uses?: number; expi
 export const deleteInvitation = (id: string) =>
   request<void>(`/api/invitations/${id}`, { method: 'DELETE' });
 
+// Admin actions
+export const restartService = () =>
+  request<void>('/api/admin/restart', { method: 'POST' });
+
 // SCIM tokens (admin)
 export interface ScimToken {
   id: string;

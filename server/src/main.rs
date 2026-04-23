@@ -1,5 +1,6 @@
 use std::env;
 use std::net::SocketAddr;
+use std::process::ExitCode;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,8 +34,26 @@ const AUTH_TAG: &str = "auth";
 )]
 struct ApiDoc;
 
+const EXIT_RESTART: u8 = 75;
+
 #[tokio::main]
-async fn main() -> Result<(), AppError> {
+async fn main() -> ExitCode {
+    match run().await {
+        Ok(restart) => {
+            if restart {
+                ExitCode::from(EXIT_RESTART)
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
+        Err(e) => {
+            eprintln!("fatal: {e:?}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<bool, AppError> {
     dotenvy::dotenv().ok();
 
     tracing_subscriber::fmt()
@@ -84,7 +103,7 @@ async fn main() -> Result<(), AppError> {
                 })?,
             };
             cli::init_admin(&db_pool, username, password, name, email).await?;
-            return Ok(());
+            return Ok(false);
         }
         Some(Commands::Serve) | None => {}
     }
@@ -137,6 +156,8 @@ async fn main() -> Result<(), AppError> {
         String::from("http://localhost:3000")
     });
 
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+
     let state = AppState {
         db_pool,
         login_rate_limiter,
@@ -145,6 +166,7 @@ async fn main() -> Result<(), AppError> {
         scim_rate_limiter,
         signing_key,
         origin,
+        shutdown,
     };
 
     // Start the LDAP listener if enabled. Settings changes take effect on the next
@@ -173,6 +195,8 @@ async fn main() -> Result<(), AppError> {
 
     use authere_server::handlers::{admin, app_passwords, application, auth, registration, role, totp, user};
     use authere_server::scim;
+
+    let shutdown_handle = state.shutdown.clone();
 
     let (router, api) = OpenApiRouter::with_openapi(ApiDoc::openapi())
         .routes(routes!(user::create_user, user::get_users))
@@ -213,6 +237,7 @@ async fn main() -> Result<(), AppError> {
         // Admin settings
         .routes(routes!(admin::get_settings, admin::update_settings))
         .routes(routes!(admin::regenerate_ldap_bind_password))
+        .routes(routes!(admin::restart_service))
         // Admin invitations
         .routes(routes!(admin::list_invitations, admin::create_invitation))
         .routes(routes!(admin::delete_invitation))
@@ -308,5 +333,10 @@ async fn main() -> Result<(), AppError> {
     info!("starting server on {bind_addr}");
 
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
-    Ok(axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).await?)
+    axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())
+        .with_graceful_shutdown(async move { shutdown_handle.notified().await })
+        .await?;
+
+    info!("server stopped, exiting with restart code {EXIT_RESTART}");
+    Ok(true)
 }

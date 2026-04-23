@@ -7,6 +7,7 @@ use std::sync::Arc;
 use axum::extract::FromRef;
 use ed25519_dalek::SigningKey;
 use sqlx::SqlitePool;
+use tokio::sync::Notify;
 
 use crate::rate_limit::RateLimiter;
 
@@ -36,6 +37,7 @@ pub struct AppState {
     pub scim_rate_limiter: RateLimiter,
     pub signing_key: Arc<SigningKey>,
     pub origin: String,
+    pub shutdown: Arc<Notify>,
 }
 
 impl FromRef<AppState> for SqlitePool {

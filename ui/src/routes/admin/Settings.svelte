@@ -8,6 +8,7 @@
     listScimTokens,
     createScimToken,
     revokeScimToken,
+    restartService,
     type Settings,
     type LdapPasswordMode,
     type Role,
@@ -43,6 +44,10 @@
   let creatingScimToken = $state(false);
   let revokingScimToken = $state<string | null>(null);
   let revealedScimToken = $state<{ name: string; token: string } | null>(null);
+
+  // Restart
+  let confirmRestart = $state(false);
+  let restarting = $state(false);
 
   onMount(async () => {
     try {
@@ -195,6 +200,20 @@
       toasts.error(`Failed to revoke: ${err.message}`);
     } finally {
       revokingScimToken = null;
+    }
+  }
+
+  async function handleRestart() {
+    restarting = true;
+    try {
+      await restartService();
+      confirmRestart = false;
+      toasts.success('Restart initiated. The page will reload shortly.');
+      setTimeout(() => window.location.reload(), 3000);
+    } catch (err: any) {
+      toasts.error(`Failed to restart: ${err.message}`);
+    } finally {
+      restarting = false;
     }
   }
 
@@ -415,8 +434,41 @@
         {/if}
       </div>
     </div>
+
+    <div class="settings-section">
+      <div class="section-title au-small font-medium au-fg-2">Danger zone</div>
+      <div class="settings-card danger-card">
+        <div class="setting-row">
+          <div class="setting-info">
+            <span class="au-small font-medium">Restart service</span>
+            <span class="au-micro au-fg-3">
+              Gracefully stop and restart the Authere process. Active sessions are preserved but in-flight requests will be dropped. Requires a process manager (systemd, Docker) configured to restart on exit code 75.
+            </span>
+          </div>
+          <Button
+            variant="danger"
+            size="sm"
+            onclick={() => (confirmRestart = true)}
+          >
+            Restart
+          </Button>
+        </div>
+      </div>
+    </div>
   {/if}
 </div>
+
+{#if confirmRestart}
+  <Modal title="Restart service?" onclose={() => (confirmRestart = false)}>
+    <p class="au-small">
+      The service will shut down and restart. All active connections will be briefly interrupted. This page will reload automatically.
+    </p>
+    {#snippet actions()}
+      <Button variant="ghost" onclick={() => (confirmRestart = false)}>Cancel</Button>
+      <Button variant="danger" onclick={handleRestart} loading={restarting}>Restart now</Button>
+    {/snippet}
+  </Modal>
+{/if}
 
 {#if confirmRegenerate}
   <Modal title="Rotate service bind password?" onclose={() => (confirmRegenerate = false)}>
@@ -624,6 +676,10 @@
 
   .create-field {
     margin-top: var(--sp-3);
+  }
+
+  .danger-card {
+    border-color: var(--danger, #EF4444);
   }
 
   /* Toggle switch */

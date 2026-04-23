@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { render, screen, within } from '@testing-library/svelte';
 import userEvent from '@testing-library/user-event';
 import { http, HttpResponse } from 'msw';
@@ -110,5 +110,71 @@ describe('Settings — SCIM tokens', () => {
     await userEvent.click(screen.getByRole('button', { name: /copy/i }));
 
     expect(navigator.clipboard.writeText).toHaveBeenCalledWith('authere_scim_secret123');
+  });
+});
+
+describe('Settings — Restart', () => {
+  it('shows the restart button', async () => {
+    mockSettingsEndpoints();
+    render(Settings);
+
+    expect(await screen.findByRole('button', { name: /restart/i })).toBeInTheDocument();
+  });
+
+  it('requires confirmation before restarting', async () => {
+    mockSettingsEndpoints();
+    render(Settings);
+
+    await screen.findByText('Restart service');
+    await userEvent.click(screen.getByRole('button', { name: /restart/i }));
+
+    const dialog = await screen.findByRole('dialog');
+    expect(dialog).toHaveTextContent(/shut down and restart/i);
+    expect(within(dialog).getByRole('button', { name: /restart now/i })).toBeInTheDocument();
+    expect(within(dialog).getByRole('button', { name: /cancel/i })).toBeInTheDocument();
+  });
+
+  it('cancels without sending the request', async () => {
+    mockSettingsEndpoints();
+    let called = false;
+    server.use(
+      http.post('/api/admin/restart', () => {
+        called = true;
+        return new HttpResponse(null, { status: 202 });
+      }),
+    );
+    render(Settings);
+
+    await screen.findByText('Restart service');
+    await userEvent.click(screen.getByRole('button', { name: /restart/i }));
+
+    const dialog = await screen.findByRole('dialog');
+    await userEvent.click(within(dialog).getByRole('button', { name: /cancel/i }));
+
+    expect(called).toBe(false);
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+  });
+
+  it('sends restart request and shows success toast', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    mockSettingsEndpoints();
+    let restarted = false;
+    server.use(
+      http.post('/api/admin/restart', () => {
+        restarted = true;
+        return new HttpResponse(null, { status: 202 });
+      }),
+    );
+    render(Settings);
+
+    await screen.findByText('Restart service');
+    await userEvent.click(screen.getByRole('button', { name: /restart/i }));
+
+    const dialog = await screen.findByRole('dialog');
+    await userEvent.click(within(dialog).getByRole('button', { name: /restart now/i }));
+
+    expect(restarted).toBe(true);
+    await waitForToast(/restart initiated/i);
+    vi.useRealTimers();
   });
 });
