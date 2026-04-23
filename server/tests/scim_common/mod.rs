@@ -89,8 +89,13 @@ pub async fn setup() -> Fixture {
         .routes(routes!(scim::discovery::get_resource_type))
         .routes(routes!(scim::discovery::list_schemas))
         .routes(routes!(scim::discovery::get_schema))
-        .routes(routes!(scim::users::list_users))
-        .routes(routes!(scim::users::get_user))
+        .routes(routes!(scim::users::list_users, scim::users::create_user))
+        .routes(routes!(
+            scim::users::get_user,
+            scim::users::replace_user,
+            scim::users::patch_user,
+            scim::users::delete_user
+        ))
         .with_state(state)
         .split_for_parts();
 
@@ -129,4 +134,53 @@ pub async fn body_json(resp: Response<Body>) -> serde_json::Value {
         .await
         .expect("read body");
     serde_json::from_slice(&bytes).unwrap_or(serde_json::json!(null))
+}
+
+/// Generic request helper. `extra_headers` lets tests set things like If-Match.
+#[allow(dead_code)]
+pub async fn request(
+    fx: &Fixture,
+    method: &str,
+    uri: &str,
+    token: Option<&str>,
+    body: Option<serde_json::Value>,
+    extra_headers: &[(&str, &str)],
+) -> Response<Body> {
+    let mut b = Request::builder().method(method).uri(uri);
+    if let Some(t) = token {
+        b = b.header("authorization", format!("Bearer {t}"));
+    }
+    let has_body = body.is_some();
+    if has_body {
+        b = b.header("content-type", "application/scim+json");
+    }
+    for (k, v) in extra_headers {
+        b = b.header(*k, *v);
+    }
+    let body = match body {
+        Some(v) => Body::from(serde_json::to_vec(&v).unwrap()),
+        None => Body::empty(),
+    };
+    let req = b.body(body).unwrap();
+    fx.router.clone().oneshot(req).await.unwrap()
+}
+
+#[allow(dead_code)]
+pub async fn post_json(fx: &Fixture, uri: &str, token: &str, body: serde_json::Value) -> Response<Body> {
+    request(fx, "POST", uri, Some(token), Some(body), &[]).await
+}
+
+#[allow(dead_code)]
+pub async fn put_json(fx: &Fixture, uri: &str, token: &str, body: serde_json::Value) -> Response<Body> {
+    request(fx, "PUT", uri, Some(token), Some(body), &[]).await
+}
+
+#[allow(dead_code)]
+pub async fn patch_json(fx: &Fixture, uri: &str, token: &str, body: serde_json::Value) -> Response<Body> {
+    request(fx, "PATCH", uri, Some(token), Some(body), &[]).await
+}
+
+#[allow(dead_code)]
+pub async fn delete(fx: &Fixture, uri: &str, token: &str) -> Response<Body> {
+    request(fx, "DELETE", uri, Some(token), None, &[]).await
 }

@@ -237,9 +237,14 @@ async fn main() -> Result<(), AppError> {
         .routes(routes!(scim::discovery::get_resource_type))
         .routes(routes!(scim::discovery::list_schemas))
         .routes(routes!(scim::discovery::get_schema))
-        // SCIM 2.0 Users (read — write lands in a follow-up commit)
-        .routes(routes!(scim::users::list_users))
-        .routes(routes!(scim::users::get_user))
+        // SCIM 2.0 Users
+        .routes(routes!(scim::users::list_users, scim::users::create_user))
+        .routes(routes!(
+            scim::users::get_user,
+            scim::users::replace_user,
+            scim::users::patch_user,
+            scim::users::delete_user
+        ))
         .with_state(state)
         .split_for_parts();
 

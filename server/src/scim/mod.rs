@@ -14,6 +14,7 @@ pub mod auth;
 pub mod discovery;
 pub mod error;
 pub mod filter;
+pub mod patch;
 pub mod schema;
 pub mod token;
 pub mod users;
