@@ -172,6 +172,7 @@ async fn main() -> Result<(), AppError> {
     }
 
     use authere_server::handlers::{admin, app_passwords, application, auth, registration, role, user};
+    use authere_server::scim;
 
     let (router, api) = OpenApiRouter::with_openapi(ApiDoc::openapi())
         .routes(routes!(user::create_user, user::get_users))
@@ -224,6 +225,21 @@ async fn main() -> Result<(), AppError> {
         // App passwords (admin)
         .routes(routes!(app_passwords::admin_list_app_passwords))
         .routes(routes!(app_passwords::admin_delete_app_password))
+        // SCIM admin token management (uses AdminUser JWT auth)
+        .routes(routes!(
+            scim::admin::create_scim_token,
+            scim::admin::list_scim_tokens
+        ))
+        .routes(routes!(scim::admin::revoke_scim_token))
+        // SCIM 2.0 discovery
+        .routes(routes!(scim::discovery::service_provider_config))
+        .routes(routes!(scim::discovery::list_resource_types))
+        .routes(routes!(scim::discovery::get_resource_type))
+        .routes(routes!(scim::discovery::list_schemas))
+        .routes(routes!(scim::discovery::get_schema))
+        // SCIM 2.0 Users (read — write lands in a follow-up commit)
+        .routes(routes!(scim::users::list_users))
+        .routes(routes!(scim::users::get_user))
         .with_state(state)
         .split_for_parts();
 
