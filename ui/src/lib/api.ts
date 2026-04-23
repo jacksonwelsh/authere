@@ -13,13 +13,30 @@ export interface Role {
   description: string | null;
 }
 
+export type AppType = 'forward_auth' | 'oidc';
+
 export interface Application {
   id: string;
   name: string;
   slug: string;
-  host_pattern: string;
+  app_type: AppType;
+  host_pattern: string | null;
   path_prefix: string | null;
   required_roles: string[];
+  enabled: boolean;
+  oidc_client_id: string | null;
+  oidc_redirect_uris: string[];
+  oidc_post_logout_redirect_uris: string[];
+  /** True for confidential (has client_secret) OIDC clients. Always false for forward_auth. */
+  oidc_confidential: boolean;
+  created_at: number;
+  updated_at: number;
+}
+
+/** Response shape for POST /api/applications: includes the one-time client_secret for OIDC. */
+export interface CreateApplicationResponse extends Application {
+  /** Only present on freshly-created confidential OIDC clients. Never shown again. */
+  oidc_client_secret?: string;
 }
 
 export interface AuditEntry {
@@ -149,8 +166,11 @@ export const deleteRole = (id: string) =>
 // Applications
 export const getApplications = () => request<Application[]>('/api/applications');
 export const getApplication = (id: string) => request<Application>(`/api/applications/${id}`);
-export const createApplication = (data: Partial<Application>) =>
-  request<Application>('/api/applications', { method: 'POST', body: JSON.stringify(data) });
+export const createApplication = (data: Partial<Application> & { oidc_confidential?: boolean }) =>
+  request<CreateApplicationResponse>('/api/applications', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  });
 export const updateApplication = (id: string, data: Partial<Application>) =>
   request<Application>(`/api/applications/${id}`, { method: 'PUT', body: JSON.stringify(data) });
 export const deleteApplication = (id: string) =>

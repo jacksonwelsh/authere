@@ -21,6 +21,7 @@ pub mod errors;
 pub mod handlers;
 pub mod invitation;
 pub mod ldap;
+pub mod oidc;
 pub mod provisioning;
 pub mod rate_limit;
 pub mod role;
@@ -36,7 +37,10 @@ pub struct AppState {
     pub register_rate_limiter: RateLimiter,
     pub ldap_bind_rate_limiter: RateLimiter,
     pub scim_rate_limiter: RateLimiter,
+    pub oidc_token_rate_limiter: RateLimiter,
     pub signing_key: Arc<SigningKey>,
+    /// UUID of the `default` signing key — used as JWT `kid` and JWKS `kid`.
+    pub signing_kid: String,
     pub origin: String,
     pub shutdown: Arc<Notify>,
     /// Wake the outbound-provisioning worker after a user write commits. Cheap to clone.

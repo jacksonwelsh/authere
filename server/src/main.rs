@@ -86,6 +86,8 @@ async fn run() -> Result<bool, AppError> {
 
     let signing_key = Arc::new(token::load_signing_key(&mut conn).await?);
     info!("signing key loaded and cached");
+    let signing_kid = authere_server::oidc::jwks::load_signing_kid(&mut conn).await?;
+    info!(kid = %signing_kid, "oidc signing kid loaded");
     drop(conn);
 
     // Handle CLI commands
@@ -132,12 +134,18 @@ async fn run() -> Result<bool, AppError> {
         window: Duration::from_secs(env_override("AUTHERE_SCIM_WINDOW_SECS", 60).into()),
     });
 
+    let oidc_token_rate_limiter = RateLimiter::new(RateLimitConfig {
+        max_requests: env_override("AUTHERE_OIDC_TOKEN_MAX_REQUESTS", 60),
+        window: Duration::from_secs(env_override("AUTHERE_OIDC_TOKEN_WINDOW_SECS", 60).into()),
+    });
+
     // Spawn background cleanup for rate limiters
     {
         let login_rl = login_rate_limiter.clone();
         let register_rl = register_rate_limiter.clone();
         let ldap_rl = ldap_bind_rate_limiter.clone();
         let scim_rl = scim_rate_limiter.clone();
+        let oidc_rl = oidc_token_rate_limiter.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(300));
             loop {
@@ -146,7 +154,25 @@ async fn run() -> Result<bool, AppError> {
                 register_rl.cleanup().await;
                 ldap_rl.cleanup().await;
                 scim_rl.cleanup().await;
+                oidc_rl.cleanup().await;
                 tracing::debug!("rate limiter cleanup completed");
+            }
+        });
+    }
+
+    // Sweep expired OIDC authorization codes periodically. Codes are single-use and short-
+    // lived, but consumed rows accumulate until we prune them.
+    {
+        let pool = db_pool.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(300));
+            loop {
+                interval.tick().await;
+                if let Ok(mut conn) = pool.acquire().await
+                    && let Err(e) = authere_server::oidc::codes::sweep_expired(&mut conn).await
+                {
+                    tracing::warn!(error = ?e, "oidc code sweep failed");
+                }
             }
         });
     }
@@ -166,7 +192,9 @@ async fn run() -> Result<bool, AppError> {
         register_rate_limiter,
         ldap_bind_rate_limiter,
         scim_rate_limiter,
+        oidc_token_rate_limiter,
         signing_key,
+        signing_kid,
         origin,
         shutdown,
         provisioning_notifier: provisioning_notifier.clone(),
@@ -216,7 +244,7 @@ async fn run() -> Result<bool, AppError> {
         }
     }
 
-    use authere_server::handlers::{admin, app_passwords, application, auth, registration, role, totp, user};
+    use authere_server::handlers::{admin, app_passwords, application, auth, oauth, registration, role, totp, user};
     use authere_server::provisioning::admin as provisioning_admin;
     use authere_server::scim;
 
@@ -314,6 +342,13 @@ async fn run() -> Result<bool, AppError> {
         ))
         .routes(routes!(provisioning_admin::list_jobs))
         .routes(routes!(provisioning_admin::retry_job))
+        // OIDC provider
+        .routes(routes!(oauth::discovery))
+        .routes(routes!(oauth::jwks))
+        .routes(routes!(oauth::authorize))
+        .routes(routes!(oauth::token))
+        .routes(routes!(oauth::userinfo))
+        .routes(routes!(oauth::end_session))
         .with_state(state)
         .split_for_parts();
 

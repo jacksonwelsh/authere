@@ -2,6 +2,7 @@ pub mod admin;
 pub mod app_passwords;
 pub mod application;
 pub mod auth;
+pub mod oauth;
 pub mod registration;
 pub mod role;
 pub mod totp;

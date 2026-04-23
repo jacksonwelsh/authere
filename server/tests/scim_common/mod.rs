@@ -79,7 +79,12 @@ pub async fn setup() -> Fixture {
             max_requests: 10_000,
             window: Duration::from_secs(60),
         }),
+        oidc_token_rate_limiter: RateLimiter::new(RateLimitConfig {
+            max_requests: 10_000,
+            window: Duration::from_secs(60),
+        }),
         signing_key,
+        signing_kid: "test-kid".to_string(),
         origin: "http://localhost:3000".to_string(),
         shutdown: Arc::new(tokio::sync::Notify::new()),
         provisioning_notifier: authere_server::provisioning::Notifier::new(),
