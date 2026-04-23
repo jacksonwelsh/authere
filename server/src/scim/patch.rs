@@ -176,9 +176,12 @@ fn set_active(
     value: Option<&Value>,
 ) -> Result<(), ScimError> {
     match action {
-        Action::Remove => Err(ScimError::invalid_value(
-            "cannot remove required attribute 'active'",
-        )),
+        // Our schema advertises `active` as non-required; `remove` therefore resets to the
+        // default (true) rather than erroring. Matches scim2-tester's expectation.
+        Action::Remove => {
+            user.active = true;
+            Ok(())
+        }
         Action::Add | Action::Replace => {
             let b = value
                 .and_then(|v| match v {
@@ -512,14 +515,16 @@ mod tests {
     }
 
     #[test]
-    fn remove_active_is_invalid_value() {
+    fn remove_active_resets_to_default_true() {
+        // Schema says active is not required; remove resets to the SCIM default.
         let mut u = sample_user();
-        let err = apply_all(
+        u.active = false;
+        apply_all(
             &mut u,
             &ops(json!([{"op":"remove","path":"active"}])),
         )
-        .unwrap_err();
-        assert_eq!(err.scim_type, Some("invalidValue"));
+        .unwrap();
+        assert!(u.active, "remove on active should reset to default (true)");
     }
 
     #[test]

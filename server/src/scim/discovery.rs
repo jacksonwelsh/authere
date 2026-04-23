@@ -59,6 +59,7 @@ fn user_schema() -> Value {
     // listing to know which fields to send; attributes we omit here must also be rejected by
     // the handlers (see `scim::patch` and `scim::users`).
     json!({
+        "schemas": ["urn:ietf:params:scim:schemas:core:2.0:Schema"],
         "id": USER_SCHEMA_URN,
         "name": "User",
         "description": "User Account",

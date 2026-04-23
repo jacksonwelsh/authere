@@ -41,12 +41,29 @@ This is **manual** and not part of CI. Run it once per significant SCIM change a
 
 ## Expected outcome
 
-All checks in the `discovery`, `users.crud`, and `users.patch` categories should pass. Known non-supported areas that may surface as failures — treat these as expected:
+Last recorded result: **29 / 36 checks pass**. The remaining 7 are all consequences of Authere storing `users.name` as one string and one email — not bugs, not fixable without a schema change. When you run the tester against your own instance, expect the same shape of failures.
 
-- **`/Groups`** — not implemented. scim2-tester's Groups discovery will find no resource type and skip; if it flags missing Groups CRUD, that's expected.
-- **Complex `emails[type eq "work"]` sub-filters on GET** — rejected with `invalidFilter`. The PATCH form is accepted and routed to our single email slot.
-- **Phone numbers, addresses, photos, enterprise extension attributes** — rejected with `invalidPath` on write. Not in the User schema we advertise.
-- **Multi-valued emails** — we store one. If the tester sends two emails and expects both to round-trip, the second will be dropped.
+### What passes
+
+- **Discovery**: ServiceProviderConfig, ResourceTypes (+ individual access), Schemas (+ individual access), invalid-resource-type 404s, invalid-schema 404s, random-URL 404 with `application/scim+json` body.
+- **User CRUD**: create (with or without a display name; we fall back to `userName`), query by id, query-in-list, replace, delete, POST `/.search` (root) and POST `/Users/.search`.
+- **Attribute projection**: both `?attributes=` and `?excludedAttributes=` on GET and on search.
+- **PATCH**: add/remove/replace on `externalId`, `userName`, `displayName`, `active`. Remove of `active` resets to default (true), consistent with the schema advertising `active` as optional.
+
+### Known deltas vs. scim2-tester expectations
+
+| Check | Gap | Why |
+|---|---|---|
+| `check_add_attribute` / `check_replace_attribute` on `name` | Complex-name round-trip: the tester sends `{givenName, familyName, middleName, honorifics}` and compares it to the response | Authere stores a single `users.name` column. We accept every subfield on input, derive one display string, and emit it as `name.formatted` only. |
+| `check_add_attribute` / `check_replace_attribute` on `emails` | Multi-valued email round-trip: custom `type`, `display`, multiple entries | We store one email in `users.email`. Array input is flattened; custom sub-fields are normalized to `{primary: true, type: "work"}`. |
+| `check_remove_attribute` on `name` / `displayName` | Tester expects the attribute absent from the response after remove | `users.name` is NOT NULL; a removed display falls back to `userName` for persistence, so the response always has a non-empty `name`/`displayName`. |
+| `check_remove_attribute` on `active` | Tester expects `active` absent after remove | `users.active` is a boolean column, always present in the projection. We reset it to the SCIM default (true) on remove. |
+
+If any of these matter for your IdP integration, the fix is a schema change (split `name` into subfields, move `emails` to its own table). None of them block Okta or Azure AD provisioning, which only use the single-valued shape.
+
+### What will fail if you don't bump rate limits
+
+The default SCIM rate limit is 60 req/min per client IP. scim2-tester hammers the server — set `AUTHERE_SCIM_MAX_REQUESTS=10000` before starting Authere for the validation run, or you'll see spurious `rate limit exceeded` errors attributed to CRUD checks.
 
 ## Cleanup
 

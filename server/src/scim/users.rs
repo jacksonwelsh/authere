@@ -43,6 +43,59 @@ pub struct ListUsersQuery {
     /// Page size. Absent → [`DEFAULT_PAGE_SIZE`]. Above [`MAX_PAGE_SIZE`] clamps to max.
     #[serde(default)]
     pub count: Option<usize>,
+    /// Comma-separated attribute names to INCLUDE (RFC 7644 §3.9). Mutually exclusive with
+    /// `excludedAttributes`. `id`, `schemas`, `meta` are always returned regardless.
+    #[serde(default)]
+    pub attributes: Option<String>,
+    #[serde(rename = "excludedAttributes", default)]
+    pub excluded_attributes: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct GetUserQuery {
+    #[serde(default)]
+    pub attributes: Option<String>,
+    #[serde(rename = "excludedAttributes", default)]
+    pub excluded_attributes: Option<String>,
+}
+
+/// Always-returned attributes per RFC 7644 §3.9.2: `schemas`, `id`, `meta` plus the SCIM
+/// "always" mutability marker. `userName` is *not* in this set; clients must ask for it if
+/// they need it (and in practice they always do).
+const ALWAYS_ATTRS: &[&str] = &["schemas", "id", "meta"];
+
+/// Apply attribute projection to a serialized SCIM resource (or a ListResponse's Resources).
+/// - If `include` is set: keep only ALWAYS_ATTRS + the listed attributes.
+/// - If `exclude` is set: drop the listed attributes (but never ALWAYS_ATTRS).
+/// Unknown / nested paths are ignored best-effort — clients rarely probe past the top level.
+fn project_resource(
+    mut resource: serde_json::Value,
+    include: Option<&str>,
+    exclude: Option<&str>,
+) -> serde_json::Value {
+    let Some(obj) = resource.as_object_mut() else {
+        return resource;
+    };
+    if let Some(list) = include {
+        let keep: std::collections::HashSet<&str> = list
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .chain(ALWAYS_ATTRS.iter().copied())
+            .collect();
+        obj.retain(|k, _| keep.iter().any(|w| w.eq_ignore_ascii_case(k)));
+    } else if let Some(list) = exclude {
+        for drop_name in list.split(',').map(|s| s.trim()) {
+            if drop_name.is_empty() {
+                continue;
+            }
+            if ALWAYS_ATTRS.iter().any(|a| a.eq_ignore_ascii_case(drop_name)) {
+                continue;
+            }
+            obj.retain(|k, _| !k.eq_ignore_ascii_case(drop_name));
+        }
+    }
+    resource
 }
 
 #[utoipa::path(
@@ -64,7 +117,7 @@ pub async fn list_users(
     State(state): State<AppState>,
     _auth: ScimAuth,
     Query(q): Query<ListUsersQuery>,
-) -> Result<ScimJson<ListResponse<ScimUser>>, ScimError> {
+) -> Result<ScimJson<serde_json::Value>, ScimError> {
     let start_index = q.start_index.unwrap_or(1).max(1);
     let count = q.count.unwrap_or(DEFAULT_PAGE_SIZE).min(MAX_PAGE_SIZE);
     let offset = start_index - 1;
@@ -104,16 +157,22 @@ pub async fn list_users(
         .await
         .map_err(ScimError::from_sqlx)?;
 
-    let resources: Vec<ScimUser> = rows
+    let resources: Vec<serde_json::Value> = rows
         .into_iter()
-        .map(|r| ScimUser::from_user(&r.into(), &state.origin))
+        .map(|r| {
+            let s = ScimUser::from_user(&r.into(), &state.origin);
+            let v = serde_json::to_value(&s).unwrap_or(serde_json::Value::Null);
+            project_resource(v, q.attributes.as_deref(), q.excluded_attributes.as_deref())
+        })
         .collect();
 
-    Ok(ScimJson::new(ListResponse::new(
+    let body = serde_json::to_value(ListResponse::new(
         resources,
         total.max(0) as usize,
         start_index,
-    )))
+    ))
+    .unwrap_or(serde_json::Value::Null);
+    Ok(ScimJson::new(body))
 }
 
 #[utoipa::path(
@@ -131,13 +190,19 @@ pub async fn get_user(
     State(state): State<AppState>,
     _auth: ScimAuth,
     Path(id): Path<Uuid>,
-) -> Result<ScimJson<ScimUser>, ScimError> {
+    Query(q): Query<GetUserQuery>,
+) -> Result<ScimJson<serde_json::Value>, ScimError> {
     let mut conn = state.db_pool.acquire().await.map_err(ScimError::from_sqlx)?;
     let user = User::get(id, &mut conn).await?.ok_or_else(ScimError::not_found)?;
     let etag = HeaderValue::from_str(&weak_etag(user.updated_at))
         .map_err(|e| ScimError::internal(format!("bad etag: {e}")))?;
     let body = ScimUser::from_user(&user, &state.origin);
-    Ok(ScimJson::new(body).header(header::ETAG, etag))
+    let projected = project_resource(
+        serde_json::to_value(&body).unwrap_or(serde_json::Value::Null),
+        q.attributes.as_deref(),
+        q.excluded_attributes.as_deref(),
+    );
+    Ok(ScimJson::new(projected).header(header::ETAG, etag))
 }
 
 // Row struct for the dynamic list query. We hand-roll rather than `query_as!` so we can use
@@ -176,6 +241,87 @@ impl ScimError {
         tracing::error!(error = %e, "scim users sqlx error");
         Self::internal("database error")
     }
+}
+
+// ============================================================================
+// POST /Users/.search — RFC 7644 §3.4.3
+// ============================================================================
+
+#[derive(Debug, Deserialize, Default)]
+pub struct SearchRequest {
+    #[serde(default)]
+    pub schemas: Vec<String>,
+    #[serde(default)]
+    pub filter: Option<String>,
+    #[serde(rename = "startIndex", default)]
+    pub start_index: Option<usize>,
+    #[serde(default)]
+    pub count: Option<usize>,
+    /// May be sent as array or comma-joined string; accept both.
+    #[serde(default)]
+    pub attributes: Option<serde_json::Value>,
+    #[serde(rename = "excludedAttributes", default)]
+    pub excluded_attributes: Option<serde_json::Value>,
+}
+
+fn value_to_comma_list(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Array(arr) => {
+            let joined: Vec<String> = arr
+                .iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect();
+            if joined.is_empty() {
+                None
+            } else {
+                Some(joined.join(","))
+            }
+        }
+        _ => None,
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/scim/v2/.search",
+    request_body = serde_json::Value,
+    responses((status = 200, description = "ListResponse of matching resources")),
+    tag = TAG,
+)]
+pub async fn search_root(
+    state: State<AppState>,
+    auth: ScimAuth,
+    Json(body): Json<SearchRequest>,
+) -> Result<ScimJson<serde_json::Value>, ScimError> {
+    // Root search is defined by RFC 7644 §3.4.3 as a search across all resource types.
+    // Since we only expose /Users, route it there.
+    search_users(state, auth, Json(body)).await
+}
+
+#[utoipa::path(
+    post,
+    path = "/scim/v2/Users/.search",
+    request_body = serde_json::Value,
+    responses((status = 200, description = "ListResponse of matching users")),
+    tag = TAG,
+)]
+pub async fn search_users(
+    state: State<AppState>,
+    auth: ScimAuth,
+    Json(body): Json<SearchRequest>,
+) -> Result<ScimJson<serde_json::Value>, ScimError> {
+    let q = ListUsersQuery {
+        filter: body.filter,
+        start_index: body.start_index,
+        count: body.count,
+        attributes: body.attributes.as_ref().and_then(value_to_comma_list),
+        excluded_attributes: body
+            .excluded_attributes
+            .as_ref()
+            .and_then(value_to_comma_list),
+    };
+    list_users(state, auth, Query(q)).await
 }
 
 // ============================================================================
@@ -282,9 +428,10 @@ pub async fn create_user(
     auth: ScimAuth,
     Json(body): Json<ScimUser>,
 ) -> Result<ScimJson<ScimUser>, ScimError> {
-    let display = body
-        .resolve_display_name()
-        .ok_or_else(|| ScimError::invalid_value("name.formatted, displayName, or name.givenName/familyName is required"))?;
+    // The schema we advertise marks `name` and `displayName` optional, so clients are free to
+    // supply neither. In that case we persist `userName` as the display name — Authere's
+    // `users.name` column is NOT NULL so we must put something there.
+    let display = body.resolve_display_name().unwrap_or_else(|| body.user_name.clone());
     let email = body.resolve_email();
     validate_scim_user_fields(&body.user_name, &display, &email)?;
 
@@ -455,7 +602,7 @@ pub async fn replace_user(
 
     let new_display = body
         .resolve_display_name()
-        .ok_or_else(|| ScimError::invalid_value("a resolvable name is required"))?;
+        .unwrap_or_else(|| body.user_name.clone());
     let new_email = body.resolve_email();
 
     let transition = persist_scim_changes(
@@ -512,7 +659,7 @@ pub async fn patch_user(
 
     let new_display = working
         .resolve_display_name()
-        .ok_or_else(|| ScimError::invalid_value("a resolvable name is required"))?;
+        .unwrap_or_else(|| working.user_name.clone());
     let new_email = working.resolve_email();
 
     let transition = persist_scim_changes(

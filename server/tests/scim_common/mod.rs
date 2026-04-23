@@ -90,6 +90,8 @@ pub async fn setup() -> Fixture {
         .routes(routes!(scim::discovery::list_schemas))
         .routes(routes!(scim::discovery::get_schema))
         .routes(routes!(scim::users::list_users, scim::users::create_user))
+        .routes(routes!(scim::users::search_users))
+        .routes(routes!(scim::users::search_root))
         .routes(routes!(
             scim::users::get_user,
             scim::users::replace_user,

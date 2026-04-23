@@ -76,15 +76,20 @@ async fn create_constructs_display_name_from_given_and_family() {
 }
 
 #[tokio::test]
-async fn create_without_any_name_is_400() {
+async fn create_without_any_name_falls_back_to_username() {
+    // Our advertised schema marks name/displayName optional, so scim2-tester expects a
+    // no-name create to succeed. We persist userName as the display name.
     let fx = setup().await;
     let body = json!({
         "schemas": [USER_SCHEMA],
-        "userName": "nameless",
+        "userName": "nameless_user",
         "active": true
     });
     let resp = post_json(&fx, "/scim/v2/Users", &fx.scim_token, body).await;
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let v = body_json(resp).await;
+    assert_eq!(v["userName"], "nameless_user");
+    assert_eq!(v["displayName"], "nameless_user");
 }
 
 #[tokio::test]

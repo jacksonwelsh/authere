@@ -239,6 +239,8 @@ async fn main() -> Result<(), AppError> {
         .routes(routes!(scim::discovery::get_schema))
         // SCIM 2.0 Users
         .routes(routes!(scim::users::list_users, scim::users::create_user))
+        .routes(routes!(scim::users::search_users))
+        .routes(routes!(scim::users::search_root))
         .routes(routes!(
             scim::users::get_user,
             scim::users::replace_user,
@@ -252,6 +254,14 @@ async fn main() -> Result<(), AppError> {
     if cfg!(debug_assertions) || env::var("AUTHERE_SWAGGER_ENABLED").is_ok() {
         router = router.merge(SwaggerUi::new("/docs").url("/apidoc/openapi.json", api));
     }
+
+    // SCIM 2.0 catch-all: any unknown path under /scim/v2 must still return a spec-shaped
+    // error (application/scim+json body, Error URN, string status). Without this, axum's
+    // default 404 produces a plain-text "not found" that trips compliance testers.
+    let router = router.route(
+        "/scim/v2/{*rest}",
+        axum::routing::any(|| async { authere_server::scim::error::ScimError::not_found() }),
+    );
 
     let router = router
         .route("/assets/{*path}", axum::routing::get(static_files::serve_asset))

@@ -253,8 +253,16 @@ async fn patch_unsupported_path_returns_400_invalid_path() {
 }
 
 #[tokio::test]
-async fn patch_remove_active_is_invalid_value() {
+async fn patch_remove_active_resets_to_default_true() {
+    // Schema advertises active as optional; remove resets to default (true), which matches
+    // scim2-tester's compliance expectation.
     let fx = setup().await;
+    // Deactivate first so we can observe the reset.
+    sqlx::query!("UPDATE users SET active = 0 WHERE id = ?", fx.alice_id)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+
     let uri = alice_uri(&fx).await;
     let resp = patch_json(
         &fx,
@@ -263,9 +271,9 @@ async fn patch_remove_active_is_invalid_value() {
         ops_body(json!([{"op":"remove","path":"active"}])),
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), StatusCode::OK);
     let v = body_json(resp).await;
-    assert_eq!(v["scimType"], "invalidValue");
+    assert_eq!(v["active"], true);
 }
 
 #[tokio::test]
