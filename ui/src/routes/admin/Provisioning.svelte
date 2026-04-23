@@ -391,14 +391,26 @@
 {/if}
 
 <style>
-  .page { display: flex; flex-direction: column; gap: 1.5rem; }
-  .page-header { display: flex; justify-content: space-between; align-items: start; gap: 1rem; flex-wrap: wrap; }
-  .page-loading { padding: 2rem; display: flex; justify-content: center; gap: 0.5rem; align-items: center; }
-  .targets-section, .jobs-section { display: flex; flex-direction: column; gap: 0.5rem; }
+  .page {
+    padding: var(--sp-6);
+    max-width: 960px;
+    margin: 0 auto;
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-6);
+  }
+  .page-header { display: flex; justify-content: space-between; align-items: flex-start; gap: var(--sp-3); flex-wrap: wrap; }
+  .page-loading { display: flex; align-items: center; justify-content: center; gap: var(--sp-2); padding: var(--sp-8); }
+  .targets-section, .jobs-section { display: flex; flex-direction: column; gap: var(--sp-2); }
   .jobs-header { display: flex; justify-content: space-between; align-items: center; }
   .health-cell { display: flex; flex-direction: column; gap: 0.125rem; }
-  .modal-form { display: flex; flex-direction: column; gap: 0.75rem; }
-  .checkbox-row { display: flex; align-items: center; gap: 0.5rem; cursor: pointer; }
+  .modal-form { display: flex; flex-direction: column; gap: var(--sp-3); }
+  .checkbox-row { display: flex; align-items: center; gap: var(--sp-2); cursor: pointer; }
   .spin { animation: spin 1s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
+
+  @media (max-width: 639.98px) {
+    .page { padding: var(--sp-4); gap: var(--sp-4); }
+    .page-header { flex-direction: column; align-items: stretch; }
+  }
 </style>
