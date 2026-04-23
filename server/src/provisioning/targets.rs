@@ -41,6 +41,9 @@ pub struct ProvisioningTarget {
     /// Optional JSON object of `{"from": "to"}` strings. When present, the worker rewrites
     /// top-level SCIM body keys per this map before dispatch. `None` = identity.
     pub attribute_map: Option<String>,
+    /// Optional webhook. When a job for this target transitions to `dead`, the worker
+    /// POSTs a small JSON envelope here. Best-effort; webhook failures don't reopen the job.
+    pub dead_letter_webhook_url: Option<String>,
 }
 
 fn now_epoch() -> i64 {
@@ -169,6 +172,7 @@ pub async fn create(
     enabled: bool,
     created_by: Option<Uuid>,
     attribute_map: Option<&str>,
+    dead_letter_webhook_url: Option<&str>,
     key: &[u8; KEY_LEN],
     conn: &mut SqliteConnection,
 ) -> Result<ProvisioningTarget, AppError> {
@@ -180,10 +184,11 @@ pub async fn create(
     sqlx::query!(
         r#"INSERT INTO provisioning_targets
             (id, name, kind, base_url, auth_token_ciphertext, auth_token_nonce,
-             enabled, created_at, created_by, updated_at, attribute_map)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+             enabled, created_at, created_by, updated_at, attribute_map,
+             dead_letter_webhook_url)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         id, name, kind, base_url, ct, nonce, enabled_int, now, created_by, now,
-        attribute_map
+        attribute_map, dead_letter_webhook_url
     )
     .execute(conn)
     .await?;
@@ -201,6 +206,7 @@ pub async fn create(
         updated_at: now,
         backfill_done_at: None,
         attribute_map: attribute_map.map(String::from),
+        dead_letter_webhook_url: dead_letter_webhook_url.map(String::from),
     })
 }
 
@@ -210,7 +216,7 @@ pub async fn get(id: Uuid, conn: &mut SqliteConnection) -> Result<Option<Provisi
                   auth_token_ciphertext, auth_token_nonce,
                   enabled as "enabled!: bool",
                   created_at, created_by as "created_by: Uuid", updated_at,
-                  backfill_done_at, attribute_map
+                  backfill_done_at, attribute_map, dead_letter_webhook_url
            FROM provisioning_targets WHERE id = ?"#,
         id
     )
@@ -229,6 +235,7 @@ pub async fn get(id: Uuid, conn: &mut SqliteConnection) -> Result<Option<Provisi
         updated_at: r.updated_at,
         backfill_done_at: r.backfill_done_at,
         attribute_map: r.attribute_map,
+        dead_letter_webhook_url: r.dead_letter_webhook_url,
     }))
 }
 
@@ -238,7 +245,7 @@ pub async fn list(conn: &mut SqliteConnection) -> Result<Vec<ProvisioningTarget>
                   auth_token_ciphertext, auth_token_nonce,
                   enabled as "enabled!: bool",
                   created_at, created_by as "created_by: Uuid", updated_at,
-                  backfill_done_at, attribute_map
+                  backfill_done_at, attribute_map, dead_letter_webhook_url
            FROM provisioning_targets ORDER BY created_at DESC"#
     )
     .fetch_all(conn)
@@ -258,6 +265,7 @@ pub async fn list(conn: &mut SqliteConnection) -> Result<Vec<ProvisioningTarget>
             updated_at: r.updated_at,
             backfill_done_at: r.backfill_done_at,
             attribute_map: r.attribute_map,
+            dead_letter_webhook_url: r.dead_letter_webhook_url,
         })
         .collect())
 }
@@ -292,6 +300,7 @@ pub async fn update(
     new_enabled: Option<bool>,
     new_auth_token: Option<&str>,
     new_attribute_map: Option<Option<&str>>,
+    new_dead_letter_webhook_url: Option<Option<&str>>,
     key: &[u8; KEY_LEN],
     conn: &mut SqliteConnection,
 ) -> Result<bool, AppError> {
@@ -315,6 +324,9 @@ pub async fn update(
     if let Some(am) = new_attribute_map {
         existing.attribute_map = am.map(String::from);
     }
+    if let Some(url) = new_dead_letter_webhook_url {
+        existing.dead_letter_webhook_url = url.map(String::from);
+    }
     existing.updated_at = now_epoch();
     let enabled_int = if existing.enabled { 1i64 } else { 0i64 };
 
@@ -322,7 +334,8 @@ pub async fn update(
         r#"UPDATE provisioning_targets
               SET name = ?, base_url = ?, enabled = ?,
                   auth_token_ciphertext = ?, auth_token_nonce = ?,
-                  attribute_map = ?, updated_at = ?
+                  attribute_map = ?, dead_letter_webhook_url = ?,
+                  updated_at = ?
             WHERE id = ?"#,
         existing.name,
         existing.base_url,
@@ -330,6 +343,7 @@ pub async fn update(
         existing.auth_token_ciphertext,
         existing.auth_token_nonce,
         existing.attribute_map,
+        existing.dead_letter_webhook_url,
         existing.updated_at,
         id
     )

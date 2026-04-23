@@ -30,6 +30,10 @@ pub struct CreateTargetInput {
     /// before dispatch (e.g. `{"externalId":"external_id"}` for snake-case peers).
     #[serde(default)]
     pub attribute_map: Option<String>,
+    /// Optional URL to POST a dead-letter envelope to when a job for this target exhausts
+    /// its retry budget. Intended for PagerDuty / Slack / internal alerting hooks.
+    #[serde(default)]
+    pub dead_letter_webhook_url: Option<String>,
 }
 
 fn default_enabled() -> bool {
@@ -52,6 +56,9 @@ pub struct UpdateTargetInput {
     /// map onto the right `Option<Option<_>>` case.
     #[serde(default, deserialize_with = "de_optional_nullable_string")]
     pub attribute_map: Option<Option<String>>,
+    /// Same triple-valued encoding as `attribute_map`: absent / null / url.
+    #[serde(default, deserialize_with = "de_optional_nullable_string")]
+    pub dead_letter_webhook_url: Option<Option<String>>,
 }
 
 fn de_optional_nullable_string<'de, D>(de: D) -> Result<Option<Option<String>>, D::Error>
@@ -81,6 +88,8 @@ pub struct TargetSummary {
     /// Attribute-rename map currently applied to this target. Canonical JSON string, or
     /// `null` if no mapping is configured.
     pub attribute_map: Option<String>,
+    /// Optional alerting URL for dead-lettered jobs.
+    pub dead_letter_webhook_url: Option<String>,
     /// Epoch of the last successful dispatch to this target, if any.
     pub last_success_at: Option<i64>,
     /// Epoch of the most recent `failed | dead` outcome.
@@ -102,6 +111,7 @@ impl From<targets::ProvisioningTarget> for TargetSummary {
             updated_at: t.updated_at,
             backfill_done_at: t.backfill_done_at,
             attribute_map: t.attribute_map,
+            dead_letter_webhook_url: t.dead_letter_webhook_url,
             last_success_at: None,
             last_failure_at: None,
             consecutive_failures: 0,
@@ -174,6 +184,26 @@ fn validate_name(name: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+fn validate_webhook_url(url: &str) -> Result<(), AppError> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        // An empty string as "present" is meaningless; reject so admins pass `null` to
+        // clear.
+        return Err(AppError::InputError(vec![
+            "dead_letter_webhook_url must not be an empty string; pass null to clear".into(),
+        ]));
+    }
+    let parsed = url::Url::parse(trimmed).map_err(|e| {
+        AppError::InputError(vec![format!("invalid dead_letter_webhook_url: {e}")])
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(AppError::InputError(vec![
+            "dead_letter_webhook_url scheme must be http or https".into(),
+        ]));
+    }
+    Ok(())
+}
+
 #[utoipa::path(
     post,
     path = "/api/provisioning/targets",
@@ -203,6 +233,9 @@ pub async fn create_target(
     if let Some(ref m) = input.attribute_map {
         mapping::validate_map_input(m)?;
     }
+    if let Some(ref url) = input.dead_letter_webhook_url {
+        validate_webhook_url(url)?;
+    }
 
     let key = targets::load_master_key()?;
     let mut tx = state.db_pool.begin().await?;
@@ -214,6 +247,7 @@ pub async fn create_target(
         input.enabled,
         Some(admin.0.user_id),
         input.attribute_map.as_deref(),
+        input.dead_letter_webhook_url.as_deref(),
         &key,
         &mut tx,
     )
@@ -290,8 +324,15 @@ pub async fn update_target(
     if let Some(Some(ref m)) = input.attribute_map {
         mapping::validate_map_input(m)?;
     }
+    if let Some(Some(ref url)) = input.dead_letter_webhook_url {
+        validate_webhook_url(url)?;
+    }
     let attribute_map_arg: Option<Option<&str>> = input
         .attribute_map
+        .as_ref()
+        .map(|inner| inner.as_deref());
+    let webhook_arg: Option<Option<&str>> = input
+        .dead_letter_webhook_url
         .as_ref()
         .map(|inner| inner.as_deref());
     let key = targets::load_master_key()?;
@@ -303,6 +344,7 @@ pub async fn update_target(
         input.enabled,
         input.auth_token.as_deref(),
         attribute_map_arg,
+        webhook_arg,
         &key,
         &mut tx,
     )

@@ -13,7 +13,8 @@ use tracing::{debug, error, warn};
 use crate::provisioning::Notifier;
 use crate::provisioning::adapter::{AdapterOutcome, ProvisioningAdapter};
 use crate::provisioning::adapters::generic_scim::GenericScimAdapter;
-use crate::provisioning::jobs::{self, OutboundJob};
+use crate::provisioning::dead_letter;
+use crate::provisioning::jobs::{self, OutboundJob, STATUS_DEAD};
 use crate::provisioning::mapping;
 use crate::provisioning::targets::{self, KIND_GENERIC_SCIM, KEY_LEN, ProvisioningTarget};
 
@@ -30,14 +31,14 @@ pub async fn run(
     master_key: [u8; KEY_LEN],
     http_client: reqwest::Client,
 ) {
-    let generic = Arc::new(GenericScimAdapter::new(http_client));
+    let generic = Arc::new(GenericScimAdapter::new(http_client.clone()));
     loop {
         tokio::select! {
             _ = tokio::time::sleep(TICK) => {}
             _ = notifier.notified() => {}
         }
 
-        match tick(&pool, &master_key, generic.as_ref()).await {
+        match tick(&pool, &master_key, generic.as_ref(), &http_client).await {
             Ok(n) if n > 0 => debug!(dispatched = n, "provisioning worker tick"),
             Ok(_) => {}
             Err(e) => error!(error = ?e, "provisioning worker tick failed"),
@@ -49,6 +50,7 @@ async fn tick(
     pool: &SqlitePool,
     master_key: &[u8; KEY_LEN],
     generic: &GenericScimAdapter,
+    http_client: &reqwest::Client,
 ) -> Result<usize, crate::errors::AppError> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -67,7 +69,7 @@ async fn tick(
 
     let count = claimed.len();
     for job in claimed {
-        if let Err(e) = dispatch_one(pool, master_key, generic, job).await {
+        if let Err(e) = dispatch_one(pool, master_key, generic, http_client, job).await {
             error!(error = ?e, "dispatch_one failed");
         }
     }
@@ -78,6 +80,7 @@ async fn dispatch_one(
     pool: &SqlitePool,
     master_key: &[u8; KEY_LEN],
     generic: &GenericScimAdapter,
+    http_client: &reqwest::Client,
     job: OutboundJob,
 ) -> Result<(), crate::errors::AppError> {
     let mut conn = pool.acquire().await?;
@@ -156,6 +159,13 @@ async fn dispatch_one(
                 &mut conn,
             )
             .await?;
+            // If this attempt exhausted the retry budget, the job is now `dead` — fire the
+            // webhook. We re-read the row so we get the post-mark status truthfully.
+            if let Some(updated) = jobs::get(job.id, &mut conn).await? {
+                if updated.status == STATUS_DEAD {
+                    dead_letter::fire(http_client, &target, &updated).await;
+                }
+            }
         }
         AdapterOutcome::PermanentFailure { status, detail } => {
             tracing::warn!(

@@ -23,6 +23,7 @@ pub mod adapter;
 pub mod adapters;
 pub mod admin;
 pub mod backfill;
+pub mod dead_letter;
 pub mod event;
 pub mod jobs;
 pub mod mapping;

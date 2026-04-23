@@ -46,6 +46,7 @@ async fn seed_target(pool: &SqlitePool, base_url: &str) -> Uuid {
         true,
         None,
         None,
+        None,
         &fixed_key(),
         &mut conn,
     )
@@ -124,6 +125,7 @@ async fn enqueue_fans_out_to_all_enabled_targets_only() {
         true,
         None,
         None,
+        None,
         &fixed_key(),
         &mut conn,
     )
@@ -135,6 +137,7 @@ async fn enqueue_fans_out_to_all_enabled_targets_only() {
         "http://b",
         "t",
         false,
+        None,
         None,
         None,
         &fixed_key(),
@@ -312,6 +315,7 @@ async fn adapter_posts_scim_user_on_created_event() {
         true,
         None,
         None,
+        None,
         &fixed_key(),
         &mut conn,
     )
@@ -382,6 +386,7 @@ async fn adapter_retries_on_5xx() {
         true,
         None,
         None,
+        None,
         &fixed_key(),
         &mut conn,
     )
@@ -431,6 +436,7 @@ async fn adapter_permanent_failure_on_401() {
         &server.uri(),
         "wrong-token",
         true,
+        None,
         None,
         None,
         &fixed_key(),
@@ -617,6 +623,7 @@ async fn backfill_creates_one_job_per_active_user() {
         true,
         None,
         None,
+        None,
         &fixed_key(),
         &mut conn,
     )
@@ -664,6 +671,7 @@ async fn backfill_skips_disabled_target() {
         "http://unused",
         "tok",
         false,
+        None,
         None,
         None,
         &fixed_key(),
@@ -781,6 +789,7 @@ async fn attribute_map_renames_top_level_fields_on_wire() {
         true,
         None,
         Some(r#"{"userName":"username"}"#),
+        None,
         &fixed_key(),
         &mut conn,
     )
@@ -832,6 +841,125 @@ async fn attribute_map_renames_top_level_fields_on_wire() {
 }
 
 #[tokio::test]
+async fn dead_letter_fire_posts_to_configured_webhook() {
+    use wiremock::matchers::body_partial_json;
+    let alert_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/hook"))
+        .and(body_partial_json(serde_json::json!({
+            "type": "authere.provisioning.dead_letter",
+        })))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&alert_server)
+        .await;
+
+    let pool = pool().await;
+    let mut conn = pool.acquire().await.unwrap();
+    let target = authere_server::provisioning::targets::create(
+        "alerted",
+        KIND_GENERIC_SCIM,
+        "http://unused",
+        "tok",
+        true,
+        None,
+        None,
+        Some(&format!("{}/hook", alert_server.uri())),
+        &fixed_key(),
+        &mut conn,
+    )
+    .await
+    .unwrap();
+
+    let user = User::new("alice".into(), "Alice".into(), None);
+    user.save(&mut conn).await.unwrap();
+    authere_server::provisioning::enqueue(
+        &user,
+        UserLifecycleEvent::Created,
+        "http://origin",
+        &mut conn,
+    )
+    .await
+    .unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        + 1000;
+    let job = jobs::claim_batch(now, 10, &mut conn)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    // Simulate retry budget exhaustion: mark retryable at the dead-letter threshold.
+    jobs::mark_failure_retryable(
+        job.id,
+        500,
+        "always fails",
+        authere_server::provisioning::jobs::DEAD_LETTER_ATTEMPTS - 1,
+        &mut conn,
+    )
+    .await
+    .unwrap();
+    let updated = jobs::get(job.id, &mut conn).await.unwrap().unwrap();
+    assert_eq!(updated.status, authere_server::provisioning::jobs::STATUS_DEAD);
+
+    let client = reqwest::Client::builder().build().unwrap();
+    authere_server::provisioning::dead_letter::fire(&client, &target, &updated).await;
+
+    // wiremock's .expect(1) + drop check verifies the call landed.
+    drop(alert_server);
+}
+
+#[tokio::test]
+async fn dead_letter_fire_noop_when_no_webhook_configured() {
+    // No webhook URL set — the fire call should just return without trying to POST anything.
+    let pool = pool().await;
+    let mut conn = pool.acquire().await.unwrap();
+    let target = authere_server::provisioning::targets::create(
+        "quiet",
+        KIND_GENERIC_SCIM,
+        "http://unused",
+        "tok",
+        true,
+        None,
+        None,
+        None,
+        &fixed_key(),
+        &mut conn,
+    )
+    .await
+    .unwrap();
+
+    let user = User::new("bob".into(), "Bob".into(), None);
+    user.save(&mut conn).await.unwrap();
+    authere_server::provisioning::enqueue(
+        &user,
+        UserLifecycleEvent::Created,
+        "http://origin",
+        &mut conn,
+    )
+    .await
+    .unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        + 1000;
+    let job = jobs::claim_batch(now, 10, &mut conn)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+
+    let client = reqwest::Client::builder().build().unwrap();
+    // Must not panic, must not hang — the assertion is simply that this returns.
+    authere_server::provisioning::dead_letter::fire(&client, &target, &job).await;
+}
+
+#[tokio::test]
 async fn attribute_map_absent_leaves_body_unchanged() {
     use wiremock::matchers::body_partial_json;
     let server = MockServer::start().await;
@@ -852,6 +980,7 @@ async fn attribute_map_absent_leaves_body_unchanged() {
         &server.uri(),
         "tok",
         true,
+        None,
         None,
         None,
         &fixed_key(),
