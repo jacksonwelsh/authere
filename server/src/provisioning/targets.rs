@@ -34,6 +34,10 @@ pub struct ProvisioningTarget {
     pub created_at: i64,
     pub created_by: Option<Uuid>,
     pub updated_at: i64,
+    /// Epoch seconds when the first-time backfill (enumerate all active users → enqueue
+    /// create jobs) completed. NULL means backfill hasn't run yet — the admin API triggers
+    /// it on first enable.
+    pub backfill_done_at: Option<i64>,
 }
 
 fn now_epoch() -> i64 {
@@ -142,6 +146,7 @@ pub async fn create(
         created_at: now,
         created_by,
         updated_at: now,
+        backfill_done_at: None,
     })
 }
 
@@ -150,7 +155,8 @@ pub async fn get(id: Uuid, conn: &mut SqliteConnection) -> Result<Option<Provisi
         r#"SELECT id as "id: Uuid", name, kind, base_url,
                   auth_token_ciphertext, auth_token_nonce,
                   enabled as "enabled!: bool",
-                  created_at, created_by as "created_by: Uuid", updated_at
+                  created_at, created_by as "created_by: Uuid", updated_at,
+                  backfill_done_at
            FROM provisioning_targets WHERE id = ?"#,
         id
     )
@@ -167,6 +173,7 @@ pub async fn get(id: Uuid, conn: &mut SqliteConnection) -> Result<Option<Provisi
         created_at: r.created_at,
         created_by: r.created_by,
         updated_at: r.updated_at,
+        backfill_done_at: r.backfill_done_at,
     }))
 }
 
@@ -175,7 +182,8 @@ pub async fn list(conn: &mut SqliteConnection) -> Result<Vec<ProvisioningTarget>
         r#"SELECT id as "id: Uuid", name, kind, base_url,
                   auth_token_ciphertext, auth_token_nonce,
                   enabled as "enabled!: bool",
-                  created_at, created_by as "created_by: Uuid", updated_at
+                  created_at, created_by as "created_by: Uuid", updated_at,
+                  backfill_done_at
            FROM provisioning_targets ORDER BY created_at DESC"#
     )
     .fetch_all(conn)
@@ -193,8 +201,24 @@ pub async fn list(conn: &mut SqliteConnection) -> Result<Vec<ProvisioningTarget>
             created_at: r.created_at,
             created_by: r.created_by,
             updated_at: r.updated_at,
+            backfill_done_at: r.backfill_done_at,
         })
         .collect())
+}
+
+/// Mark a target's initial-sync backfill as done. Idempotent: overwrites any existing
+/// timestamp with the current one.
+pub async fn mark_backfill_done(id: Uuid, conn: &mut SqliteConnection) -> Result<(), AppError> {
+    let now = now_epoch();
+    sqlx::query!(
+        "UPDATE provisioning_targets SET backfill_done_at = ?, updated_at = ? WHERE id = ?",
+        now,
+        now,
+        id
+    )
+    .execute(conn)
+    .await?;
+    Ok(())
 }
 
 pub async fn list_enabled(conn: &mut SqliteConnection) -> Result<Vec<ProvisioningTarget>, AppError> {

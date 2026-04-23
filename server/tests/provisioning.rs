@@ -463,6 +463,289 @@ async fn adapter_permanent_failure_on_401() {
     assert!(matches!(outcome, AdapterOutcome::PermanentFailure { status: 401, .. }));
 }
 
+// ---------------------------------------------------------------------------
+// M2: coalescing, backfill, target health.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn coalesce_pass_collapses_consecutive_updates() {
+    let pool = pool().await;
+    seed_target(&pool, "http://unused").await;
+
+    let mut conn = pool.acquire().await.unwrap();
+    let user = User::new("alice".into(), "Alice".into(), None);
+    user.save(&mut conn).await.unwrap();
+    drop(conn);
+
+    // Queue create then three updates.
+    {
+        let mut tx = pool.begin().await.unwrap();
+        authere_server::provisioning::enqueue(
+            &user,
+            UserLifecycleEvent::Created,
+            "http://origin",
+            &mut tx,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+    for _ in 0..3 {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let mut tx = pool.begin().await.unwrap();
+        authere_server::provisioning::enqueue(
+            &user,
+            UserLifecycleEvent::Updated,
+            "http://origin",
+            &mut tx,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    let mut conn = pool.acquire().await.unwrap();
+    let before: Vec<_> = jobs::list_recent(None, Some(STATUS_PENDING), 100, &mut conn)
+        .await
+        .unwrap();
+    assert_eq!(before.len(), 4);
+
+    let flipped = jobs::run_coalesce_pass(&mut conn).await.unwrap();
+    // 2 of the 3 updates should be superseded; create + latest update remain pending.
+    assert_eq!(flipped, 2);
+
+    let pending: Vec<_> = jobs::list_recent(None, Some(STATUS_PENDING), 100, &mut conn)
+        .await
+        .unwrap();
+    assert_eq!(pending.len(), 2);
+    let superseded: Vec<_> =
+        jobs::list_recent(None, Some(jobs::STATUS_SUPERSEDED), 100, &mut conn)
+            .await
+            .unwrap();
+    assert_eq!(superseded.len(), 2);
+}
+
+#[tokio::test]
+async fn coalesce_pass_is_noop_with_single_job() {
+    let pool = pool().await;
+    seed_target(&pool, "http://unused").await;
+
+    let mut conn = pool.acquire().await.unwrap();
+    let user = User::new("alice".into(), "Alice".into(), None);
+    user.save(&mut conn).await.unwrap();
+    authere_server::provisioning::enqueue(
+        &user,
+        UserLifecycleEvent::Created,
+        "http://origin",
+        &mut conn,
+    )
+    .await
+    .unwrap();
+    let flipped = jobs::run_coalesce_pass(&mut conn).await.unwrap();
+    assert_eq!(flipped, 0);
+}
+
+#[tokio::test]
+async fn coalesce_pass_delete_supersedes_everything() {
+    let pool = pool().await;
+    seed_target(&pool, "http://unused").await;
+
+    let mut conn = pool.acquire().await.unwrap();
+    let user = User::new("alice".into(), "Alice".into(), None);
+    user.save(&mut conn).await.unwrap();
+    authere_server::provisioning::enqueue(
+        &user,
+        UserLifecycleEvent::Created,
+        "http://origin",
+        &mut conn,
+    )
+    .await
+    .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    authere_server::provisioning::enqueue(
+        &user,
+        UserLifecycleEvent::Updated,
+        "http://origin",
+        &mut conn,
+    )
+    .await
+    .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    authere_server::provisioning::enqueue(
+        &user,
+        UserLifecycleEvent::Deleted,
+        "http://origin",
+        &mut conn,
+    )
+    .await
+    .unwrap();
+
+    let flipped = jobs::run_coalesce_pass(&mut conn).await.unwrap();
+    assert_eq!(flipped, 2);
+
+    let pending = jobs::list_recent(None, Some(STATUS_PENDING), 100, &mut conn)
+        .await
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].event_type, "delete");
+}
+
+#[tokio::test]
+async fn backfill_creates_one_job_per_active_user() {
+    let pool = pool().await;
+    let mut conn = pool.acquire().await.unwrap();
+    let alice = User::new("alice".into(), "Alice".into(), None);
+    alice.save(&mut conn).await.unwrap();
+    let bob = User::new("bob".into(), "Bob".into(), None);
+    bob.save(&mut conn).await.unwrap();
+    // Inactive user should be skipped.
+    let mut carol = User::new("carol".into(), "Carol".into(), None);
+    carol.save(&mut conn).await.unwrap();
+    carol.set_active(false, &mut conn).await.unwrap();
+
+    let target = authere_server::provisioning::targets::create(
+        "bf-target",
+        authere_server::provisioning::targets::KIND_GENERIC_SCIM,
+        "http://unused",
+        "tok",
+        true,
+        None,
+        &fixed_key(),
+        &mut conn,
+    )
+    .await
+    .unwrap();
+
+    let n = authere_server::provisioning::backfill::run_if_needed(
+        target.id,
+        "http://origin",
+        &mut conn,
+    )
+    .await
+    .unwrap();
+    assert_eq!(n, 2, "backfill must enqueue one job per active user");
+
+    // Running again is a no-op (backfill_done_at is now set).
+    let n2 = authere_server::provisioning::backfill::run_if_needed(
+        target.id,
+        "http://origin",
+        &mut conn,
+    )
+    .await
+    .unwrap();
+    assert_eq!(n2, 0);
+
+    // The done-at mark persists.
+    let refreshed =
+        authere_server::provisioning::targets::get(target.id, &mut conn)
+            .await
+            .unwrap()
+            .unwrap();
+    assert!(refreshed.backfill_done_at.is_some());
+}
+
+#[tokio::test]
+async fn backfill_skips_disabled_target() {
+    let pool = pool().await;
+    let mut conn = pool.acquire().await.unwrap();
+    let alice = User::new("alice".into(), "Alice".into(), None);
+    alice.save(&mut conn).await.unwrap();
+
+    let target = authere_server::provisioning::targets::create(
+        "disabled",
+        authere_server::provisioning::targets::KIND_GENERIC_SCIM,
+        "http://unused",
+        "tok",
+        false,
+        None,
+        &fixed_key(),
+        &mut conn,
+    )
+    .await
+    .unwrap();
+
+    let n = authere_server::provisioning::backfill::run_if_needed(
+        target.id,
+        "http://origin",
+        &mut conn,
+    )
+    .await
+    .unwrap();
+    assert_eq!(n, 0);
+
+    let refreshed =
+        authere_server::provisioning::targets::get(target.id, &mut conn)
+            .await
+            .unwrap()
+            .unwrap();
+    assert!(refreshed.backfill_done_at.is_none());
+}
+
+#[tokio::test]
+async fn target_health_reports_last_success_and_consecutive_failures() {
+    let pool = pool().await;
+    let target_id = seed_target(&pool, "http://unused").await;
+
+    let mut conn = pool.acquire().await.unwrap();
+    let user = User::new("alice".into(), "Alice".into(), None);
+    user.save(&mut conn).await.unwrap();
+
+    // Enqueue three jobs; mark the first success, the next two permanent failures.
+    for _ in 0..3 {
+        authere_server::provisioning::enqueue(
+            &user,
+            UserLifecycleEvent::Updated,
+            "http://origin",
+            &mut conn,
+        )
+        .await
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        + 1000;
+    let first = jobs::claim_batch(now, 10, &mut conn).await.unwrap();
+    assert_eq!(first.len(), 1, "per-pair FIFO blocks the rest");
+    jobs::mark_success(first[0].id, Some("ok"), &mut conn)
+        .await
+        .unwrap();
+    // Now the next can be claimed.
+    let second = jobs::claim_batch(now, 10, &mut conn).await.unwrap();
+    assert_eq!(second.len(), 1);
+    jobs::mark_failure_permanent(second[0].id, 400, "bad", 0, &mut conn)
+        .await
+        .unwrap();
+    let third = jobs::claim_batch(now, 10, &mut conn).await.unwrap();
+    assert_eq!(third.len(), 1);
+    jobs::mark_failure_permanent(third[0].id, 400, "bad again", 0, &mut conn)
+        .await
+        .unwrap();
+
+    let health = jobs::compute_health(&mut conn).await.unwrap();
+    assert_eq!(health.len(), 1);
+    let h = &health[0];
+    assert_eq!(h.target_id, target_id);
+    assert!(h.last_success_at.is_some());
+    assert!(h.last_failure_at.is_some());
+    assert_eq!(h.consecutive_failures, 2);
+}
+
+#[tokio::test]
+async fn target_health_absent_when_no_jobs() {
+    let pool = pool().await;
+    seed_target(&pool, "http://unused").await;
+    let mut conn = pool.acquire().await.unwrap();
+    let health = jobs::compute_health(&mut conn).await.unwrap();
+    assert!(
+        health.is_empty(),
+        "no jobs → no health rows (absent means healthy)"
+    );
+}
+
 #[tokio::test]
 async fn requeue_moves_failed_job_back_to_pending() {
     let pool = pool().await;

@@ -22,6 +22,7 @@ use tokio::sync::Notify;
 pub mod adapter;
 pub mod adapters;
 pub mod admin;
+pub mod backfill;
 pub mod event;
 pub mod jobs;
 pub mod targets;

@@ -55,6 +55,12 @@ async fn tick(
         .as_secs() as i64;
 
     let mut conn = pool.acquire().await?;
+    // Collapse redundant pending jobs before claiming — saves outbound calls when a write
+    // path burst-enqueues updates.
+    let superseded = jobs::run_coalesce_pass(&mut conn).await?;
+    if superseded > 0 {
+        tracing::info!(count = superseded, "provisioning.coalesce.superseded");
+    }
     let claimed = jobs::claim_batch(now, BATCH_SIZE, &mut conn).await?;
     drop(conn);
 
@@ -117,9 +123,20 @@ async fn dispatch_one(
 
     match outcome {
         AdapterOutcome::Success { external_id } => {
+            tracing::info!(
+                target.kind = %target.kind,
+                event = %job.event_type,
+                "provisioning.dispatch.success"
+            );
             jobs::mark_success(job.id, external_id.as_deref(), &mut conn).await?;
         }
         AdapterOutcome::RetryableFailure { status, detail } => {
+            tracing::warn!(
+                target.kind = %target.kind,
+                event = %job.event_type,
+                status,
+                "provisioning.dispatch.retryable"
+            );
             warn!(
                 job_id = %job.id,
                 target_id = %target.id,
@@ -137,6 +154,12 @@ async fn dispatch_one(
             .await?;
         }
         AdapterOutcome::PermanentFailure { status, detail } => {
+            tracing::warn!(
+                target.kind = %target.kind,
+                event = %job.event_type,
+                status,
+                "provisioning.dispatch.permanent"
+            );
             warn!(
                 job_id = %job.id,
                 target_id = %target.id,

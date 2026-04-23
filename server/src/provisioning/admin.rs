@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::AppState;
 use crate::auth_middleware::AdminUser;
 use crate::errors::AppError;
-use crate::provisioning::{jobs, targets};
+use crate::provisioning::{backfill, jobs, targets};
 
 const TAG: &str = "provisioning-admin";
 
@@ -55,6 +55,13 @@ pub struct TargetSummary {
     pub created_at: i64,
     pub created_by: Option<Uuid>,
     pub updated_at: i64,
+    pub backfill_done_at: Option<i64>,
+    /// Epoch of the last successful dispatch to this target, if any.
+    pub last_success_at: Option<i64>,
+    /// Epoch of the most recent `failed | dead` outcome.
+    pub last_failure_at: Option<i64>,
+    /// Count of consecutive failures since the last success (or all-time if never).
+    pub consecutive_failures: i64,
 }
 
 impl From<targets::ProvisioningTarget> for TargetSummary {
@@ -68,6 +75,10 @@ impl From<targets::ProvisioningTarget> for TargetSummary {
             created_at: t.created_at,
             created_by: t.created_by,
             updated_at: t.updated_at,
+            backfill_done_at: t.backfill_done_at,
+            last_success_at: None,
+            last_failure_at: None,
+            consecutive_failures: 0,
         }
     }
 }
@@ -165,7 +176,7 @@ pub async fn create_target(
     }
 
     let key = targets::load_master_key()?;
-    let mut conn = state.db_pool.acquire().await?;
+    let mut tx = state.db_pool.begin().await?;
     let created = targets::create(
         input.name.trim(),
         &input.kind,
@@ -174,11 +185,13 @@ pub async fn create_target(
         input.enabled,
         Some(admin.0.user_id),
         &key,
-        &mut conn,
+        &mut tx,
     )
     .await?;
-    // Poke the worker in case this is a new target with pending jobs (unlikely — none yet —
-    // but cheap).
+    // Kick off the initial backfill in the same transaction as the create so crash-safe:
+    // if we commit the target, we commit its backfill jobs.
+    let _ = backfill::run_if_needed(created.id, &state.origin, &mut tx).await?;
+    tx.commit().await?;
     state.provisioning_notifier.notify_one();
     Ok((StatusCode::CREATED, Json(created.into())))
 }
@@ -199,7 +212,23 @@ pub async fn list_targets(
 ) -> Result<Json<Vec<TargetSummary>>, AppError> {
     let mut conn = state.db_pool.acquire().await?;
     let rows = targets::list(&mut conn).await?;
-    Ok(Json(rows.into_iter().map(Into::into).collect()))
+    let health = jobs::compute_health(&mut conn).await?;
+    let health_map: std::collections::HashMap<Uuid, jobs::TargetHealth> =
+        health.into_iter().map(|h| (h.target_id, h)).collect();
+
+    let summaries = rows
+        .into_iter()
+        .map(|t| {
+            let mut s: TargetSummary = t.into();
+            if let Some(h) = health_map.get(&s.id) {
+                s.last_success_at = h.last_success_at;
+                s.last_failure_at = h.last_failure_at;
+                s.consecutive_failures = h.consecutive_failures;
+            }
+            s
+        })
+        .collect();
+    Ok(Json(summaries))
 }
 
 #[utoipa::path(
@@ -229,7 +258,7 @@ pub async fn update_target(
         validate_base_url(u)?;
     }
     let key = targets::load_master_key()?;
-    let mut conn = state.db_pool.acquire().await?;
+    let mut tx = state.db_pool.begin().await?;
     let updated = targets::update(
         id,
         input.name.as_deref(),
@@ -237,14 +266,19 @@ pub async fn update_target(
         input.enabled,
         input.auth_token.as_deref(),
         &key,
-        &mut conn,
+        &mut tx,
     )
     .await?;
     if !updated {
         return Err(AppError::NotFound);
     }
+    // If this update transitioned the target into `enabled` and it hasn't been backfilled
+    // yet, run the initial sync now. `run_if_needed` no-ops otherwise so repeated PATCHes
+    // that don't flip `enabled` stay cheap.
+    let _ = backfill::run_if_needed(id, &state.origin, &mut tx).await?;
+    let fresh = targets::get(id, &mut tx).await?.ok_or(AppError::NotFound)?;
+    tx.commit().await?;
     state.provisioning_notifier.notify_one();
-    let fresh = targets::get(id, &mut conn).await?.ok_or(AppError::NotFound)?;
     Ok(Json(fresh.into()))
 }
 
