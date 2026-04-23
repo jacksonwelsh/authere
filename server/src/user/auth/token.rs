@@ -333,13 +333,28 @@ pub async fn verify_access_token(
         "SELECT revoked_before FROM user_access_revocations WHERE user_id = ?",
         user_id
     )
-    .fetch_optional(conn)
+    .fetch_optional(&mut *conn)
     .await?;
 
     if let Some(r) = revocation {
         if token_data.claims.iat <= r.revoked_before {
             return Err(AppError::AuthenticationRequired);
         }
+    }
+
+    // Deactivated users must not be able to present access tokens. The revocation table is
+    // populated by the SCIM deactivation flow, but we also check the flag directly as
+    // belt-and-suspenders against races with in-flight tokens.
+    let active_row = query!(
+        r#"SELECT active as "active!: bool" FROM users WHERE id = ?"#,
+        user_id
+    )
+    .fetch_optional(conn)
+    .await?;
+    match active_row {
+        Some(row) if !row.active => return Err(AppError::AuthenticationRequired),
+        None => return Err(AppError::AuthenticationRequired),
+        _ => {}
     }
 
     Ok(token_data.claims)
@@ -690,6 +705,72 @@ mod tests {
         let token = generate_forward_token(Uuid::new_v4(), vec![], "app.example.com", &key).unwrap();
         let result = verify_forward_token(&token, "app.example.com", &other_key);
         assert!(result.is_err());
+    }
+
+    use crate::db::DbEntity;
+    use crate::user::User;
+    use sqlx::SqlitePool;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    async fn in_memory_pool() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        sqlx::migrate!("../migrations")
+            .run(&pool)
+            .await
+            .expect("run migrations");
+        pool
+    }
+
+    #[tokio::test]
+    async fn verify_access_token_accepts_active_user() {
+        let pool = in_memory_pool().await;
+        let mut conn = pool.acquire().await.unwrap();
+
+        let user = User::new("a".into(), "Alice".into(), None);
+        user.save(&mut conn).await.unwrap();
+
+        let key = generate_key();
+        let token = generate_access_token(user.id, vec!["user".into()], &key).unwrap();
+
+        let claims = verify_access_token(&token, &key, &mut conn).await.unwrap();
+        assert_eq!(claims.sub, user.id.to_string());
+    }
+
+    #[tokio::test]
+    async fn verify_access_token_rejects_inactive_user() {
+        let pool = in_memory_pool().await;
+        let mut conn = pool.acquire().await.unwrap();
+
+        let mut user = User::new("a".into(), "Alice".into(), None);
+        user.save(&mut conn).await.unwrap();
+
+        let key = generate_key();
+        let token = generate_access_token(user.id, vec!["user".into()], &key).unwrap();
+
+        user.set_active(false, &mut conn).await.unwrap();
+
+        let err = verify_access_token(&token, &key, &mut conn).await.expect_err(
+            "inactive users must not be able to present access tokens",
+        );
+        assert!(matches!(err, AppError::AuthenticationRequired));
+    }
+
+    #[tokio::test]
+    async fn verify_access_token_rejects_unknown_user() {
+        // If the user has been hard-deleted, an otherwise-valid token should no longer work.
+        let pool = in_memory_pool().await;
+        let mut conn = pool.acquire().await.unwrap();
+        let key = generate_key();
+        let ghost_id = Uuid::now_v7();
+        let token = generate_access_token(ghost_id, vec![], &key).unwrap();
+
+        let err = verify_access_token(&token, &key, &mut conn).await.expect_err(
+            "tokens for non-existent users must be rejected",
+        );
+        assert!(matches!(err, AppError::AuthenticationRequired));
     }
 
     #[test]

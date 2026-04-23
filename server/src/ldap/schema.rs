@@ -348,6 +348,10 @@ mod tests {
             username: "alice".into(),
             name: "Alice".into(),
             email: Some("alice@example.com".into()),
+            active: true,
+            external_id: None,
+            created_at: 0,
+            updated_at: 0,
         };
         let entry = build_user_entry(&user, &["admin".into(), "user".into()], &cfg);
         assert_eq!(entry.dn, "uid=alice,ou=people,dc=authere,dc=local");
@@ -370,6 +374,10 @@ mod tests {
             username: "bob".into(),
             name: "Bob".into(),
             email: None,
+            active: true,
+            external_id: None,
+            created_at: 0,
+            updated_at: 0,
         };
         let entry = build_user_entry(&user, &[], &cfg);
         assert!(entry.attr_values("mail").is_none());
@@ -417,6 +425,10 @@ mod tests {
             username: "alice".into(),
             name: "Alice".into(),
             email: Some("a@b.co".into()),
+            active: true,
+            external_id: None,
+            created_at: 0,
+            updated_at: 0,
         };
         let entry = build_user_entry(&user, &[], &cfg);
 

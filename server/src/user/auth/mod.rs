@@ -61,6 +61,11 @@ impl Authenticator {
         password_cleartext: String,
         conn: &mut SqliteConnection,
     ) -> Result<(), AppError> {
+        if !user.active {
+            // Still run the dummy check so timing doesn't leak the active flag.
+            Authenticator::dummy_password_check();
+            return Err(AppError::AuthenticationRequired);
+        }
         if let Some(password) = Authenticator::get_password_for(user, conn).await? {
             match password.verify_password(&password_cleartext) {
                 Ok(()) => Ok(()),

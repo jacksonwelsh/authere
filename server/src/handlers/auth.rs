@@ -695,6 +695,10 @@ mod tests {
             username: "testuser".into(),
             name: "Test User".into(),
             email: Some("test@example.com".into()),
+            active: true,
+            external_id: None,
+            created_at: 0,
+            updated_at: 0,
         };
         let roles = vec!["admin".into(), "user".into()];
 
@@ -716,6 +720,10 @@ mod tests {
             username: "testuser".into(),
             name: "Test User".into(),
             email: None,
+            active: true,
+            external_id: None,
+            created_at: 0,
+            updated_at: 0,
         };
         let roles = vec!["user".into()];
 
@@ -733,6 +741,10 @@ mod tests {
             username: "testuser".into(),
             name: "Test".into(),
             email: None,
+            active: true,
+            external_id: None,
+            created_at: 0,
+            updated_at: 0,
         };
 
         let headers = build_auth_headers(&user, &[], None);

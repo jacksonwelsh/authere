@@ -47,15 +47,36 @@ pub struct User {
     pub name: String,
     /// Manually-created users don't need an email address, but it's always nice to have one.
     pub email: Option<String>,
+    /// Whether the account can authenticate. Deactivated users stay in the DB so they can be
+    /// reactivated without losing authenticators, roles, or audit history.
+    pub active: bool,
+    /// Opaque IdP-side identifier, set via SCIM. Unique across users when present.
+    pub external_id: Option<String>,
+    /// Unix epoch seconds. Used for SCIM meta.created and weak-ETag version.
+    pub created_at: i64,
+    /// Unix epoch seconds. Refreshed on every persisted write.
+    pub updated_at: i64,
+}
+
+fn now_epoch() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("Time went backwards")
+        .as_secs() as i64
 }
 
 impl User {
     pub fn new(username: String, name: String, email: Option<String>) -> User {
+        let now = now_epoch();
         User {
             id: Uuid::now_v7(),
             username,
             name,
             email,
+            active: true,
+            external_id: None,
+            created_at: now,
+            updated_at: now,
         }
     }
 
@@ -76,7 +97,9 @@ impl User {
     pub async fn list(conn: &mut SqliteConnection) -> AppResult<Vec<User>> {
         Ok(sqlx::query_as!(
             User,
-            r#"SELECT id as "id: uuid::Uuid", name, username, email FROM users"#
+            r#"SELECT id as "id: uuid::Uuid", name, username, email,
+                      active as "active!: bool", external_id, created_at, updated_at
+               FROM users"#
         )
         .fetch_all(conn)
         .await?)
@@ -118,8 +141,41 @@ impl User {
     ) -> AppResult<Option<Self>> {
         Ok(sqlx::query_as!(
             User,
-            r#"SELECT id as "id: uuid::Uuid", name, username, email FROM users WHERE username = ?"#,
+            r#"SELECT id as "id: uuid::Uuid", name, username, email,
+                      active as "active!: bool", external_id, created_at, updated_at
+               FROM users WHERE username = ?"#,
             username
+        )
+        .fetch_optional(conn)
+        .await?)
+    }
+
+    /// Case-insensitive lookup, used by SCIM where `userName` equality is defined as case-folded.
+    pub async fn get_by_username_ci(
+        username: &str,
+        conn: &mut SqliteConnection,
+    ) -> AppResult<Option<Self>> {
+        Ok(sqlx::query_as!(
+            User,
+            r#"SELECT id as "id: uuid::Uuid", name, username, email,
+                      active as "active!: bool", external_id, created_at, updated_at
+               FROM users WHERE lower(username) = lower(?)"#,
+            username
+        )
+        .fetch_optional(conn)
+        .await?)
+    }
+
+    pub async fn get_by_external_id(
+        external_id: &str,
+        conn: &mut SqliteConnection,
+    ) -> AppResult<Option<Self>> {
+        Ok(sqlx::query_as!(
+            User,
+            r#"SELECT id as "id: uuid::Uuid", name, username, email,
+                      active as "active!: bool", external_id, created_at, updated_at
+               FROM users WHERE external_id = ?"#,
+            external_id
         )
         .fetch_optional(conn)
         .await?)
@@ -178,9 +234,11 @@ impl User {
         if let Some(e) = email { self.email = e; }
         if let Some(u) = username { self.username = u; }
 
+        self.updated_at = now_epoch();
+
         sqlx::query!(
-            "UPDATE users SET name = ?, email = ?, username = ? WHERE id = ?",
-            self.name, self.email, self.username, self.id
+            "UPDATE users SET name = ?, email = ?, username = ?, updated_at = ? WHERE id = ?",
+            self.name, self.email, self.username, self.updated_at, self.id
         )
         .execute(conn)
         .await
@@ -191,19 +249,87 @@ impl User {
         })?;
         Ok(())
     }
+
+    /// Flip the `active` flag. Returns `Ok(true)` if the active state actually changed, `Ok(false)`
+    /// if it was already in that state. Does NOT revoke tokens — callers that need to cut off
+    /// active sessions (e.g. SCIM deactivation) must call `revoke_all_user_tokens` separately.
+    pub async fn set_active(
+        &mut self,
+        active: bool,
+        conn: &mut SqliteConnection,
+    ) -> AppResult<bool> {
+        if self.active == active {
+            return Ok(false);
+        }
+        self.active = active;
+        self.updated_at = now_epoch();
+        sqlx::query!(
+            "UPDATE users SET active = ?, updated_at = ? WHERE id = ?",
+            self.active, self.updated_at, self.id
+        )
+        .execute(conn)
+        .await?;
+        Ok(true)
+    }
+
+    /// Set or clear the SCIM `externalId`. Uniqueness is enforced by a partial index; duplicates
+    /// surface as `AppError::UniqueError`.
+    pub async fn set_external_id(
+        &mut self,
+        external_id: Option<String>,
+        conn: &mut SqliteConnection,
+    ) -> AppResult<()> {
+        self.external_id = external_id;
+        self.updated_at = now_epoch();
+        sqlx::query!(
+            "UPDATE users SET external_id = ?, updated_at = ? WHERE id = ?",
+            self.external_id, self.updated_at, self.id
+        )
+        .execute(conn)
+        .await
+        .map_err(|e| match e {
+            sqlx::Error::Database(ref db) if db.message().contains("UNIQUE") =>
+                AppError::UniqueError("externalId already taken".to_string()),
+            _ => e.into(),
+        })?;
+        Ok(())
+    }
+
+    pub async fn delete(id: Uuid, conn: &mut SqliteConnection) -> AppResult<bool> {
+        let result = sqlx::query!("DELETE FROM users WHERE id = ?", id)
+            .execute(conn)
+            .await?;
+        Ok(result.rows_affected() == 1)
+    }
 }
 
 impl DbEntity for User {
     async fn save(&self, conn: &mut SqliteConnection) -> AppResult<()> {
         sqlx::query!(
-            "INSERT INTO users (id, username, name, email) VALUES (?, ?, ?, ?)",
+            "INSERT INTO users (id, username, name, email, active, external_id, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             self.id,
             self.username,
             self.name,
-            self.email
+            self.email,
+            self.active,
+            self.external_id,
+            self.created_at,
+            self.updated_at,
         )
         .execute(conn)
-        .await?;
+        .await
+        .map_err(|e| match e {
+            sqlx::Error::Database(ref db) if db.message().contains("UNIQUE") => {
+                let msg = db.message();
+                if msg.contains("external_id") {
+                    AppError::UniqueError("externalId already taken".to_string())
+                } else {
+                    AppError::UniqueError("Username already taken".to_string())
+                }
+            }
+            _ => e.into(),
+        })?;
 
         Ok(())
     }
@@ -211,7 +337,9 @@ impl DbEntity for User {
     async fn get(id: uuid::Uuid, conn: &mut SqliteConnection) -> AppResult<Option<Self>> {
         Ok(sqlx::query_as!(
             User,
-            r#"SELECT id as "id: uuid::Uuid", username, name, email FROM users WHERE id = ?"#,
+            r#"SELECT id as "id: uuid::Uuid", username, name, email,
+                      active as "active!: bool", external_id, created_at, updated_at
+               FROM users WHERE id = ?"#,
             id
         )
         .fetch_optional(conn)
@@ -394,6 +522,20 @@ mod tests {
     }
 
     #[test]
+    fn user_new_defaults_active_and_no_external_id() {
+        let user = User::new("carol".into(), "Carol".into(), None);
+        assert!(user.active, "new users should default to active");
+        assert!(user.external_id.is_none());
+    }
+
+    #[test]
+    fn user_new_sets_timestamps() {
+        let user = User::new("dan".into(), "Dan".into(), None);
+        assert!(user.created_at > 0);
+        assert_eq!(user.created_at, user.updated_at);
+    }
+
+    #[test]
     fn user_new_no_email() {
         let user = User::new("bob".into(), "Bob".into(), None);
         assert!(user.email.is_none());
@@ -408,6 +550,10 @@ mod tests {
         assert_eq!(user.username, deserialized.username);
         assert_eq!(user.name, deserialized.name);
         assert_eq!(user.email, deserialized.email);
+        assert_eq!(user.active, deserialized.active);
+        assert_eq!(user.external_id, deserialized.external_id);
+        assert_eq!(user.created_at, deserialized.created_at);
+        assert_eq!(user.updated_at, deserialized.updated_at);
     }
 
     #[test]
@@ -444,5 +590,200 @@ mod tests {
     #[test]
     fn validate_email_plus_addressing() {
         User::validate_email(&Some("user+tag@example.com".into())).unwrap();
+    }
+
+    // ------------------------------------------------------------------------
+    // DB-backed tests — exercise the new `active`, `external_id`, and timestamp
+    // columns end to end. Mirrors the in-memory pool pattern from app_passwords.
+    // ------------------------------------------------------------------------
+
+    use sqlx::SqlitePool;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    async fn in_memory_pool() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        sqlx::migrate!("../migrations")
+            .run(&pool)
+            .await
+            .expect("run migrations");
+        pool
+    }
+
+    #[tokio::test]
+    async fn save_and_get_preserves_new_fields() {
+        let pool = in_memory_pool().await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut user = User::new("alice".into(), "Alice".into(), Some("a@b.co".into()));
+        user.external_id = Some("okta-123".into());
+        user.save(&mut conn).await.unwrap();
+
+        let loaded = User::get(user.id, &mut conn).await.unwrap().unwrap();
+        assert!(loaded.active);
+        assert_eq!(loaded.external_id.as_deref(), Some("okta-123"));
+        assert_eq!(loaded.created_at, user.created_at);
+        assert_eq!(loaded.updated_at, user.updated_at);
+    }
+
+    #[tokio::test]
+    async fn set_active_returns_false_when_unchanged() {
+        let pool = in_memory_pool().await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut user = User::new("a".into(), "Alice".into(), None);
+        user.save(&mut conn).await.unwrap();
+
+        let changed = user.set_active(true, &mut conn).await.unwrap();
+        assert!(!changed, "setting active to current value is a no-op");
+    }
+
+    #[tokio::test]
+    async fn set_active_deactivates_and_refreshes_updated_at() {
+        let pool = in_memory_pool().await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut user = User::new("a".into(), "Alice".into(), None);
+        let original_updated = user.updated_at;
+        user.save(&mut conn).await.unwrap();
+
+        // Sleep 1s so unixepoch() granularity picks up a new timestamp.
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let changed = user.set_active(false, &mut conn).await.unwrap();
+        assert!(changed);
+        assert!(!user.active);
+        assert!(user.updated_at > original_updated);
+
+        let reloaded = User::get(user.id, &mut conn).await.unwrap().unwrap();
+        assert!(!reloaded.active);
+    }
+
+    #[tokio::test]
+    async fn set_external_id_enforces_uniqueness() {
+        let pool = in_memory_pool().await;
+        let mut conn = pool.acquire().await.unwrap();
+
+        let mut alice = User::new("alice".into(), "Alice".into(), None);
+        alice.save(&mut conn).await.unwrap();
+        alice.set_external_id(Some("okta-same".into()), &mut conn).await.unwrap();
+
+        let mut bob = User::new("bob".into(), "Bob".into(), None);
+        bob.save(&mut conn).await.unwrap();
+        let err = bob
+            .set_external_id(Some("okta-same".into()), &mut conn)
+            .await
+            .expect_err("duplicate external_id must fail");
+        assert!(matches!(err, AppError::UniqueError(_)));
+    }
+
+    #[tokio::test]
+    async fn external_id_null_allowed_for_many() {
+        // Partial unique index must only constrain non-null values.
+        let pool = in_memory_pool().await;
+        let mut conn = pool.acquire().await.unwrap();
+
+        let alice = User::new("alice".into(), "Alice".into(), None);
+        alice.save(&mut conn).await.unwrap();
+        let bob = User::new("bob".into(), "Bob".into(), None);
+        bob.save(&mut conn).await.unwrap();
+        // Both have external_id = None — no conflict.
+    }
+
+    #[tokio::test]
+    async fn get_by_username_ci_is_case_insensitive() {
+        let pool = in_memory_pool().await;
+        let mut conn = pool.acquire().await.unwrap();
+        let user = User::new("Alice".into(), "Alice".into(), None);
+        user.save(&mut conn).await.unwrap();
+
+        let hit = User::get_by_username_ci("ALICE", &mut conn).await.unwrap();
+        assert!(hit.is_some());
+        let hit = User::get_by_username_ci("alice", &mut conn).await.unwrap();
+        assert!(hit.is_some());
+        let hit = User::get_by_username_ci("AlIcE", &mut conn).await.unwrap();
+        assert!(hit.is_some());
+    }
+
+    #[tokio::test]
+    async fn get_by_external_id_roundtrip() {
+        let pool = in_memory_pool().await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut user = User::new("a".into(), "Alice".into(), None);
+        user.save(&mut conn).await.unwrap();
+        user.set_external_id(Some("ext-123".into()), &mut conn)
+            .await
+            .unwrap();
+
+        let hit = User::get_by_external_id("ext-123", &mut conn).await.unwrap();
+        assert!(hit.is_some());
+        assert_eq!(hit.unwrap().id, user.id);
+
+        let miss = User::get_by_external_id("does-not-exist", &mut conn).await.unwrap();
+        assert!(miss.is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_removes_user() {
+        let pool = in_memory_pool().await;
+        let mut conn = pool.acquire().await.unwrap();
+        let user = User::new("a".into(), "Alice".into(), None);
+        user.save(&mut conn).await.unwrap();
+
+        assert!(User::delete(user.id, &mut conn).await.unwrap());
+        assert!(User::get(user.id, &mut conn).await.unwrap().is_none());
+        // Second delete is a no-op.
+        assert!(!User::delete(user.id, &mut conn).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn update_refreshes_updated_at() {
+        let pool = in_memory_pool().await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut user = User::new("a".into(), "Alice".into(), None);
+        let original = user.updated_at;
+        user.save(&mut conn).await.unwrap();
+
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        user.update(Some("Alice New".into()), None, None, &mut conn)
+            .await
+            .unwrap();
+        assert!(user.updated_at > original);
+    }
+
+    #[tokio::test]
+    async fn login_rejects_inactive_user() {
+        let pool = in_memory_pool().await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut user = User::new("a".into(), "Alice".into(), None);
+        user.save(&mut conn).await.unwrap();
+
+        let auth = Authenticator::new_password("hunter2hunter2".into(), user.id).unwrap();
+        auth.save(&mut conn).await.unwrap();
+
+        // Control: login works while active.
+        Authenticator::try_password_login(&user, "hunter2hunter2".into(), &mut conn)
+            .await
+            .expect("active user with correct password must succeed");
+
+        user.set_active(false, &mut conn).await.unwrap();
+        let err = Authenticator::try_password_login(&user, "hunter2hunter2".into(), &mut conn)
+            .await
+            .expect_err("inactive user must not be able to log in");
+        assert!(matches!(err, AppError::AuthenticationRequired));
+    }
+
+    #[tokio::test]
+    async fn list_includes_inactive_users() {
+        // SCIM requires that list returns inactive users by default; clients filter them out.
+        let pool = in_memory_pool().await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut alice = User::new("alice".into(), "Alice".into(), None);
+        alice.save(&mut conn).await.unwrap();
+        let bob = User::new("bob".into(), "Bob".into(), None);
+        bob.save(&mut conn).await.unwrap();
+        alice.set_active(false, &mut conn).await.unwrap();
+
+        let all = User::list(&mut conn).await.unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().any(|u| !u.active));
     }
 }

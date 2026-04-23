@@ -195,6 +195,7 @@ async fn start_server(mode: LdapPasswordMode) -> Fixture {
         login_rate_limiter: RateLimiter::new(RateLimitConfig::default()),
         register_rate_limiter: RateLimiter::new(RateLimitConfig::default()),
         ldap_bind_rate_limiter,
+        scim_rate_limiter: RateLimiter::new(RateLimitConfig::default()),
         signing_key,
         origin: String::from("http://localhost:3000"),
     };
@@ -397,6 +398,26 @@ async fn primary_only_rejects_totp_user() {
         res.rc, 0,
         "app passwords are also rejected in primary_only mode"
     );
+}
+
+#[tokio::test]
+async fn bind_rejected_for_deactivated_user() {
+    // Deactivation is the SCIM control surface for revoking access; LDAP bind must honor it.
+    let fx = start_server(LdapPasswordMode::PrimaryAndApp).await;
+
+    let mut conn = fx.state.db_pool.acquire().await.unwrap();
+    sqlx::query!("UPDATE users SET active = 0 WHERE id = ?", fx.alice_id)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    drop(conn);
+
+    let mut ldap = connect(fx.addr).await;
+    let res = ldap
+        .simple_bind(&user_dn("alice"), ALICE_PASSWORD)
+        .await
+        .unwrap();
+    assert_ne!(res.rc, 0, "deactivated user must not be able to LDAP bind");
 }
 
 #[tokio::test]

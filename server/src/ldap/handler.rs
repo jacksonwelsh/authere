@@ -164,6 +164,20 @@ async fn handle_user_bind(
         }
     };
 
+    if !user.active {
+        Authenticator::dummy_password_check();
+        return bind_failed_with_conn(
+            req,
+            ip,
+            mode,
+            "user_inactive",
+            Some(user.id),
+            &req.dn,
+            &mut conn,
+        )
+        .await;
+    }
+
     let totp = match user_has_totp(user.id, &mut conn).await {
         Ok(v) => v,
         Err(e) => {

@@ -111,6 +111,14 @@ pub enum AuditEventType {
     LdapBindFailed,
     LdapBindRejectedMfaRequired,
     LdapBindPasswordRotated,
+    // SCIM
+    ScimTokenCreated,
+    ScimTokenRevoked,
+    ScimUserCreated,
+    ScimUserUpdated,
+    ScimUserDeactivated,
+    ScimUserReactivated,
+    ScimUserDeleted,
 }
 
 impl AuditEventType {
@@ -143,6 +151,13 @@ impl AuditEventType {
             AuditEventType::LdapBindFailed => "ldap_bind_failed",
             AuditEventType::LdapBindRejectedMfaRequired => "ldap_bind_rejected_mfa_required",
             AuditEventType::LdapBindPasswordRotated => "ldap_bind_password_rotated",
+            AuditEventType::ScimTokenCreated => "scim_token_created",
+            AuditEventType::ScimTokenRevoked => "scim_token_revoked",
+            AuditEventType::ScimUserCreated => "scim_user_created",
+            AuditEventType::ScimUserUpdated => "scim_user_updated",
+            AuditEventType::ScimUserDeactivated => "scim_user_deactivated",
+            AuditEventType::ScimUserReactivated => "scim_user_reactivated",
+            AuditEventType::ScimUserDeleted => "scim_user_deleted",
         }
     }
 }
@@ -637,6 +652,132 @@ pub async fn log_ldap_bind_password_rotated(
         .await
 }
 
+// ============================================================================
+// SCIM helpers
+// ============================================================================
+
+fn scim_details(token_id: Uuid, token_name: &str, extra: Option<serde_json::Value>) -> serde_json::Value {
+    match extra {
+        None => json!({ "scim_token_id": token_id, "scim_token_name": token_name }),
+        Some(serde_json::Value::Object(mut map)) => {
+            map.insert("scim_token_id".into(), json!(token_id));
+            map.insert("scim_token_name".into(), json!(token_name));
+            serde_json::Value::Object(map)
+        }
+        Some(other) => {
+            json!({ "scim_token_id": token_id, "scim_token_name": token_name, "extra": other })
+        }
+    }
+}
+
+/// Log an admin minting a new SCIM token. Records the token label so a destructive audit
+/// trail ties a specific integration ("Okta prod") to downstream user mutations.
+pub async fn log_scim_token_created(
+    token_id: Uuid,
+    token_name: &str,
+    actor_id: Uuid,
+    ctx: &AuditContext,
+    conn: &mut SqliteConnection,
+) -> Result<(), AppError> {
+    AuditLogEntry::new(AuditEventType::ScimTokenCreated)
+        .actor(actor_id)
+        .ip(&ctx.ip_address)
+        .details(json!({ "scim_token_id": token_id, "scim_token_name": token_name }))
+        .save(conn)
+        .await
+}
+
+pub async fn log_scim_token_revoked(
+    token_id: Uuid,
+    token_name: &str,
+    actor_id: Uuid,
+    ctx: &AuditContext,
+    conn: &mut SqliteConnection,
+) -> Result<(), AppError> {
+    AuditLogEntry::new(AuditEventType::ScimTokenRevoked)
+        .actor(actor_id)
+        .ip(&ctx.ip_address)
+        .details(json!({ "scim_token_id": token_id, "scim_token_name": token_name }))
+        .save(conn)
+        .await
+}
+
+pub async fn log_scim_user_created(
+    user_id: Uuid,
+    token_id: Uuid,
+    token_name: &str,
+    ctx: &AuditContext,
+    conn: &mut SqliteConnection,
+) -> Result<(), AppError> {
+    AuditLogEntry::new(AuditEventType::ScimUserCreated)
+        .user(user_id)
+        .ip(&ctx.ip_address)
+        .details(scim_details(token_id, token_name, None))
+        .save(conn)
+        .await
+}
+
+pub async fn log_scim_user_updated(
+    user_id: Uuid,
+    token_id: Uuid,
+    token_name: &str,
+    changes: Option<serde_json::Value>,
+    ctx: &AuditContext,
+    conn: &mut SqliteConnection,
+) -> Result<(), AppError> {
+    AuditLogEntry::new(AuditEventType::ScimUserUpdated)
+        .user(user_id)
+        .ip(&ctx.ip_address)
+        .details(scim_details(token_id, token_name, changes))
+        .save(conn)
+        .await
+}
+
+pub async fn log_scim_user_deactivated(
+    user_id: Uuid,
+    token_id: Uuid,
+    token_name: &str,
+    ctx: &AuditContext,
+    conn: &mut SqliteConnection,
+) -> Result<(), AppError> {
+    AuditLogEntry::new(AuditEventType::ScimUserDeactivated)
+        .user(user_id)
+        .ip(&ctx.ip_address)
+        .details(scim_details(token_id, token_name, None))
+        .save(conn)
+        .await
+}
+
+pub async fn log_scim_user_reactivated(
+    user_id: Uuid,
+    token_id: Uuid,
+    token_name: &str,
+    ctx: &AuditContext,
+    conn: &mut SqliteConnection,
+) -> Result<(), AppError> {
+    AuditLogEntry::new(AuditEventType::ScimUserReactivated)
+        .user(user_id)
+        .ip(&ctx.ip_address)
+        .details(scim_details(token_id, token_name, None))
+        .save(conn)
+        .await
+}
+
+pub async fn log_scim_user_deleted(
+    user_id: Uuid,
+    token_id: Uuid,
+    token_name: &str,
+    ctx: &AuditContext,
+    conn: &mut SqliteConnection,
+) -> Result<(), AppError> {
+    AuditLogEntry::new(AuditEventType::ScimUserDeleted)
+        .user(user_id)
+        .ip(&ctx.ip_address)
+        .details(scim_details(token_id, token_name, None))
+        .save(conn)
+        .await
+}
+
 /// Log admin updating system settings
 pub async fn log_settings_updated(
     actor_id: Uuid,
@@ -716,11 +857,47 @@ mod tests {
             (AuditEventType::InvitationDeleted, "invitation_deleted"),
             (AuditEventType::InvitationConsumed, "invitation_consumed"),
             (AuditEventType::SettingsUpdated, "settings_updated"),
+            (AuditEventType::ScimTokenCreated, "scim_token_created"),
+            (AuditEventType::ScimTokenRevoked, "scim_token_revoked"),
+            (AuditEventType::ScimUserCreated, "scim_user_created"),
+            (AuditEventType::ScimUserUpdated, "scim_user_updated"),
+            (AuditEventType::ScimUserDeactivated, "scim_user_deactivated"),
+            (AuditEventType::ScimUserReactivated, "scim_user_reactivated"),
+            (AuditEventType::ScimUserDeleted, "scim_user_deleted"),
         ];
 
         for (event_type, expected_str) in all_types {
             assert_eq!(event_type.as_str(), expected_str);
         }
+    }
+
+    #[test]
+    fn scim_details_merges_extra_object() {
+        let token_id = Uuid::nil();
+        let extra = json!({ "fields_changed": ["email"] });
+        let merged = scim_details(token_id, "Okta prod", Some(extra));
+        let obj = merged.as_object().unwrap();
+        assert_eq!(obj["scim_token_id"], json!(token_id));
+        assert_eq!(obj["scim_token_name"], "Okta prod");
+        assert_eq!(obj["fields_changed"], json!(["email"]));
+    }
+
+    #[test]
+    fn scim_details_wraps_non_object_extra() {
+        let token_id = Uuid::nil();
+        let merged = scim_details(token_id, "Azure", Some(json!("raw-string")));
+        let obj = merged.as_object().unwrap();
+        assert_eq!(obj["extra"], json!("raw-string"));
+    }
+
+    #[test]
+    fn scim_details_without_extra_only_has_token_fields() {
+        let token_id = Uuid::nil();
+        let merged = scim_details(token_id, "OneLogin", None);
+        let obj = merged.as_object().unwrap();
+        assert_eq!(obj.len(), 2);
+        assert!(obj.contains_key("scim_token_id"));
+        assert!(obj.contains_key("scim_token_name"));
     }
 
     #[test]

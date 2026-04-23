@@ -108,11 +108,17 @@ async fn main() -> Result<(), AppError> {
         window: Duration::from_secs(env_override("AUTHERE_LDAP_WINDOW_SECS", 60).into()),
     });
 
+    let scim_rate_limiter = RateLimiter::new(RateLimitConfig {
+        max_requests: env_override("AUTHERE_SCIM_MAX_REQUESTS", 60),
+        window: Duration::from_secs(env_override("AUTHERE_SCIM_WINDOW_SECS", 60).into()),
+    });
+
     // Spawn background cleanup for rate limiters
     {
         let login_rl = login_rate_limiter.clone();
         let register_rl = register_rate_limiter.clone();
         let ldap_rl = ldap_bind_rate_limiter.clone();
+        let scim_rl = scim_rate_limiter.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(300));
             loop {
@@ -120,6 +126,7 @@ async fn main() -> Result<(), AppError> {
                 login_rl.cleanup().await;
                 register_rl.cleanup().await;
                 ldap_rl.cleanup().await;
+                scim_rl.cleanup().await;
                 tracing::debug!("rate limiter cleanup completed");
             }
         });
@@ -135,6 +142,7 @@ async fn main() -> Result<(), AppError> {
         login_rate_limiter,
         register_rate_limiter,
         ldap_bind_rate_limiter,
+        scim_rate_limiter,
         signing_key,
         origin,
     };

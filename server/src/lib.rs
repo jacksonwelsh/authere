@@ -22,6 +22,7 @@ pub mod invitation;
 pub mod ldap;
 pub mod rate_limit;
 pub mod role;
+pub mod scim;
 pub mod settings;
 pub mod static_files;
 pub mod user;
@@ -32,6 +33,7 @@ pub struct AppState {
     pub login_rate_limiter: RateLimiter,
     pub register_rate_limiter: RateLimiter,
     pub ldap_bind_rate_limiter: RateLimiter,
+    pub scim_rate_limiter: RateLimiter,
     pub signing_key: Arc<SigningKey>,
     pub origin: String,
 }
@@ -45,5 +47,16 @@ impl FromRef<AppState> for SqlitePool {
 impl FromRef<AppState> for Arc<SigningKey> {
     fn from_ref(state: &AppState) -> Self {
         state.signing_key.clone()
+    }
+}
+
+/// Newtype over the SCIM rate limiter so `ScimAuth` can extract it via `FromRef` without
+/// colliding with the other RateLimiter fields on AppState.
+#[derive(Clone)]
+pub struct ScimRateLimiter(pub RateLimiter);
+
+impl FromRef<AppState> for ScimRateLimiter {
+    fn from_ref(state: &AppState) -> Self {
+        ScimRateLimiter(state.scim_rate_limiter.clone())
     }
 }
