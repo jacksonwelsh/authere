@@ -100,6 +100,55 @@ fn build_url(base_url: &str, event: UserLifecycleEvent, external_id: Option<&str
     }
 }
 
+/// Send one SCIM request and classify the response. Shared between adapters — Slack reuses
+/// this after rewriting its Delete event into a Deactivate.
+///
+/// `event` drives both URL construction and the classify rules (409-on-create is success,
+/// 404-on-delete is success, …).
+pub async fn send_scim_request(
+    client: &reqwest::Client,
+    target: &ProvisioningTarget,
+    token: &str,
+    job: &OutboundJob,
+    event: UserLifecycleEvent,
+    body: Value,
+) -> AdapterOutcome {
+    let fallback_id = job.user_id.to_string();
+    let url_id = job.external_resource_id.as_deref().or(Some(&fallback_id));
+    let url = build_url(&target.base_url, event, url_id);
+
+    let rb = match event {
+        UserLifecycleEvent::Created => client.post(&url).json(&body),
+        UserLifecycleEvent::Updated => client.put(&url).json(&body),
+        UserLifecycleEvent::Deactivated | UserLifecycleEvent::Reactivated => {
+            client.patch(&url).json(&body)
+        }
+        UserLifecycleEvent::Deleted => client.delete(&url),
+    };
+
+    let rb = rb
+        .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(reqwest::header::ACCEPT, SCIM_CONTENT_TYPE)
+        .header(reqwest::header::CONTENT_TYPE, SCIM_CONTENT_TYPE)
+        .timeout(REQUEST_TIMEOUT);
+
+    let res = match rb.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            // Transport errors (DNS, TLS, connect, timeout) are all retryable — an admin may
+            // fix the network or the URL mid-flight.
+            return AdapterOutcome::RetryableFailure {
+                status: 0,
+                detail: format!("transport error: {e}"),
+            };
+        }
+    };
+
+    let status = res.status().as_u16();
+    let text = res.text().await.unwrap_or_default();
+    classify_response(event, status, &text)
+}
+
 impl ProvisioningAdapter for GenericScimAdapter {
     async fn dispatch(
         &self,
@@ -114,46 +163,7 @@ impl ProvisioningAdapter for GenericScimAdapter {
                 detail: format!("unknown event_type {}", job.event_type),
             };
         };
-
-        // For updates/deletes without a captured external id, fall back to our internal UUID.
-        let fallback_id = job.user_id.to_string();
-        let url_id = job.external_resource_id.as_deref().or(Some(&fallback_id));
-        let url = build_url(&target.base_url, event, url_id);
-
-        let rb = match event {
-            UserLifecycleEvent::Created => self.client.post(&url).json(&body),
-            UserLifecycleEvent::Updated => self.client.put(&url).json(&body),
-            UserLifecycleEvent::Deactivated | UserLifecycleEvent::Reactivated => {
-                self.client.patch(&url).json(&body)
-            }
-            UserLifecycleEvent::Deleted => self.client.delete(&url),
-        };
-
-        let rb = rb
-            .header(reqwest::header::AUTHORIZATION, format!("Bearer {target_auth_token}"))
-            .header(reqwest::header::ACCEPT, SCIM_CONTENT_TYPE)
-            .header(reqwest::header::CONTENT_TYPE, SCIM_CONTENT_TYPE)
-            .timeout(REQUEST_TIMEOUT);
-
-        let res = match rb.send().await {
-            Ok(r) => r,
-            Err(e) => {
-                let is_timeout = e.is_timeout() || e.is_connect();
-                let status = 0u16;
-                let detail = format!("transport error: {e}");
-                return if is_timeout {
-                    AdapterOutcome::RetryableFailure { status, detail }
-                } else {
-                    // Other transport errors (DNS failure, TLS) — retry; the admin may fix
-                    // the URL or network mid-flight.
-                    AdapterOutcome::RetryableFailure { status, detail }
-                };
-            }
-        };
-
-        let status = res.status().as_u16();
-        let text = res.text().await.unwrap_or_default();
-        classify_response(event, status, &text)
+        send_scim_request(&self.client, target, target_auth_token, job, event, body).await
     }
 }
 

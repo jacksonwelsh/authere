@@ -14,6 +14,7 @@ use crate::provisioning::Notifier;
 use crate::provisioning::adapter::{AdapterOutcome, ProvisioningAdapter};
 use crate::provisioning::adapters::generic_scim::GenericScimAdapter;
 use crate::provisioning::jobs::{self, OutboundJob};
+use crate::provisioning::mapping;
 use crate::provisioning::targets::{self, KIND_GENERIC_SCIM, KEY_LEN, ProvisioningTarget};
 
 const TICK: Duration = Duration::from_secs(30);
@@ -119,6 +120,9 @@ async fn dispatch_one(
     };
 
     let body = jobs::decode_payload(&job.payload);
+    // Apply per-target attribute rename (top-level keys only) before handing to the adapter.
+    // A malformed map is logged and ignored — we don't fail the job on bad admin config.
+    let body = mapping::apply_map(target.attribute_map.as_deref(), body);
     let outcome = dispatch_via_adapter(&target, &token, &job, body, generic).await;
 
     match outcome {

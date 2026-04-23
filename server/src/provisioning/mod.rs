@@ -25,6 +25,7 @@ pub mod admin;
 pub mod backfill;
 pub mod event;
 pub mod jobs;
+pub mod mapping;
 pub mod targets;
 pub mod worker;
 

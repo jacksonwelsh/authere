@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::AppState;
 use crate::auth_middleware::AdminUser;
 use crate::errors::AppError;
-use crate::provisioning::{backfill, jobs, targets};
+use crate::provisioning::{backfill, jobs, mapping, targets};
 
 const TAG: &str = "provisioning-admin";
 
@@ -26,6 +26,10 @@ pub struct CreateTargetInput {
     pub auth_token: String,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    /// Optional JSON object of `{"from": "to"}` strings renaming top-level SCIM body keys
+    /// before dispatch (e.g. `{"externalId":"external_id"}` for snake-case peers).
+    #[serde(default)]
+    pub attribute_map: Option<String>,
 }
 
 fn default_enabled() -> bool {
@@ -43,6 +47,24 @@ pub struct UpdateTargetInput {
     /// If supplied, rotates the stored token. Otherwise the existing ciphertext is preserved.
     #[serde(default)]
     pub auth_token: Option<String>,
+    /// Triple-valued: field absent = leave unchanged, `null` = clear, object = set. Use the
+    /// `#[serde(default, deserialize_with)]` shim below so both "missing" and explicit-null
+    /// map onto the right `Option<Option<_>>` case.
+    #[serde(default, deserialize_with = "de_optional_nullable_string")]
+    pub attribute_map: Option<Option<String>>,
+}
+
+fn de_optional_nullable_string<'de, D>(de: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // serde_json parses missing → field default = None (outer), but we want to distinguish
+    // "field present but null" vs "field absent". `#[serde(default)]` already handles the
+    // outer absent case via `Default`. Here we only get called when the field *is* present,
+    // so we just wrap the inner Option<String> deserialization.
+    use serde::Deserialize;
+    let inner: Option<String> = Option::<String>::deserialize(de)?;
+    Ok(Some(inner))
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -56,6 +78,9 @@ pub struct TargetSummary {
     pub created_by: Option<Uuid>,
     pub updated_at: i64,
     pub backfill_done_at: Option<i64>,
+    /// Attribute-rename map currently applied to this target. Canonical JSON string, or
+    /// `null` if no mapping is configured.
+    pub attribute_map: Option<String>,
     /// Epoch of the last successful dispatch to this target, if any.
     pub last_success_at: Option<i64>,
     /// Epoch of the most recent `failed | dead` outcome.
@@ -76,6 +101,7 @@ impl From<targets::ProvisioningTarget> for TargetSummary {
             created_by: t.created_by,
             updated_at: t.updated_at,
             backfill_done_at: t.backfill_done_at,
+            attribute_map: t.attribute_map,
             last_success_at: None,
             last_failure_at: None,
             consecutive_failures: 0,
@@ -174,6 +200,9 @@ pub async fn create_target(
             "auth_token is required".into(),
         ]));
     }
+    if let Some(ref m) = input.attribute_map {
+        mapping::validate_map_input(m)?;
+    }
 
     let key = targets::load_master_key()?;
     let mut tx = state.db_pool.begin().await?;
@@ -184,6 +213,7 @@ pub async fn create_target(
         &input.auth_token,
         input.enabled,
         Some(admin.0.user_id),
+        input.attribute_map.as_deref(),
         &key,
         &mut tx,
     )
@@ -257,6 +287,13 @@ pub async fn update_target(
     if let Some(ref u) = input.base_url {
         validate_base_url(u)?;
     }
+    if let Some(Some(ref m)) = input.attribute_map {
+        mapping::validate_map_input(m)?;
+    }
+    let attribute_map_arg: Option<Option<&str>> = input
+        .attribute_map
+        .as_ref()
+        .map(|inner| inner.as_deref());
     let key = targets::load_master_key()?;
     let mut tx = state.db_pool.begin().await?;
     let updated = targets::update(
@@ -265,6 +302,7 @@ pub async fn update_target(
         input.base_url.as_deref(),
         input.enabled,
         input.auth_token.as_deref(),
+        attribute_map_arg,
         &key,
         &mut tx,
     )

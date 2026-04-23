@@ -45,6 +45,7 @@ async fn seed_target(pool: &SqlitePool, base_url: &str) -> Uuid {
         "downstream-secret",
         true,
         None,
+        None,
         &fixed_key(),
         &mut conn,
     )
@@ -122,6 +123,7 @@ async fn enqueue_fans_out_to_all_enabled_targets_only() {
         "t",
         true,
         None,
+        None,
         &fixed_key(),
         &mut conn,
     )
@@ -133,6 +135,7 @@ async fn enqueue_fans_out_to_all_enabled_targets_only() {
         "http://b",
         "t",
         false,
+        None,
         None,
         &fixed_key(),
         &mut conn,
@@ -308,6 +311,7 @@ async fn adapter_posts_scim_user_on_created_event() {
         "downstream-secret",
         true,
         None,
+        None,
         &fixed_key(),
         &mut conn,
     )
@@ -377,6 +381,7 @@ async fn adapter_retries_on_5xx() {
         "tok",
         true,
         None,
+        None,
         &fixed_key(),
         &mut conn,
     )
@@ -426,6 +431,7 @@ async fn adapter_permanent_failure_on_401() {
         &server.uri(),
         "wrong-token",
         true,
+        None,
         None,
         &fixed_key(),
         &mut conn,
@@ -610,6 +616,7 @@ async fn backfill_creates_one_job_per_active_user() {
         "tok",
         true,
         None,
+        None,
         &fixed_key(),
         &mut conn,
     )
@@ -657,6 +664,7 @@ async fn backfill_skips_disabled_target() {
         "http://unused",
         "tok",
         false,
+        None,
         None,
         &fixed_key(),
         &mut conn,
@@ -744,6 +752,146 @@ async fn target_health_absent_when_no_jobs() {
         health.is_empty(),
         "no jobs → no health rows (absent means healthy)"
     );
+}
+
+#[tokio::test]
+async fn attribute_map_renames_top_level_fields_on_wire() {
+    use wiremock::matchers::body_partial_json;
+
+    let server = MockServer::start().await;
+    // The mock asserts the downstream receives `username` (snake-ish) rather than Authere's
+    // `userName`. If the rename didn't apply, wiremock would not match and the request
+    // would fall through to a 404 default.
+    Mock::given(method("POST"))
+        .and(path("/Users"))
+        .and(body_partial_json(serde_json::json!({ "username": "alice" })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+            "id": "mapped-1"
+        })))
+        .mount(&server)
+        .await;
+
+    let pool = pool().await;
+    let mut conn = pool.acquire().await.unwrap();
+    let target = authere_server::provisioning::targets::create(
+        "mapped",
+        KIND_GENERIC_SCIM,
+        &server.uri(),
+        "tok",
+        true,
+        None,
+        Some(r#"{"userName":"username"}"#),
+        &fixed_key(),
+        &mut conn,
+    )
+    .await
+    .unwrap();
+
+    let user = User::new("alice".into(), "Alice".into(), None);
+    user.save(&mut conn).await.unwrap();
+    authere_server::provisioning::enqueue(
+        &user,
+        UserLifecycleEvent::Created,
+        "http://origin",
+        &mut conn,
+    )
+    .await
+    .unwrap();
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        + 1000;
+    let job = jobs::claim_batch(now, 10, &mut conn)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+
+    // Simulate what the worker does: apply mapping before handing to the adapter.
+    let raw_body = jobs::decode_payload(&job.payload);
+    let mapped =
+        authere_server::provisioning::mapping::apply_map(target.attribute_map.as_deref(), raw_body);
+    assert_eq!(mapped["username"], "alice");
+    assert!(mapped.get("userName").is_none());
+
+    let http = reqwest::Client::builder().build().unwrap();
+    let adapter = GenericScimAdapter::new(http);
+    let outcome = adapter.dispatch(&target, "tok", &job, mapped).await;
+    assert!(
+        matches!(
+            outcome,
+            AdapterOutcome::Success {
+                external_id: Some(ref id)
+            } if id == "mapped-1"
+        ),
+        "wiremock body matcher required the rename to have applied: {outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn attribute_map_absent_leaves_body_unchanged() {
+    use wiremock::matchers::body_partial_json;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/Users"))
+        .and(body_partial_json(serde_json::json!({ "userName": "bob" })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+            "id": "bob-1"
+        })))
+        .mount(&server)
+        .await;
+
+    let pool = pool().await;
+    let mut conn = pool.acquire().await.unwrap();
+    let target = authere_server::provisioning::targets::create(
+        "no-map",
+        KIND_GENERIC_SCIM,
+        &server.uri(),
+        "tok",
+        true,
+        None,
+        None,
+        &fixed_key(),
+        &mut conn,
+    )
+    .await
+    .unwrap();
+
+    let user = User::new("bob".into(), "Bob".into(), None);
+    user.save(&mut conn).await.unwrap();
+    authere_server::provisioning::enqueue(
+        &user,
+        UserLifecycleEvent::Created,
+        "http://origin",
+        &mut conn,
+    )
+    .await
+    .unwrap();
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        + 1000;
+    let job = jobs::claim_batch(now, 10, &mut conn)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+
+    let raw_body = jobs::decode_payload(&job.payload);
+    let mapped =
+        authere_server::provisioning::mapping::apply_map(target.attribute_map.as_deref(), raw_body);
+    assert_eq!(mapped["userName"], "bob");
+
+    let http = reqwest::Client::builder().build().unwrap();
+    let adapter = GenericScimAdapter::new(http);
+    let outcome = adapter.dispatch(&target, "tok", &job, mapped).await;
+    assert!(matches!(outcome, AdapterOutcome::Success { .. }));
 }
 
 #[tokio::test]

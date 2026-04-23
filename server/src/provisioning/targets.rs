@@ -38,6 +38,9 @@ pub struct ProvisioningTarget {
     /// create jobs) completed. NULL means backfill hasn't run yet — the admin API triggers
     /// it on first enable.
     pub backfill_done_at: Option<i64>,
+    /// Optional JSON object of `{"from": "to"}` strings. When present, the worker rewrites
+    /// top-level SCIM body keys per this map before dispatch. `None` = identity.
+    pub attribute_map: Option<String>,
 }
 
 fn now_epoch() -> i64 {
@@ -63,12 +66,59 @@ pub fn parse_master_key(hex_key: &str) -> Result<[u8; KEY_LEN], AppError> {
     Ok(out)
 }
 
-/// Decode the hex-encoded master key out of the `AUTHERE_PROVISIONING_KEY` env var. Returns
-/// an error on missing / malformed input — callers treat this as fatal.
+/// Read a hex-encoded master key from a file on disk. Fails if the file isn't readable or
+/// if (on Unix) the file is world- or group-readable. This gives operators an alternative
+/// to stuffing the key into the process env, where it's visible to anyone who can read
+/// /proc/<pid>/environ.
+pub fn load_master_key_from_file(path: &std::path::Path) -> Result<[u8; KEY_LEN], AppError> {
+    check_key_file_perms(path)?;
+    let contents = std::fs::read_to_string(path).map_err(|e| {
+        AppError::InternalError(format!(
+            "failed to read AUTHERE_PROVISIONING_KEY_FILE ({}): {e}",
+            path.display()
+        ))
+    })?;
+    parse_master_key(&contents)
+}
+
+/// On Unix, refuse to load a key file that's readable by anyone other than the owner.
+/// On non-Unix platforms this is a no-op — the caller inherits whatever ACLs the OS enforces.
+fn check_key_file_perms(path: &std::path::Path) -> Result<(), AppError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::metadata(path).map_err(|e| {
+            AppError::InternalError(format!("cannot stat {}: {e}", path.display()))
+        })?;
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(AppError::InternalError(format!(
+                "AUTHERE_PROVISIONING_KEY_FILE {} has mode {:o}; must be 0600 or stricter (not group/world readable)",
+                path.display(),
+                mode
+            )));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+/// Resolve the master key from the first configured source:
+///   1. `AUTHERE_PROVISIONING_KEY_FILE` (preferred in production — key stays off the env)
+///   2. `AUTHERE_PROVISIONING_KEY` (inline hex, simplest for dev)
+///
+/// Returns an error if neither is set or the chosen source can't be parsed.
 pub fn load_master_key() -> Result<[u8; KEY_LEN], AppError> {
+    if let Ok(path) = std::env::var("AUTHERE_PROVISIONING_KEY_FILE") {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            return load_master_key_from_file(std::path::Path::new(trimmed));
+        }
+    }
     let hex_key = std::env::var("AUTHERE_PROVISIONING_KEY").map_err(|_| {
         AppError::InternalError(
-            "AUTHERE_PROVISIONING_KEY is not set — outbound provisioning is disabled".into(),
+            "neither AUTHERE_PROVISIONING_KEY_FILE nor AUTHERE_PROVISIONING_KEY is set — outbound provisioning is disabled".into(),
         )
     })?;
     parse_master_key(&hex_key)
@@ -110,6 +160,7 @@ pub fn decrypt_token(
 
 /// Create a new target. The plaintext token is encrypted on the way in; the caller never
 /// sees the stored bytes.
+#[allow(clippy::too_many_arguments)]
 pub async fn create(
     name: &str,
     kind: &str,
@@ -117,6 +168,7 @@ pub async fn create(
     auth_token: &str,
     enabled: bool,
     created_by: Option<Uuid>,
+    attribute_map: Option<&str>,
     key: &[u8; KEY_LEN],
     conn: &mut SqliteConnection,
 ) -> Result<ProvisioningTarget, AppError> {
@@ -128,9 +180,10 @@ pub async fn create(
     sqlx::query!(
         r#"INSERT INTO provisioning_targets
             (id, name, kind, base_url, auth_token_ciphertext, auth_token_nonce,
-             enabled, created_at, created_by, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
-        id, name, kind, base_url, ct, nonce, enabled_int, now, created_by, now
+             enabled, created_at, created_by, updated_at, attribute_map)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+        id, name, kind, base_url, ct, nonce, enabled_int, now, created_by, now,
+        attribute_map
     )
     .execute(conn)
     .await?;
@@ -147,6 +200,7 @@ pub async fn create(
         created_by,
         updated_at: now,
         backfill_done_at: None,
+        attribute_map: attribute_map.map(String::from),
     })
 }
 
@@ -156,7 +210,7 @@ pub async fn get(id: Uuid, conn: &mut SqliteConnection) -> Result<Option<Provisi
                   auth_token_ciphertext, auth_token_nonce,
                   enabled as "enabled!: bool",
                   created_at, created_by as "created_by: Uuid", updated_at,
-                  backfill_done_at
+                  backfill_done_at, attribute_map
            FROM provisioning_targets WHERE id = ?"#,
         id
     )
@@ -174,6 +228,7 @@ pub async fn get(id: Uuid, conn: &mut SqliteConnection) -> Result<Option<Provisi
         created_by: r.created_by,
         updated_at: r.updated_at,
         backfill_done_at: r.backfill_done_at,
+        attribute_map: r.attribute_map,
     }))
 }
 
@@ -183,7 +238,7 @@ pub async fn list(conn: &mut SqliteConnection) -> Result<Vec<ProvisioningTarget>
                   auth_token_ciphertext, auth_token_nonce,
                   enabled as "enabled!: bool",
                   created_at, created_by as "created_by: Uuid", updated_at,
-                  backfill_done_at
+                  backfill_done_at, attribute_map
            FROM provisioning_targets ORDER BY created_at DESC"#
     )
     .fetch_all(conn)
@@ -202,6 +257,7 @@ pub async fn list(conn: &mut SqliteConnection) -> Result<Vec<ProvisioningTarget>
             created_by: r.created_by,
             updated_at: r.updated_at,
             backfill_done_at: r.backfill_done_at,
+            attribute_map: r.attribute_map,
         })
         .collect())
 }
@@ -226,7 +282,8 @@ pub async fn list_enabled(conn: &mut SqliteConnection) -> Result<Vec<Provisionin
 }
 
 /// Partial update. Any `Some` field is written; `None` means "leave alone". `new_auth_token`
-/// re-encrypts with a fresh nonce when supplied.
+/// re-encrypts with a fresh nonce when supplied. `new_attribute_map` accepts `Some(Some(_))`
+/// to set, `Some(None)` to clear, and `None` to leave unchanged.
 #[allow(clippy::too_many_arguments)]
 pub async fn update(
     id: Uuid,
@@ -234,6 +291,7 @@ pub async fn update(
     new_base_url: Option<&str>,
     new_enabled: Option<bool>,
     new_auth_token: Option<&str>,
+    new_attribute_map: Option<Option<&str>>,
     key: &[u8; KEY_LEN],
     conn: &mut SqliteConnection,
 ) -> Result<bool, AppError> {
@@ -254,6 +312,9 @@ pub async fn update(
         existing.auth_token_ciphertext = ct;
         existing.auth_token_nonce = nonce;
     }
+    if let Some(am) = new_attribute_map {
+        existing.attribute_map = am.map(String::from);
+    }
     existing.updated_at = now_epoch();
     let enabled_int = if existing.enabled { 1i64 } else { 0i64 };
 
@@ -261,13 +322,14 @@ pub async fn update(
         r#"UPDATE provisioning_targets
               SET name = ?, base_url = ?, enabled = ?,
                   auth_token_ciphertext = ?, auth_token_nonce = ?,
-                  updated_at = ?
+                  attribute_map = ?, updated_at = ?
             WHERE id = ?"#,
         existing.name,
         existing.base_url,
         enabled_int,
         existing.auth_token_ciphertext,
         existing.auth_token_nonce,
+        existing.attribute_map,
         existing.updated_at,
         id
     )
@@ -358,5 +420,50 @@ mod tests {
         let hex = format!("  {}  ", "a".repeat(KEY_LEN * 2));
         let k = parse_master_key(&hex).unwrap();
         assert_eq!(k, [0xaa; KEY_LEN]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_master_key_from_file_rejects_world_readable() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("provisioning-key-{}.hex", Uuid::now_v7()));
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "{}", "a".repeat(KEY_LEN * 2)).unwrap();
+        drop(f);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let err = load_master_key_from_file(&path).expect_err("must reject loose perms");
+        match err {
+            AppError::InternalError(msg) => assert!(msg.contains("0600"), "msg was: {msg}"),
+            other => panic!("wrong error variant: {other:?}"),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_master_key_from_file_reads_strict_perms() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("provisioning-key-{}.hex", Uuid::now_v7()));
+        let mut f = std::fs::File::create(&path).unwrap();
+        write!(f, "{}", "a".repeat(KEY_LEN * 2)).unwrap();
+        drop(f);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let key = load_master_key_from_file(&path).unwrap();
+        assert_eq!(key, [0xaa; KEY_LEN]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_master_key_from_file_fails_on_missing_file() {
+        let bogus = std::path::PathBuf::from("/definitely/not/a/real/path.hex");
+        assert!(load_master_key_from_file(&bogus).is_err());
     }
 }
