@@ -5,6 +5,7 @@ use uuid::Uuid;
 
 use crate::AppState;
 use crate::app_passwords::{AppPassword, CreateAppPasswordInput, CreateAppPasswordResponse};
+use crate::audit::{audit, AuditContext, AuditEventType};
 use crate::auth_middleware::{AdminUser, AuthUser};
 use crate::errors::AppError;
 use crate::settings::load_ldap_config;
@@ -43,6 +44,7 @@ pub async fn list_my_app_passwords(
 )]
 pub async fn create_my_app_password(
     State(state): State<AppState>,
+    audit_ctx: AuditContext,
     auth: AuthUser,
     axum::extract::Json(input): axum::extract::Json<CreateAppPasswordInput>,
 ) -> Result<(StatusCode, axum::Json<CreateAppPasswordResponse>), AppError> {
@@ -57,6 +59,12 @@ pub async fn create_my_app_password(
 
     let (record, cleartext) = AppPassword::create(auth.user_id, &input.name, &mut conn).await?;
     info!(user_id = %auth.user_id, app_password_id = %record.id, "app password created");
+    let _ = audit(AuditEventType::AppPasswordCreated)
+        .user(auth.user_id)
+        .ctx(&audit_ctx)
+        .details(serde_json::json!({ "app_password_id": record.id, "name": record.name }))
+        .save(&mut conn)
+        .await;
     Ok((
         StatusCode::CREATED,
         axum::Json(CreateAppPasswordResponse {
@@ -79,6 +87,7 @@ pub async fn create_my_app_password(
 )]
 pub async fn delete_my_app_password(
     State(state): State<AppState>,
+    audit_ctx: AuditContext,
     auth: AuthUser,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
@@ -88,6 +97,12 @@ pub async fn delete_my_app_password(
         return Err(AppError::NotFound);
     }
     info!(user_id = %auth.user_id, app_password_id = %id, "app password deleted");
+    let _ = audit(AuditEventType::AppPasswordDeleted)
+        .user(auth.user_id)
+        .ctx(&audit_ctx)
+        .details(serde_json::json!({ "app_password_id": id }))
+        .save(&mut conn)
+        .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -129,6 +144,7 @@ pub async fn admin_list_app_passwords(
 )]
 pub async fn admin_delete_app_password(
     State(state): State<AppState>,
+    audit_ctx: AuditContext,
     admin: AdminUser,
     Path((user_id, id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, AppError> {
@@ -143,5 +159,12 @@ pub async fn admin_delete_app_password(
         app_password_id = %id,
         "admin revoked app password"
     );
+    let _ = audit(AuditEventType::AdminAppPasswordDeleted)
+        .user(user_id)
+        .actor(admin.0.user_id)
+        .ctx(&audit_ctx)
+        .details(serde_json::json!({ "app_password_id": id }))
+        .save(&mut conn)
+        .await;
     Ok(StatusCode::NO_CONTENT)
 }

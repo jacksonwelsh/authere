@@ -6,7 +6,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::AppState;
-use crate::audit::{AuditContext, log_admin_role_assigned, log_admin_role_removed};
+use crate::audit::{audit, AuditContext, AuditEventType};
 use crate::auth_middleware::AdminUser;
 use crate::db::DbEntity;
 use crate::errors::AppError;
@@ -70,7 +70,8 @@ pub async fn list_roles(
 )]
 pub async fn create_role(
     State(state): State<AppState>,
-    _admin: AdminUser,
+    audit_ctx: AuditContext,
+    admin: AdminUser,
     extract::Json(input): extract::Json<CreateRoleInput>,
 ) -> Result<(StatusCode, axum::Json<Role>), AppError> {
     Role::validate_input(&input)?;
@@ -79,7 +80,13 @@ pub async fn create_role(
     let mut conn = state.db_pool.acquire().await?;
     role.save(&mut conn).await?;
 
-    info!(role_id = %role.id, role_name = %role.name, "role created");
+    info!(role_id = %role.id, role_name = %role.name, admin = %admin.0.user_id, "role created");
+    let _ = audit(AuditEventType::RoleCreated)
+        .actor(admin.0.user_id)
+        .ctx(&audit_ctx)
+        .details(serde_json::json!({ "role_id": role.id, "role_name": role.name }))
+        .save(&mut conn)
+        .await;
 
     Ok((StatusCode::CREATED, axum::Json(role)))
 }
@@ -102,14 +109,22 @@ pub async fn create_role(
 )]
 pub async fn delete_role(
     State(state): State<AppState>,
-    _admin: AdminUser,
+    audit_ctx: AuditContext,
+    admin: AdminUser,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
     let mut conn = state.db_pool.acquire().await?;
 
+    let role_name = Role::get(id, &mut conn).await?.map(|r| r.name);
     let deleted = Role::delete(id, &mut conn).await?;
     if deleted {
-        info!(role_id = %id, "role deleted");
+        info!(role_id = %id, admin = %admin.0.user_id, "role deleted");
+        let _ = audit(AuditEventType::RoleDeleted)
+            .actor(admin.0.user_id)
+            .ctx(&audit_ctx)
+            .details(serde_json::json!({ "role_id": id, "role_name": role_name }))
+            .save(&mut conn)
+            .await;
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(AppError::NotFound)
@@ -188,7 +203,13 @@ pub async fn assign_role(
     let _ = revoke_user_access_tokens(user_id, &mut conn).await;
 
     info!(user_id = %user_id, role = %role.name, admin = %admin.0.user_id, "role assigned");
-    let _ = log_admin_role_assigned(user_id, admin.0.user_id, input.role_id, &role.name, &audit_ctx, &mut conn).await;
+    let _ = audit(AuditEventType::AdminRoleAssigned)
+        .user(user_id)
+        .actor(admin.0.user_id)
+        .ctx(&audit_ctx)
+        .details(serde_json::json!({ "role_id": input.role_id, "role_name": role.name }))
+        .save(&mut conn)
+        .await;
     Ok(StatusCode::CREATED)
 }
 
@@ -238,7 +259,13 @@ pub async fn remove_role(
     if removed {
         let _ = revoke_user_access_tokens(user_id, &mut conn).await;
         info!(user_id = %user_id, role_id = %role_id, admin = %admin.0.user_id, "role removed");
-        let _ = log_admin_role_removed(user_id, admin.0.user_id, role_id, &audit_ctx, &mut conn).await;
+        let _ = audit(AuditEventType::AdminRoleRemoved)
+            .user(user_id)
+            .actor(admin.0.user_id)
+            .ctx(&audit_ctx)
+            .details(serde_json::json!({ "role_id": role_id }))
+            .save(&mut conn)
+            .await;
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(AppError::NotFound)

@@ -6,7 +6,7 @@ use tracing::{info, warn};
 use utoipa::ToSchema;
 
 use crate::AppState;
-use crate::audit::{AuditContext, log_invitation_consumed, log_user_registered};
+use crate::audit::{audit, AuditContext, AuditEventType};
 use crate::db::DbEntity;
 use crate::errors::AppError;
 use crate::handlers::{RegisterError, build_auth_cookie, build_refresh_cookie};
@@ -126,9 +126,23 @@ pub async fn register(
     info!(user_id = %user.id, username = %user.username, invite = consumed_invite.is_some(), "user registered");
 
     let invite_id = consumed_invite.as_ref().map(|i| i.id.as_str());
-    let _ = log_user_registered(user.id, invite_id, &audit_ctx, &mut conn).await;
+    let register_details = match invite_id {
+        Some(id) => serde_json::json!({ "invite_used": true, "invite_id": id }),
+        None => serde_json::json!({ "invite_used": false }),
+    };
+    let _ = audit(AuditEventType::UserRegistered)
+        .user(user.id)
+        .ctx(&audit_ctx)
+        .details(register_details)
+        .save(&mut conn)
+        .await;
     if let Some(invite) = &consumed_invite {
-        let _ = log_invitation_consumed(user.id, &invite.id, &audit_ctx, &mut conn).await;
+        let _ = audit(AuditEventType::InvitationConsumed)
+            .user(user.id)
+            .ctx(&audit_ctx)
+            .details(serde_json::json!({ "invite_id": invite.id }))
+            .save(&mut conn)
+            .await;
     }
 
     let token_pair = generate_token_pair(user.id, vec![ROLE_USER.to_string()], &state.signing_key, &mut conn).await?;

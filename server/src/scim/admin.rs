@@ -10,7 +10,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::AppState;
-use crate::audit::{AuditContext, log_scim_token_created, log_scim_token_revoked};
+use crate::audit::{audit, AuditContext, AuditEventType};
 use crate::auth_middleware::AdminUser;
 use crate::errors::AppError;
 use crate::scim::token::{self, ScimTokenRecord};
@@ -80,7 +80,7 @@ fn validate_name(name: &str) -> Result<(), AppError> {
 )]
 pub async fn create_scim_token(
     State(state): State<AppState>,
-    audit: AuditContext,
+    audit_ctx: AuditContext,
     admin: AdminUser,
     Json(input): Json<CreateScimTokenInput>,
 ) -> Result<(StatusCode, Json<CreateScimTokenResponse>), AppError> {
@@ -89,14 +89,15 @@ pub async fn create_scim_token(
     let mut conn = state.db_pool.acquire().await?;
     let minted = token::mint(input.name.trim(), admin.0.user_id, &mut conn).await?;
 
-    let _ = log_scim_token_created(
-        minted.id,
-        &minted.name,
-        admin.0.user_id,
-        &audit,
-        &mut conn,
-    )
-    .await;
+    let _ = audit(AuditEventType::ScimTokenCreated)
+        .actor(admin.0.user_id)
+        .ctx(&audit_ctx)
+        .details(serde_json::json!({
+            "scim_token_id": minted.id,
+            "scim_token_name": minted.name,
+        }))
+        .save(&mut conn)
+        .await;
 
     Ok((
         StatusCode::CREATED,
@@ -142,7 +143,7 @@ pub async fn list_scim_tokens(
 )]
 pub async fn revoke_scim_token(
     State(state): State<AppState>,
-    audit: AuditContext,
+    audit_ctx: AuditContext,
     admin: AdminUser,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
@@ -154,14 +155,15 @@ pub async fn revoke_scim_token(
     }
     let did = token::revoke(id, &mut conn).await?;
     if did {
-        let _ = log_scim_token_revoked(
-            existing.id,
-            &existing.name,
-            admin.0.user_id,
-            &audit,
-            &mut conn,
-        )
-        .await;
+        let _ = audit(AuditEventType::ScimTokenRevoked)
+            .actor(admin.0.user_id)
+            .ctx(&audit_ctx)
+            .details(serde_json::json!({
+                "scim_token_id": existing.id,
+                "scim_token_name": existing.name,
+            }))
+            .save(&mut conn)
+            .await;
     }
     Ok(StatusCode::NO_CONTENT)
 }

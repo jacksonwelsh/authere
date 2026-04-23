@@ -258,6 +258,8 @@ async fn run() -> Result<bool, AppError> {
         .routes(routes!(user::change_my_password))
         .routes(routes!(user::admin_change_user_password))
         .routes(routes!(admin::get_audit_log))
+        .routes(routes!(admin::get_audit_event_types))
+        .routes(routes!(admin::export_audit_log))
         // Admin settings
         .routes(routes!(admin::get_settings, admin::update_settings))
         .routes(routes!(admin::regenerate_ldap_bind_password))

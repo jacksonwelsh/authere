@@ -5,6 +5,7 @@ use uuid::Uuid;
 
 use crate::AppState;
 use crate::application::{Application, CreateApplicationInput, UpdateApplicationInput};
+use crate::audit::{audit, AuditContext, AuditEventType};
 use crate::auth_middleware::AdminUser;
 use crate::db::DbEntity;
 use crate::errors::AppError;
@@ -47,7 +48,8 @@ pub async fn list_applications(
 )]
 pub async fn create_application(
     State(state): State<AppState>,
-    _admin: AdminUser,
+    audit_ctx: AuditContext,
+    admin: AdminUser,
     extract::Json(input): extract::Json<CreateApplicationInput>,
 ) -> Result<(StatusCode, axum::Json<Application>), AppError> {
     Application::validate_input(&input)?;
@@ -57,6 +59,16 @@ pub async fn create_application(
     app.save(&mut conn).await?;
 
     info!(app_id = %app.id, app_name = %app.name, slug = %app.slug, "application created");
+    let _ = audit(AuditEventType::ApplicationCreated)
+        .actor(admin.0.user_id)
+        .ctx(&audit_ctx)
+        .details(serde_json::json!({
+            "application_id": app.id,
+            "name": app.name,
+            "slug": app.slug,
+        }))
+        .save(&mut conn)
+        .await;
 
     Ok((StatusCode::CREATED, axum::Json(app)))
 }
@@ -109,7 +121,8 @@ pub async fn get_application(
 )]
 pub async fn update_application(
     State(state): State<AppState>,
-    _admin: AdminUser,
+    audit_ctx: AuditContext,
+    admin: AdminUser,
     Path(id): Path<Uuid>,
     extract::Json(input): extract::Json<UpdateApplicationInput>,
 ) -> Result<axum::Json<Application>, AppError> {
@@ -120,6 +133,16 @@ pub async fn update_application(
 
     app.update(input, &mut conn).await?;
     info!(app_id = %id, app_name = %app.name, "application updated");
+    let _ = audit(AuditEventType::ApplicationUpdated)
+        .actor(admin.0.user_id)
+        .ctx(&audit_ctx)
+        .details(serde_json::json!({
+            "application_id": app.id,
+            "name": app.name,
+            "slug": app.slug,
+        }))
+        .save(&mut conn)
+        .await;
     Ok(axum::Json(app))
 }
 
@@ -140,14 +163,30 @@ pub async fn update_application(
 )]
 pub async fn delete_application(
     State(state): State<AppState>,
-    _admin: AdminUser,
+    audit_ctx: AuditContext,
+    admin: AdminUser,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
     let mut conn = state.db_pool.acquire().await?;
 
+    let existing = Application::get(id, &mut conn).await?;
     let deleted = Application::delete(id, &mut conn).await?;
     if deleted {
         info!(app_id = %id, "application deleted");
+        let details = match existing {
+            Some(app) => serde_json::json!({
+                "application_id": id,
+                "name": app.name,
+                "slug": app.slug,
+            }),
+            None => serde_json::json!({ "application_id": id }),
+        };
+        let _ = audit(AuditEventType::ApplicationDeleted)
+            .actor(admin.0.user_id)
+            .ctx(&audit_ctx)
+            .details(details)
+            .save(&mut conn)
+            .await;
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(AppError::NotFound)

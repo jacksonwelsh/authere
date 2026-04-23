@@ -11,10 +11,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::AppState;
-use crate::audit::{
-    log_scim_user_created, log_scim_user_deactivated, log_scim_user_deleted,
-    log_scim_user_reactivated, log_scim_user_updated,
-};
+use crate::audit::{audit, scim_details, AuditEventType};
 use crate::db::DbEntity;
 use crate::errors::AppError;
 use crate::provisioning::{self, event::UserLifecycleEvent};
@@ -450,14 +447,12 @@ pub async fn create_user(
     state.provisioning_notifier.notify_one();
 
     let mut conn = state.db_pool.acquire().await.map_err(AppError::from)?;
-    let _ = log_scim_user_created(
-        user.id,
-        auth.token.id,
-        &auth.token.name,
-        &auth.audit,
-        &mut conn,
-    )
-    .await;
+    let _ = audit(AuditEventType::ScimUserCreated)
+        .user(user.id)
+        .ctx(&auth.audit)
+        .details(scim_details(auth.token.id, &auth.token.name, None))
+        .save(&mut conn)
+        .await;
 
     let loc = location_header(&state, user.id)?;
     let etag = HeaderValue::from_str(&weak_etag(user.updated_at))
@@ -541,39 +536,17 @@ async fn audit_transition(
     transition: ActiveTransition,
     conn: &mut sqlx::SqliteConnection,
 ) {
-    match transition {
-        ActiveTransition::Unchanged => {
-            let _ = log_scim_user_updated(
-                user_id,
-                auth.token.id,
-                &auth.token.name,
-                None,
-                &auth.audit,
-                conn,
-            )
-            .await;
-        }
-        ActiveTransition::Deactivated => {
-            let _ = log_scim_user_deactivated(
-                user_id,
-                auth.token.id,
-                &auth.token.name,
-                &auth.audit,
-                conn,
-            )
-            .await;
-        }
-        ActiveTransition::Reactivated => {
-            let _ = log_scim_user_reactivated(
-                user_id,
-                auth.token.id,
-                &auth.token.name,
-                &auth.audit,
-                conn,
-            )
-            .await;
-        }
-    }
+    let event = match transition {
+        ActiveTransition::Unchanged => AuditEventType::ScimUserUpdated,
+        ActiveTransition::Deactivated => AuditEventType::ScimUserDeactivated,
+        ActiveTransition::Reactivated => AuditEventType::ScimUserReactivated,
+    };
+    let _ = audit(event)
+        .user(user_id)
+        .ctx(&auth.audit)
+        .details(scim_details(auth.token.id, &auth.token.name, None))
+        .save(conn)
+        .await;
 }
 
 #[utoipa::path(
@@ -745,14 +718,12 @@ pub async fn delete_user(
     state.provisioning_notifier.notify_one();
 
     let mut conn = state.db_pool.acquire().await.map_err(AppError::from)?;
-    let _ = log_scim_user_deleted(
-        id,
-        auth.token.id,
-        &auth.token.name,
-        &auth.audit,
-        &mut conn,
-    )
-    .await;
+    let _ = audit(AuditEventType::ScimUserDeleted)
+        .user(id)
+        .ctx(&auth.audit)
+        .details(scim_details(auth.token.id, &auth.token.name, None))
+        .save(&mut conn)
+        .await;
     Ok(StatusCode::NO_CONTENT)
 }
 

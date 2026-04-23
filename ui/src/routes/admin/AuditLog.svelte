@@ -1,43 +1,111 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { getAuditLog, type AuditEntry } from '../../lib/api';
+  import {
+    downloadAuditExport,
+    getAuditEventTypes,
+    getAuditLog,
+    type AuditEntry,
+    type AuditLogQuery,
+  } from '../../lib/api';
   import Button from '../../lib/components/Button.svelte';
   import Badge from '../../lib/components/Badge.svelte';
   import CopyId from '../../lib/components/CopyId.svelte';
+  import Input from '../../lib/components/Input.svelte';
   import Modal from '../../lib/components/Modal.svelte';
   import { toasts } from '../../lib/toast.svelte';
 
+  const PAGE_SIZE = 50;
+
   let entries = $state<AuditEntry[]>([]);
+  let total = $state(0);
+  let page = $state(0); // 0-indexed
   let loading = $state(true);
-  let loadingMore = $state(false);
-  let hasMore = $state(true);
   let selected = $state<AuditEntry | null>(null);
-  const PAGE = 50;
+
+  // Filter inputs — bound to controls, applied on "Apply". Kept separate from
+  // the active filters so typing in a field doesn't hammer the API.
+  let eventTypes = $state<string[]>([]);
+  let filterEventType = $state<string>('');
+  let filterActor = $state<string>('');
+  let filterUser = $state<string>('');
+  let filterSince = $state<string>(''); // datetime-local "YYYY-MM-DDTHH:MM"
+  let filterUntil = $state<string>('');
+
+  // Active filters currently applied to the query. Diverges from the inputs
+  // between typing and clicking "Apply".
+  let active = $state<AuditLogQuery>({});
+
+  const totalPages = $derived(Math.max(1, Math.ceil(total / PAGE_SIZE)));
 
   onMount(async () => {
-    await load(0, true);
+    try {
+      eventTypes = await getAuditEventTypes();
+    } catch {
+      // Non-fatal; filter dropdown just shows empty.
+    }
+    await load();
   });
 
-  async function load(offset: number, reset = false) {
+  async function load() {
+    loading = true;
     try {
-      if (offset === 0) loading = true; else loadingMore = true;
-      const data = await getAuditLog({ limit: PAGE, offset });
-      if (reset) {
-        entries = data;
-      } else {
-        entries = [...entries, ...data];
-      }
-      hasMore = data.length === PAGE;
+      const resp = await getAuditLog({
+        ...active,
+        limit: PAGE_SIZE,
+        offset: page * PAGE_SIZE,
+      });
+      entries = resp.entries;
+      total = resp.total;
     } catch {
       toasts.error('Failed to load audit log.');
     } finally {
       loading = false;
-      loadingMore = false;
     }
   }
 
-  function loadMore() {
-    load(entries.length);
+  /**
+   * Convert a local datetime-local string ("YYYY-MM-DDTHH:MM") to unix seconds,
+   * or return undefined for empty input. Uses local timezone (the user is
+   * filtering from their admin console, so local time is the expected input).
+   */
+  function localDatetimeToUnix(s: string): number | undefined {
+    if (!s) return undefined;
+    const ms = new Date(s).getTime();
+    if (Number.isNaN(ms)) return undefined;
+    return Math.floor(ms / 1000);
+  }
+
+  function applyFilters() {
+    active = {
+      event_type: filterEventType ? [filterEventType] : undefined,
+      actor_id: filterActor.trim() || undefined,
+      user_id: filterUser.trim() || undefined,
+      since: localDatetimeToUnix(filterSince),
+      until: localDatetimeToUnix(filterUntil),
+    };
+    page = 0;
+    load();
+  }
+
+  function clearFilters() {
+    filterEventType = '';
+    filterActor = '';
+    filterUser = '';
+    filterSince = '';
+    filterUntil = '';
+    active = {};
+    page = 0;
+    load();
+  }
+
+  function goToPage(p: number) {
+    if (p < 0 || p >= totalPages) return;
+    page = p;
+    load();
+  }
+
+  function exportAs(format: 'json' | 'csv') {
+    downloadAuditExport(format, active);
   }
 
   function formatTime(ts: number) {
@@ -45,8 +113,8 @@
   }
 
   function eventVariant(type: string): 'success' | 'danger' | 'warning' | 'default' {
-    if (type.includes('success') || type === 'user_created') return 'success';
-    if (type.includes('fail') || type.includes('denied')) return 'danger';
+    if (type.includes('success') || type === 'user_created' || type === 'user_registered') return 'success';
+    if (type.includes('fail') || type.includes('denied') || type.includes('rejected')) return 'danger';
     if (type.startsWith('admin_')) return 'warning';
     return 'default';
   }
@@ -74,18 +142,93 @@
     if (entry.user_id) return { label: entry.user_id.slice(-12), id: entry.user_id };
     return { label: '—' };
   }
+
+  /**
+   * Render a compact page window: always first + last, up to 5 around the
+   * current page, with gap markers when there's a jump.
+   */
+  function pageWindow(current: number, last: number): (number | '…')[] {
+    if (last <= 7) return Array.from({ length: last + 1 }, (_, i) => i);
+    const pages = new Set<number>([0, last, current, current - 1, current + 1, current - 2, current + 2]);
+    const sorted = [...pages].filter((p) => p >= 0 && p <= last).sort((a, b) => a - b);
+    const out: (number | '…')[] = [];
+    let prev = -1;
+    for (const p of sorted) {
+      if (prev >= 0 && p - prev > 1) out.push('…');
+      out.push(p);
+      prev = p;
+    }
+    return out;
+  }
 </script>
 
 <div class="page">
   <header class="page-header">
     <div>
       <h1 class="au-h3">Audit log</h1>
-      <p class="au-micro au-fg-3">Append-only security event feed</p>
+      <p class="au-micro au-fg-3">Append-only security event feed · {total.toLocaleString()} events</p>
     </div>
-    <Button variant="secondary" onclick={() => load(0, true)}>
-      <i class="ph ph-arrow-clockwise"></i> Refresh
-    </Button>
+    <div class="header-actions">
+      <Button variant="secondary" onclick={() => exportAs('csv')} disabled={total === 0}>
+        <i class="ph ph-download-simple"></i> CSV
+      </Button>
+      <Button variant="secondary" onclick={() => exportAs('json')} disabled={total === 0}>
+        <i class="ph ph-download-simple"></i> JSON
+      </Button>
+      <Button variant="secondary" onclick={() => load()}>
+        <i class="ph ph-arrow-clockwise"></i> Refresh
+      </Button>
+    </div>
   </header>
+
+  <div class="filters">
+    <div class="field">
+      <label class="field-label au-nano" for="filter-event-type">Event type</label>
+      <select
+        id="filter-event-type"
+        class="au-input"
+        value={filterEventType}
+        onchange={(e) => (filterEventType = (e.currentTarget as HTMLSelectElement).value)}
+      >
+        <option value="">All events</option>
+        {#each eventTypes as t (t)}
+          <option value={t}>{t}</option>
+        {/each}
+      </select>
+    </div>
+    <div class="filter-input">
+      <Input
+        label="Actor ID"
+        placeholder="UUID of acting admin"
+        bind:value={filterActor}
+      />
+    </div>
+    <div class="filter-input">
+      <Input
+        label="User ID"
+        placeholder="UUID of target user"
+        bind:value={filterUser}
+      />
+    </div>
+    <div class="filter-input">
+      <Input
+        label="From"
+        type="datetime-local"
+        bind:value={filterSince}
+      />
+    </div>
+    <div class="filter-input">
+      <Input
+        label="To"
+        type="datetime-local"
+        bind:value={filterUntil}
+      />
+    </div>
+    <div class="filter-actions">
+      <Button onclick={applyFilters}>Apply</Button>
+      <Button variant="secondary" onclick={clearFilters}>Clear</Button>
+    </div>
+  </div>
 
   {#if loading}
     <div class="page-loading au-fg-4 au-small">
@@ -131,18 +274,48 @@
             </tr>
           {/each}
           {#if entries.length === 0}
-            <tr><td colspan="5" class="empty-row au-fg-4 au-small">No events recorded yet.</td></tr>
+            <tr><td colspan="5" class="empty-row au-fg-4 au-small">No events match the current filters.</td></tr>
           {/if}
         </tbody>
       </table>
     </div>
 
-    {#if hasMore}
-      <div class="load-more">
-        <Button variant="secondary" loading={loadingMore} onclick={loadMore}>
-          Load more
+    {#if totalPages > 1}
+      <nav class="pager" aria-label="Pagination">
+        <Button
+          variant="secondary"
+          disabled={page === 0}
+          onclick={() => goToPage(page - 1)}
+        >
+          <i class="ph ph-caret-left"></i> Prev
         </Button>
-      </div>
+        <ol class="pages">
+          {#each pageWindow(page, totalPages - 1) as token, i (i)}
+            {#if token === '…'}
+              <li class="gap au-fg-4">…</li>
+            {:else}
+              <li>
+                <button
+                  type="button"
+                  class="page-btn"
+                  class:active={token === page}
+                  onclick={() => goToPage(token)}
+                  aria-current={token === page ? 'page' : undefined}
+                >
+                  {token + 1}
+                </button>
+              </li>
+            {/if}
+          {/each}
+        </ol>
+        <Button
+          variant="secondary"
+          disabled={page >= totalPages - 1}
+          onclick={() => goToPage(page + 1)}
+        >
+          Next <i class="ph ph-caret-right"></i>
+        </Button>
+      </nav>
     {/if}
   {/if}
 </div>
@@ -199,9 +372,45 @@
 {/if}
 
 <style>
-  .page { padding: var(--sp-6); max-width: 960px; margin: 0 auto; }
-  .page-header { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: var(--sp-6); }
+  .page { padding: var(--sp-6); max-width: 1120px; margin: 0 auto; }
+  .page-header { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: var(--sp-6); gap: var(--sp-3); }
+  .header-actions { display: flex; gap: var(--sp-2); flex-wrap: wrap; }
   .page-loading { display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-8); }
+
+  .filters {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: var(--sp-3);
+    padding: var(--sp-3);
+    margin-bottom: var(--sp-4);
+    border: 1px solid var(--border-0);
+    border-radius: var(--radius);
+    background: var(--bg-1);
+    align-items: end;
+  }
+  .filter-input, .field { min-width: 0; }
+  .field { display: flex; flex-direction: column; gap: var(--sp-1); }
+  .field-label { color: var(--fg-3); letter-spacing: 0.06em; }
+  .au-input {
+    height: 40px;
+    padding: 0 var(--sp-3);
+    background: var(--bg-2);
+    border: 1px solid var(--border-1);
+    border-radius: var(--radius);
+    color: var(--fg-1);
+    font-family: inherit;
+    font-size: 16px;
+    outline: none;
+    transition: border-color var(--duration-micro) var(--ease-out);
+    width: 100%;
+  }
+  @media (min-width: 640px) {
+    .au-input { height: 32px; font-size: 13px; }
+  }
+  .au-input:hover:not(:disabled) { border-color: var(--border-2); }
+  .au-input:focus { border-color: var(--border-focus); box-shadow: 0 0 0 2px var(--accent-subtle) inset; }
+  .filter-actions { display: flex; gap: var(--sp-2); align-items: end; }
+
   .table-wrap { border: 1px solid var(--border-0); border-radius: var(--radius); overflow-x: auto; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 700px; }
   thead th {
@@ -221,7 +430,34 @@
   .col-ip { width: 140px; }
   .ua-cell { overflow: hidden; text-overflow: ellipsis; max-width: 280px; }
   .empty-row { padding: var(--sp-8) !important; text-align: center; }
-  .load-more { display: flex; justify-content: center; padding: var(--sp-4); }
+
+  .pager {
+    display: flex; align-items: center; justify-content: center;
+    gap: var(--sp-2); padding: var(--sp-4); flex-wrap: wrap;
+  }
+  .pages { display: flex; list-style: none; gap: 2px; padding: 0; margin: 0; }
+  .page-btn {
+    min-width: 32px;
+    height: 32px;
+    padding: 0 var(--sp-2);
+    background: var(--bg-2);
+    border: 1px solid var(--border-1);
+    border-radius: var(--radius);
+    color: var(--fg-2);
+    font-family: inherit;
+    font-size: 13px;
+    font-variant-numeric: tabular-nums;
+    cursor: pointer;
+    transition: border-color var(--duration-micro) var(--ease-out);
+  }
+  .page-btn:hover { border-color: var(--border-2); }
+  .page-btn.active {
+    background: var(--accent-subtle);
+    border-color: var(--border-focus);
+    color: var(--fg-1);
+  }
+  .gap { padding: 0 var(--sp-2); color: var(--fg-4); font-family: 'IBM Plex Mono', monospace; }
+
   .spin { animation: spin 0.7s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
   .ghost-label { font-style: italic; }
@@ -238,15 +474,11 @@
       gap: var(--sp-3);
       margin-bottom: var(--sp-4);
     }
+    .filters { grid-template-columns: 1fr; }
 
     /* Collapse table into a stack of cards. */
-    .table-wrap {
-      border: none;
-      overflow: visible;
-    }
-    table, thead, tbody, tr, th, td {
-      display: block;
-    }
+    .table-wrap { border: none; overflow: visible; }
+    table, thead, tbody, tr, th, td { display: block; }
     table { min-width: 0; }
     thead { display: none; }
     tbody tr {

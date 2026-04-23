@@ -78,7 +78,8 @@ impl<S: Send + Sync> FromRequestParts<S> for AuditContext {
     }
 }
 
-/// Types of audit events
+/// All audit event types. When adding a new variant, also add it to `as_str`,
+/// `from_str`, and `ALL`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuditEventType {
     LoginSuccess,
@@ -106,6 +107,7 @@ pub enum AuditEventType {
     InvitationDeleted,
     InvitationConsumed,
     SettingsUpdated,
+    SystemRestarted,
     // LDAP
     LdapBindSuccess,
     LdapBindFailed,
@@ -119,6 +121,17 @@ pub enum AuditEventType {
     ScimUserDeactivated,
     ScimUserReactivated,
     ScimUserDeleted,
+    // App passwords
+    AppPasswordCreated,
+    AppPasswordDeleted,
+    AdminAppPasswordDeleted,
+    // Application / OAuth clients
+    ApplicationCreated,
+    ApplicationUpdated,
+    ApplicationDeleted,
+    // Role definitions (separate from assignments)
+    RoleCreated,
+    RoleDeleted,
 }
 
 impl AuditEventType {
@@ -147,6 +160,7 @@ impl AuditEventType {
             AuditEventType::InvitationDeleted => "invitation_deleted",
             AuditEventType::InvitationConsumed => "invitation_consumed",
             AuditEventType::SettingsUpdated => "settings_updated",
+            AuditEventType::SystemRestarted => "system_restarted",
             AuditEventType::LdapBindSuccess => "ldap_bind_success",
             AuditEventType::LdapBindFailed => "ldap_bind_failed",
             AuditEventType::LdapBindRejectedMfaRequired => "ldap_bind_rejected_mfa_required",
@@ -158,11 +172,82 @@ impl AuditEventType {
             AuditEventType::ScimUserDeactivated => "scim_user_deactivated",
             AuditEventType::ScimUserReactivated => "scim_user_reactivated",
             AuditEventType::ScimUserDeleted => "scim_user_deleted",
+            AuditEventType::AppPasswordCreated => "app_password_created",
+            AuditEventType::AppPasswordDeleted => "app_password_deleted",
+            AuditEventType::AdminAppPasswordDeleted => "admin_app_password_deleted",
+            AuditEventType::ApplicationCreated => "application_created",
+            AuditEventType::ApplicationUpdated => "application_updated",
+            AuditEventType::ApplicationDeleted => "application_deleted",
+            AuditEventType::RoleCreated => "role_created",
+            AuditEventType::RoleDeleted => "role_deleted",
         }
     }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        Self::ALL.iter().find(|t| t.as_str() == s).copied()
+    }
+
+    /// Full list of event types, used for the `from_str` lookup and the admin UI
+    /// filter dropdown (exposed via `GET /api/audit/event-types`).
+    pub const ALL: &'static [AuditEventType] = &[
+        AuditEventType::LoginSuccess,
+        AuditEventType::LoginFailed,
+        AuditEventType::Logout,
+        AuditEventType::TokenRefresh,
+        AuditEventType::UserCreated,
+        AuditEventType::UserUpdated,
+        AuditEventType::UserDeleted,
+        AuditEventType::PasswordChanged,
+        AuditEventType::RoleAssigned,
+        AuditEventType::RoleRemoved,
+        AuditEventType::MfaEnabled,
+        AuditEventType::MfaDisabled,
+        AuditEventType::AdminCreateUser,
+        AuditEventType::AdminUpdateUser,
+        AuditEventType::AdminDeleteUser,
+        AuditEventType::AdminPasswordReset,
+        AuditEventType::AdminRoleAssigned,
+        AuditEventType::AdminRoleRemoved,
+        AuditEventType::UserRegistered,
+        AuditEventType::InvitationCreated,
+        AuditEventType::InvitationDeleted,
+        AuditEventType::InvitationConsumed,
+        AuditEventType::SettingsUpdated,
+        AuditEventType::SystemRestarted,
+        AuditEventType::LdapBindSuccess,
+        AuditEventType::LdapBindFailed,
+        AuditEventType::LdapBindRejectedMfaRequired,
+        AuditEventType::LdapBindPasswordRotated,
+        AuditEventType::ScimTokenCreated,
+        AuditEventType::ScimTokenRevoked,
+        AuditEventType::ScimUserCreated,
+        AuditEventType::ScimUserUpdated,
+        AuditEventType::ScimUserDeactivated,
+        AuditEventType::ScimUserReactivated,
+        AuditEventType::ScimUserDeleted,
+        AuditEventType::AppPasswordCreated,
+        AuditEventType::AppPasswordDeleted,
+        AuditEventType::AdminAppPasswordDeleted,
+        AuditEventType::ApplicationCreated,
+        AuditEventType::ApplicationUpdated,
+        AuditEventType::ApplicationDeleted,
+        AuditEventType::RoleCreated,
+        AuditEventType::RoleDeleted,
+    ];
 }
 
-/// Builder for creating audit log entries
+/// Builder for creating audit log entries.
+///
+/// Most producers will use the `audit()` free function, which is a shorter
+/// alias for `AuditLogEntry::new(event_type)`:
+///
+/// ```ignore
+/// let _ = audit(AuditEventType::LoginSuccess)
+///     .user(user_id)
+///     .ctx(&audit_ctx)
+///     .save(&mut conn)
+///     .await;
+/// ```
 pub struct AuditLogEntry {
     event_type: AuditEventType,
     user_id: Option<Uuid>,
@@ -190,13 +275,29 @@ impl AuditLogEntry {
         self
     }
 
-    /// The actor who performed the action (e.g., admin who changed a role)
-    pub fn actor(mut self, actor_id: Uuid) -> Self {
-        self.actor_id = Some(actor_id);
+    /// The actor who performed the action (e.g., admin who changed a role). Pass
+    /// `Option<Uuid>` and the builder will skip when `None` — convenient for
+    /// self-service flows where there may or may not be an acting admin.
+    pub fn actor<A: IntoActorId>(mut self, actor: A) -> Self {
+        if let Some(id) = actor.into_actor_id() {
+            self.actor_id = Some(id);
+        }
         self
     }
 
-    /// Client IP address
+    /// Pull IP and user-agent from an HTTP request's audit context. This is the
+    /// one-call replacement for `.ip(&ctx.ip_address).user_agent(ua)` that most
+    /// producers used to repeat.
+    pub fn ctx(mut self, ctx: &AuditContext) -> Self {
+        self.ip_address = Some(ctx.ip_address.clone());
+        if let Some(ref ua) = ctx.user_agent {
+            self.user_agent = Some(ua.clone());
+        }
+        self
+    }
+
+    /// Client IP address. Prefer `.ctx()` when called from an HTTP handler;
+    /// use `.ip()` only for non-HTTP producers like the LDAP server.
     pub fn ip(mut self, ip: impl Into<String>) -> Self {
         self.ip_address = Some(ip.into());
         self
@@ -243,10 +344,35 @@ impl AuditLogEntry {
     }
 }
 
+/// Short alias for `AuditLogEntry::new(event_type)`. Most call sites should use
+/// this; the plain builder constructor is kept for callers that need it.
+pub fn audit(event_type: AuditEventType) -> AuditLogEntry {
+    AuditLogEntry::new(event_type)
+}
+
+/// Polymorphic `.actor()` input: accepts `Uuid` or `Option<Uuid>` so handlers can
+/// pass `Option` from self-service flows without an outer `if let`.
+pub trait IntoActorId {
+    fn into_actor_id(self) -> Option<Uuid>;
+}
+
+impl IntoActorId for Uuid {
+    fn into_actor_id(self) -> Option<Uuid> {
+        Some(self)
+    }
+}
+
+impl IntoActorId for Option<Uuid> {
+    fn into_actor_id(self) -> Option<Uuid> {
+        self
+    }
+}
+
 /// Query audit logs with optional filters
 #[derive(Debug, Default)]
 pub struct AuditLogQuery {
     user_id: Option<Uuid>,
+    actor_id: Option<Uuid>,
     event_types: Option<Vec<AuditEventType>>,
     since: Option<i64>,
     until: Option<i64>,
@@ -261,6 +387,11 @@ impl AuditLogQuery {
 
     pub fn for_user(mut self, user_id: Uuid) -> Self {
         self.user_id = Some(user_id);
+        self
+    }
+
+    pub fn for_actor(mut self, actor_id: Uuid) -> Self {
+        self.actor_id = Some(actor_id);
         self
     }
 
@@ -289,7 +420,37 @@ impl AuditLogQuery {
         self
     }
 
-    pub async fn execute(self, conn: &mut SqliteConnection) -> Result<Vec<AuditLogRecord>, AppError> {
+    /// Push the shared WHERE clause on to a QueryBuilder. Used by both the
+    /// row-fetching query and the matching-count query so the two can't drift.
+    fn push_filters<'q>(&'q self, qb: &mut sqlx::QueryBuilder<'q, sqlx::Sqlite>) {
+        if let Some(uid) = self.user_id {
+            qb.push(" AND al.user_id = ").push_bind(uid);
+        }
+        if let Some(aid) = self.actor_id {
+            qb.push(" AND al.actor_id = ").push_bind(aid);
+        }
+        if let Some(ref types) = self.event_types {
+            if !types.is_empty() {
+                qb.push(" AND al.event_type IN (");
+                let mut sep = qb.separated(", ");
+                for t in types {
+                    sep.push_bind(t.as_str());
+                }
+                qb.push(")");
+            }
+        }
+        if let Some(ts) = self.since {
+            qb.push(" AND al.timestamp >= ").push_bind(ts);
+        }
+        if let Some(ts) = self.until {
+            qb.push(" AND al.timestamp <= ").push_bind(ts);
+        }
+    }
+
+    pub async fn execute(
+        &self,
+        conn: &mut SqliteConnection,
+    ) -> Result<Vec<AuditLogRecord>, AppError> {
         let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> = sqlx::QueryBuilder::new(
             "SELECT al.id, al.timestamp, al.event_type, al.user_id, al.actor_id, \
              al.ip_address, al.user_agent, al.details, \
@@ -300,16 +461,7 @@ impl AuditLogQuery {
              WHERE 1=1",
         );
 
-        if let Some(uid) = self.user_id {
-            qb.push(" AND al.user_id = ").push_bind(uid);
-        }
-        if let Some(ts) = self.since {
-            qb.push(" AND al.timestamp >= ").push_bind(ts);
-        }
-        if let Some(ts) = self.until {
-            qb.push(" AND al.timestamp <= ").push_bind(ts);
-        }
-
+        self.push_filters(&mut qb);
         qb.push(" ORDER BY al.timestamp DESC");
 
         if let Some(limit) = self.limit {
@@ -320,6 +472,15 @@ impl AuditLogQuery {
         }
 
         Ok(qb.build_query_as().fetch_all(conn).await?)
+    }
+
+    /// Count rows matching the current filters. Ignores limit/offset.
+    pub async fn count(&self, conn: &mut SqliteConnection) -> Result<i64, AppError> {
+        let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> =
+            sqlx::QueryBuilder::new("SELECT COUNT(*) FROM audit_log al WHERE 1=1");
+        self.push_filters(&mut qb);
+        let count: i64 = qb.build_query_scalar().fetch_one(conn).await?;
+        Ok(count)
     }
 }
 
@@ -355,25 +516,10 @@ pub struct AuditLogRecord {
     pub actor_username: Option<String>,
 }
 
-/// Convenience function to log a login success
-pub async fn log_login_success(
-    user_id: Uuid,
-    ctx: &AuditContext,
-    conn: &mut SqliteConnection,
-) -> Result<(), AppError> {
-    let mut entry = AuditLogEntry::new(AuditEventType::LoginSuccess)
-        .user(user_id)
-        .ip(&ctx.ip_address);
-
-    if let Some(ref ua) = ctx.user_agent {
-        entry = entry.user_agent(ua);
-    }
-
-    entry.save(conn).await
-}
-
-/// Convenience function to log a login failure.
-/// Pass user_id if the user account exists (wrong password); leave None for unknown usernames.
+/// Log a login failure. Pass user_id if the user account exists (wrong password);
+/// leave None for unknown usernames. Kept as a helper because the details JSON
+/// needs to mark nonexistent users — doing this inline at every call site would
+/// be easy to get wrong.
 pub async fn log_login_failed(
     username: &str,
     user_id: Option<Uuid>,
@@ -386,207 +532,15 @@ pub async fn log_login_failed(
         json!({ "username": username, "user_exists": false })
     };
 
-    let mut entry = AuditLogEntry::new(AuditEventType::LoginFailed)
-        .ip(&ctx.ip_address)
-        .details(details);
-
+    let mut entry = audit(AuditEventType::LoginFailed).ctx(ctx).details(details);
     if let Some(uid) = user_id {
         entry = entry.user(uid);
     }
-
-    if let Some(ref ua) = ctx.user_agent {
-        entry = entry.user_agent(ua);
-    }
-
     entry.save(conn).await
 }
 
-/// Convenience function to log a logout
-pub async fn log_logout(
-    user_id: Uuid,
-    ctx: &AuditContext,
-    conn: &mut SqliteConnection,
-) -> Result<(), AppError> {
-    AuditLogEntry::new(AuditEventType::Logout)
-        .user(user_id)
-        .ip(&ctx.ip_address)
-        .save(conn)
-        .await
-}
-
-/// Convenience function to log a token refresh
-pub async fn log_token_refresh(
-    user_id: Uuid,
-    ctx: &AuditContext,
-    conn: &mut SqliteConnection,
-) -> Result<(), AppError> {
-    AuditLogEntry::new(AuditEventType::TokenRefresh)
-        .user(user_id)
-        .ip(&ctx.ip_address)
-        .save(conn)
-        .await
-}
-
-/// Convenience function to log user creation (self-registration)
-pub async fn log_user_created(
-    user_id: Uuid,
-    actor_id: Option<Uuid>,
-    ctx: &AuditContext,
-    conn: &mut SqliteConnection,
-) -> Result<(), AppError> {
-    let mut entry = AuditLogEntry::new(AuditEventType::UserCreated)
-        .user(user_id)
-        .ip(&ctx.ip_address);
-
-    if let Some(actor) = actor_id {
-        entry = entry.actor(actor);
-    }
-
-    entry.save(conn).await
-}
-
-/// Convenience function to log a self-service password change or admin password reset
-pub async fn log_password_changed(
-    user_id: Uuid,
-    actor_id: Option<Uuid>,
-    ctx: &AuditContext,
-    conn: &mut SqliteConnection,
-) -> Result<(), AppError> {
-    let event_type = if actor_id.is_some() {
-        AuditEventType::AdminPasswordReset
-    } else {
-        AuditEventType::PasswordChanged
-    };
-
-    let mut entry = AuditLogEntry::new(event_type)
-        .user(user_id)
-        .ip(&ctx.ip_address);
-
-    if let Some(actor) = actor_id {
-        entry = entry.actor(actor);
-    }
-
-    entry.save(conn).await
-}
-
-/// Log an admin updating a user's profile
-pub async fn log_admin_update_user(
-    user_id: Uuid,
-    actor_id: Uuid,
-    ctx: &AuditContext,
-    conn: &mut SqliteConnection,
-) -> Result<(), AppError> {
-    AuditLogEntry::new(AuditEventType::AdminUpdateUser)
-        .user(user_id)
-        .actor(actor_id)
-        .ip(&ctx.ip_address)
-        .save(conn)
-        .await
-}
-
-/// Log an admin assigning a role to a user
-pub async fn log_admin_role_assigned(
-    user_id: Uuid,
-    actor_id: Uuid,
-    role_id: Uuid,
-    role_name: &str,
-    ctx: &AuditContext,
-    conn: &mut SqliteConnection,
-) -> Result<(), AppError> {
-    AuditLogEntry::new(AuditEventType::AdminRoleAssigned)
-        .user(user_id)
-        .actor(actor_id)
-        .ip(&ctx.ip_address)
-        .details(json!({ "role_id": role_id, "role_name": role_name }))
-        .save(conn)
-        .await
-}
-
-/// Log an admin removing a role from a user
-pub async fn log_admin_role_removed(
-    user_id: Uuid,
-    actor_id: Uuid,
-    role_id: Uuid,
-    ctx: &AuditContext,
-    conn: &mut SqliteConnection,
-) -> Result<(), AppError> {
-    AuditLogEntry::new(AuditEventType::AdminRoleRemoved)
-        .user(user_id)
-        .actor(actor_id)
-        .ip(&ctx.ip_address)
-        .details(json!({ "role_id": role_id }))
-        .save(conn)
-        .await
-}
-
-/// Log a user self-registration
-pub async fn log_user_registered(
-    user_id: Uuid,
-    invite_id: Option<&str>,
-    ctx: &AuditContext,
-    conn: &mut SqliteConnection,
-) -> Result<(), AppError> {
-    let details = if let Some(id) = invite_id {
-        json!({ "invite_used": true, "invite_id": id })
-    } else {
-        json!({ "invite_used": false })
-    };
-    AuditLogEntry::new(AuditEventType::UserRegistered)
-        .user(user_id)
-        .ip(&ctx.ip_address)
-        .details(details)
-        .save(conn)
-        .await
-}
-
-/// Log an admin creating an invitation
-pub async fn log_invitation_created(
-    actor_id: Uuid,
-    invite_id: &str,
-    label: Option<&str>,
-    ctx: &AuditContext,
-    conn: &mut SqliteConnection,
-) -> Result<(), AppError> {
-    AuditLogEntry::new(AuditEventType::InvitationCreated)
-        .actor(actor_id)
-        .ip(&ctx.ip_address)
-        .details(json!({ "invite_id": invite_id, "label": label }))
-        .save(conn)
-        .await
-}
-
-/// Log an admin deleting an invitation
-pub async fn log_invitation_deleted(
-    actor_id: Uuid,
-    invite_id: &str,
-    ctx: &AuditContext,
-    conn: &mut SqliteConnection,
-) -> Result<(), AppError> {
-    AuditLogEntry::new(AuditEventType::InvitationDeleted)
-        .actor(actor_id)
-        .ip(&ctx.ip_address)
-        .details(json!({ "invite_id": invite_id }))
-        .save(conn)
-        .await
-}
-
-/// Log an invitation being consumed during registration
-pub async fn log_invitation_consumed(
-    user_id: Uuid,
-    invite_id: &str,
-    ctx: &AuditContext,
-    conn: &mut SqliteConnection,
-) -> Result<(), AppError> {
-    AuditLogEntry::new(AuditEventType::InvitationConsumed)
-        .user(user_id)
-        .ip(&ctx.ip_address)
-        .details(json!({ "invite_id": invite_id }))
-        .save(conn)
-        .await
-}
-
-/// Log a successful LDAP simple-bind. Sets user_id when bound as a user (not the service
-/// account), and tags the event with the password mode and credential kind used.
+/// Log a successful LDAP simple-bind. Called from the LDAP server (no HTTP
+/// request), so it takes raw IP rather than an `AuditContext`.
 pub async fn log_ldap_bind_success(
     user_id: Option<Uuid>,
     dn: &str,
@@ -595,7 +549,7 @@ pub async fn log_ldap_bind_success(
     credential: &str,
     conn: &mut SqliteConnection,
 ) -> Result<(), AppError> {
-    let mut entry = AuditLogEntry::new(AuditEventType::LdapBindSuccess)
+    let mut entry = audit(AuditEventType::LdapBindSuccess)
         .ip(ip)
         .details(json!({ "dn": dn, "mode": mode, "credential": credential }));
     if let Some(uid) = user_id {
@@ -604,7 +558,8 @@ pub async fn log_ldap_bind_success(
     entry.save(conn).await
 }
 
-/// Log a failed LDAP bind. `reason` is a short machine-readable tag, e.g. "invalid_credentials".
+/// Log a failed LDAP bind. `reason` is a short machine-readable tag,
+/// e.g. "invalid_credentials".
 pub async fn log_ldap_bind_failed(
     user_id: Option<Uuid>,
     dn: &str,
@@ -613,7 +568,7 @@ pub async fn log_ldap_bind_failed(
     reason: &str,
     conn: &mut SqliteConnection,
 ) -> Result<(), AppError> {
-    let mut entry = AuditLogEntry::new(AuditEventType::LdapBindFailed)
+    let mut entry = audit(AuditEventType::LdapBindFailed)
         .ip(ip)
         .details(json!({ "dn": dn, "mode": mode, "reason": reason }));
     if let Some(uid) = user_id {
@@ -622,8 +577,8 @@ pub async fn log_ldap_bind_failed(
     entry.save(conn).await
 }
 
-/// Log an LDAP bind rejected because the user has TOTP enabled and the active mode cannot
-/// accept an MFA-second-factor over simple bind.
+/// Log an LDAP bind rejected because the user has TOTP enabled and the active
+/// mode cannot accept an MFA second factor over simple bind.
 pub async fn log_ldap_bind_rejected_mfa_required(
     user_id: Uuid,
     dn: &str,
@@ -631,7 +586,7 @@ pub async fn log_ldap_bind_rejected_mfa_required(
     mode: &str,
     conn: &mut SqliteConnection,
 ) -> Result<(), AppError> {
-    AuditLogEntry::new(AuditEventType::LdapBindRejectedMfaRequired)
+    audit(AuditEventType::LdapBindRejectedMfaRequired)
         .user(user_id)
         .ip(ip)
         .details(json!({ "dn": dn, "mode": mode }))
@@ -639,24 +594,14 @@ pub async fn log_ldap_bind_rejected_mfa_required(
         .await
 }
 
-/// Log an admin rotating the LDAP service-account bind password.
-pub async fn log_ldap_bind_password_rotated(
-    actor_id: Uuid,
-    ctx: &AuditContext,
-    conn: &mut SqliteConnection,
-) -> Result<(), AppError> {
-    AuditLogEntry::new(AuditEventType::LdapBindPasswordRotated)
-        .actor(actor_id)
-        .ip(&ctx.ip_address)
-        .save(conn)
-        .await
-}
-
-// ============================================================================
-// SCIM helpers
-// ============================================================================
-
-fn scim_details(token_id: Uuid, token_name: &str, extra: Option<serde_json::Value>) -> serde_json::Value {
+/// Build the details block for SCIM events — token identity is included on every
+/// SCIM mutation so admins can trace downstream user changes back to a specific
+/// integration ("Okta prod" vs. "Azure").
+pub fn scim_details(
+    token_id: Uuid,
+    token_name: &str,
+    extra: Option<serde_json::Value>,
+) -> serde_json::Value {
     match extra {
         None => json!({ "scim_token_id": token_id, "scim_token_name": token_name }),
         Some(serde_json::Value::Object(mut map)) => {
@@ -670,129 +615,6 @@ fn scim_details(token_id: Uuid, token_name: &str, extra: Option<serde_json::Valu
     }
 }
 
-/// Log an admin minting a new SCIM token. Records the token label so a destructive audit
-/// trail ties a specific integration ("Okta prod") to downstream user mutations.
-pub async fn log_scim_token_created(
-    token_id: Uuid,
-    token_name: &str,
-    actor_id: Uuid,
-    ctx: &AuditContext,
-    conn: &mut SqliteConnection,
-) -> Result<(), AppError> {
-    AuditLogEntry::new(AuditEventType::ScimTokenCreated)
-        .actor(actor_id)
-        .ip(&ctx.ip_address)
-        .details(json!({ "scim_token_id": token_id, "scim_token_name": token_name }))
-        .save(conn)
-        .await
-}
-
-pub async fn log_scim_token_revoked(
-    token_id: Uuid,
-    token_name: &str,
-    actor_id: Uuid,
-    ctx: &AuditContext,
-    conn: &mut SqliteConnection,
-) -> Result<(), AppError> {
-    AuditLogEntry::new(AuditEventType::ScimTokenRevoked)
-        .actor(actor_id)
-        .ip(&ctx.ip_address)
-        .details(json!({ "scim_token_id": token_id, "scim_token_name": token_name }))
-        .save(conn)
-        .await
-}
-
-pub async fn log_scim_user_created(
-    user_id: Uuid,
-    token_id: Uuid,
-    token_name: &str,
-    ctx: &AuditContext,
-    conn: &mut SqliteConnection,
-) -> Result<(), AppError> {
-    AuditLogEntry::new(AuditEventType::ScimUserCreated)
-        .user(user_id)
-        .ip(&ctx.ip_address)
-        .details(scim_details(token_id, token_name, None))
-        .save(conn)
-        .await
-}
-
-pub async fn log_scim_user_updated(
-    user_id: Uuid,
-    token_id: Uuid,
-    token_name: &str,
-    changes: Option<serde_json::Value>,
-    ctx: &AuditContext,
-    conn: &mut SqliteConnection,
-) -> Result<(), AppError> {
-    AuditLogEntry::new(AuditEventType::ScimUserUpdated)
-        .user(user_id)
-        .ip(&ctx.ip_address)
-        .details(scim_details(token_id, token_name, changes))
-        .save(conn)
-        .await
-}
-
-pub async fn log_scim_user_deactivated(
-    user_id: Uuid,
-    token_id: Uuid,
-    token_name: &str,
-    ctx: &AuditContext,
-    conn: &mut SqliteConnection,
-) -> Result<(), AppError> {
-    AuditLogEntry::new(AuditEventType::ScimUserDeactivated)
-        .user(user_id)
-        .ip(&ctx.ip_address)
-        .details(scim_details(token_id, token_name, None))
-        .save(conn)
-        .await
-}
-
-pub async fn log_scim_user_reactivated(
-    user_id: Uuid,
-    token_id: Uuid,
-    token_name: &str,
-    ctx: &AuditContext,
-    conn: &mut SqliteConnection,
-) -> Result<(), AppError> {
-    AuditLogEntry::new(AuditEventType::ScimUserReactivated)
-        .user(user_id)
-        .ip(&ctx.ip_address)
-        .details(scim_details(token_id, token_name, None))
-        .save(conn)
-        .await
-}
-
-pub async fn log_scim_user_deleted(
-    user_id: Uuid,
-    token_id: Uuid,
-    token_name: &str,
-    ctx: &AuditContext,
-    conn: &mut SqliteConnection,
-) -> Result<(), AppError> {
-    AuditLogEntry::new(AuditEventType::ScimUserDeleted)
-        .user(user_id)
-        .ip(&ctx.ip_address)
-        .details(scim_details(token_id, token_name, None))
-        .save(conn)
-        .await
-}
-
-/// Log admin updating system settings
-pub async fn log_settings_updated(
-    actor_id: Uuid,
-    changes: serde_json::Value,
-    ctx: &AuditContext,
-    conn: &mut SqliteConnection,
-) -> Result<(), AppError> {
-    AuditLogEntry::new(AuditEventType::SettingsUpdated)
-        .actor(actor_id)
-        .ip(&ctx.ip_address)
-        .details(changes)
-        .save(conn)
-        .await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -804,11 +626,71 @@ mod tests {
         assert_eq!(AuditEventType::Logout.as_str(), "logout");
         assert_eq!(AuditEventType::TokenRefresh.as_str(), "token_refresh");
         assert_eq!(AuditEventType::UserCreated.as_str(), "user_created");
-        assert_eq!(AuditEventType::RoleAssigned.as_str(), "role_assigned");
-        assert_eq!(AuditEventType::AdminPasswordReset.as_str(), "admin_password_reset");
-        assert_eq!(AuditEventType::AdminRoleAssigned.as_str(), "admin_role_assigned");
-        assert_eq!(AuditEventType::AdminRoleRemoved.as_str(), "admin_role_removed");
-        assert_eq!(AuditEventType::AdminUpdateUser.as_str(), "admin_update_user");
+        assert_eq!(AuditEventType::AppPasswordCreated.as_str(), "app_password_created");
+        assert_eq!(AuditEventType::ApplicationDeleted.as_str(), "application_deleted");
+        assert_eq!(AuditEventType::RoleCreated.as_str(), "role_created");
+        assert_eq!(AuditEventType::SystemRestarted.as_str(), "system_restarted");
+    }
+
+    #[test]
+    fn all_list_covers_every_variant() {
+        // If someone adds a new event type but forgets to add it to ALL,
+        // from_str will miss it. Spot-check that the list is fully populated
+        // by round-tripping every known name.
+        for variant in AuditEventType::ALL {
+            let s = variant.as_str();
+            assert_eq!(AuditEventType::from_str(s), Some(*variant), "round-trip failed for {s}");
+        }
+    }
+
+    #[test]
+    fn from_str_unknown_returns_none() {
+        assert_eq!(AuditEventType::from_str("not_a_real_event"), None);
+        assert_eq!(AuditEventType::from_str(""), None);
+    }
+
+    #[test]
+    fn builder_applies_ctx_ip_and_user_agent() {
+        let ctx = AuditContext {
+            ip: "10.0.0.5".parse().unwrap(),
+            ip_address: "10.0.0.5".into(),
+            user_agent: Some("Mozilla/5.0".into()),
+        };
+        let entry = audit(AuditEventType::LoginSuccess).ctx(&ctx);
+        assert_eq!(entry.ip_address.as_deref(), Some("10.0.0.5"));
+        assert_eq!(entry.user_agent.as_deref(), Some("Mozilla/5.0"));
+    }
+
+    #[test]
+    fn builder_ctx_without_user_agent_leaves_field_empty() {
+        let ctx = AuditContext {
+            ip: "127.0.0.1".parse().unwrap(),
+            ip_address: "127.0.0.1".into(),
+            user_agent: None,
+        };
+        let entry = audit(AuditEventType::Logout).ctx(&ctx);
+        assert_eq!(entry.ip_address.as_deref(), Some("127.0.0.1"));
+        assert!(entry.user_agent.is_none());
+    }
+
+    #[test]
+    fn actor_accepts_option_none() {
+        let entry = audit(AuditEventType::UserCreated).actor(None::<Uuid>);
+        assert!(entry.actor_id.is_none());
+    }
+
+    #[test]
+    fn actor_accepts_option_some() {
+        let id = Uuid::now_v7();
+        let entry = audit(AuditEventType::UserCreated).actor(Some(id));
+        assert_eq!(entry.actor_id, Some(id));
+    }
+
+    #[test]
+    fn actor_accepts_raw_uuid() {
+        let id = Uuid::now_v7();
+        let entry = audit(AuditEventType::AdminUpdateUser).actor(id);
+        assert_eq!(entry.actor_id, Some(id));
     }
 
     #[test]
@@ -816,7 +698,7 @@ mod tests {
         let user_id = Uuid::now_v7();
         let actor_id = Uuid::now_v7();
 
-        let entry = AuditLogEntry::new(AuditEventType::AdminRoleAssigned)
+        let entry = audit(AuditEventType::AdminRoleAssigned)
             .user(user_id)
             .actor(actor_id)
             .ip("192.168.1.1")
@@ -829,46 +711,6 @@ mod tests {
         assert_eq!(entry.ip_address, Some("192.168.1.1".to_string()));
         assert_eq!(entry.user_agent, Some("Mozilla/5.0".to_string()));
         assert!(entry.details.is_some());
-    }
-
-    #[test]
-    fn test_all_event_types_have_str() {
-        let all_types = [
-            (AuditEventType::LoginSuccess, "login_success"),
-            (AuditEventType::LoginFailed, "login_failed"),
-            (AuditEventType::Logout, "logout"),
-            (AuditEventType::TokenRefresh, "token_refresh"),
-            (AuditEventType::UserCreated, "user_created"),
-            (AuditEventType::UserUpdated, "user_updated"),
-            (AuditEventType::UserDeleted, "user_deleted"),
-            (AuditEventType::PasswordChanged, "password_changed"),
-            (AuditEventType::RoleAssigned, "role_assigned"),
-            (AuditEventType::RoleRemoved, "role_removed"),
-            (AuditEventType::MfaEnabled, "mfa_enabled"),
-            (AuditEventType::MfaDisabled, "mfa_disabled"),
-            (AuditEventType::AdminCreateUser, "admin_create_user"),
-            (AuditEventType::AdminUpdateUser, "admin_update_user"),
-            (AuditEventType::AdminDeleteUser, "admin_delete_user"),
-            (AuditEventType::AdminPasswordReset, "admin_password_reset"),
-            (AuditEventType::AdminRoleAssigned, "admin_role_assigned"),
-            (AuditEventType::AdminRoleRemoved, "admin_role_removed"),
-            (AuditEventType::UserRegistered, "user_registered"),
-            (AuditEventType::InvitationCreated, "invitation_created"),
-            (AuditEventType::InvitationDeleted, "invitation_deleted"),
-            (AuditEventType::InvitationConsumed, "invitation_consumed"),
-            (AuditEventType::SettingsUpdated, "settings_updated"),
-            (AuditEventType::ScimTokenCreated, "scim_token_created"),
-            (AuditEventType::ScimTokenRevoked, "scim_token_revoked"),
-            (AuditEventType::ScimUserCreated, "scim_user_created"),
-            (AuditEventType::ScimUserUpdated, "scim_user_updated"),
-            (AuditEventType::ScimUserDeactivated, "scim_user_deactivated"),
-            (AuditEventType::ScimUserReactivated, "scim_user_reactivated"),
-            (AuditEventType::ScimUserDeleted, "scim_user_deleted"),
-        ];
-
-        for (event_type, expected_str) in all_types {
-            assert_eq!(event_type.as_str(), expected_str);
-        }
     }
 
     #[test]
@@ -902,7 +744,7 @@ mod tests {
 
     #[test]
     fn test_entry_builder_defaults() {
-        let entry = AuditLogEntry::new(AuditEventType::Logout);
+        let entry = audit(AuditEventType::Logout);
         assert_eq!(entry.event_type, AuditEventType::Logout);
         assert!(entry.user_id.is_none());
         assert!(entry.actor_id.is_none());
@@ -914,9 +756,7 @@ mod tests {
     #[test]
     fn test_entry_builder_chaining() {
         let uid = Uuid::now_v7();
-        let entry = AuditLogEntry::new(AuditEventType::LoginSuccess)
-            .user(uid)
-            .ip("10.0.0.1");
+        let entry = audit(AuditEventType::LoginSuccess).user(uid).ip("10.0.0.1");
 
         assert_eq!(entry.user_id, Some(uid));
         assert_eq!(entry.ip_address, Some("10.0.0.1".to_string()));
@@ -926,14 +766,17 @@ mod tests {
     #[test]
     fn test_audit_log_query_builder() {
         let uid = Uuid::now_v7();
+        let aid = Uuid::now_v7();
         let query = AuditLogQuery::new()
             .for_user(uid)
+            .for_actor(aid)
             .since(1000)
             .until(2000)
             .limit(50)
             .offset(10);
 
         assert_eq!(query.user_id, Some(uid));
+        assert_eq!(query.actor_id, Some(aid));
         assert_eq!(query.since, Some(1000));
         assert_eq!(query.until, Some(2000));
         assert_eq!(query.limit, Some(50));
@@ -944,6 +787,7 @@ mod tests {
     fn test_audit_log_query_defaults() {
         let query = AuditLogQuery::new();
         assert!(query.user_id.is_none());
+        assert!(query.actor_id.is_none());
         assert!(query.event_types.is_none());
         assert!(query.since.is_none());
         assert!(query.until.is_none());
@@ -957,7 +801,7 @@ mod tests {
             AuditEventType::LoginSuccess,
             AuditEventType::LoginFailed,
         ]);
-        let types = query.event_types.unwrap();
+        let types = query.event_types.as_ref().unwrap();
         assert_eq!(types.len(), 2);
         assert_eq!(types[0], AuditEventType::LoginSuccess);
         assert_eq!(types[1], AuditEventType::LoginFailed);

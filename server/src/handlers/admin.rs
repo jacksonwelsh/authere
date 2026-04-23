@@ -3,17 +3,15 @@ use argon2::{
     password_hash::{PasswordHasher, SaltString, rand_core::OsRng},
 };
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::response::IntoResponse;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 use uuid::Uuid;
 
 use crate::AppState;
-use crate::audit::{
-    AuditContext, AuditLogQuery, AuditLogRecord, log_invitation_created, log_invitation_deleted,
-    log_ldap_bind_password_rotated, log_settings_updated,
-};
+use crate::audit::{audit, AuditContext, AuditEventType, AuditLogQuery, AuditLogRecord};
 use crate::auth_middleware::AdminUser;
 use crate::errors::AppError;
 use crate::invitation::{CreateInvitationInput, Invitation, InvitationWithStatus};
@@ -26,13 +24,62 @@ use crate::settings::{
 
 const ADMIN_TAG: &str = "admin";
 
+/// Maximum rows returned by export endpoints. Picked so a normal audit log fits in
+/// one file even for noisy production deployments. If you're past 50k rows and
+/// need more, use date ranges.
+const EXPORT_LIMIT: i64 = 50_000;
+
 #[derive(Deserialize)]
 pub struct AuditLogParams {
     limit: Option<i64>,
     offset: Option<i64>,
     user_id: Option<Uuid>,
+    actor_id: Option<Uuid>,
+    /// Comma-separated list of event types to include. Unknown types are ignored.
+    event_type: Option<String>,
     since: Option<i64>,
     until: Option<i64>,
+}
+
+/// Parse the comma-separated event_type param into a Vec, dropping any names the
+/// server doesn't recognize. Unknown names are silently dropped so the admin
+/// UI's filter dropdown never wedges the request if the enum drifts ahead of
+/// the client.
+fn parse_event_types(s: Option<&str>) -> Option<Vec<AuditEventType>> {
+    let raw = s?;
+    let types: Vec<AuditEventType> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(AuditEventType::from_str)
+        .collect();
+    if types.is_empty() { None } else { Some(types) }
+}
+
+fn build_query(params: &AuditLogParams) -> AuditLogQuery {
+    let mut query = AuditLogQuery::new();
+    if let Some(uid) = params.user_id {
+        query = query.for_user(uid);
+    }
+    if let Some(aid) = params.actor_id {
+        query = query.for_actor(aid);
+    }
+    if let Some(types) = parse_event_types(params.event_type.as_deref()) {
+        query = query.event_types(types);
+    }
+    if let Some(ts) = params.since {
+        query = query.since(ts);
+    }
+    if let Some(ts) = params.until {
+        query = query.until(ts);
+    }
+    query
+}
+
+#[derive(Debug, Serialize)]
+pub struct AuditLogResponse {
+    pub entries: Vec<AuditLogRecord>,
+    pub total: i64,
 }
 
 #[utoipa::path(
@@ -49,24 +96,172 @@ pub async fn get_audit_log(
     _admin: AdminUser,
     State(state): State<AppState>,
     Query(params): Query<AuditLogParams>,
-) -> Result<axum::Json<Vec<AuditLogRecord>>, AppError> {
+) -> Result<axum::Json<AuditLogResponse>, AppError> {
     let limit = params.limit.unwrap_or(50).clamp(1, 200);
     let offset = params.offset.unwrap_or(0).max(0);
 
-    let mut query = AuditLogQuery::new().limit(limit).offset(offset);
-    if let Some(uid) = params.user_id {
-        query = query.for_user(uid);
+    let base_query = build_query(&params);
+    let mut conn = state.db_pool.acquire().await?;
+    let total = base_query.count(&mut conn).await?;
+
+    let paged = build_query(&params).limit(limit).offset(offset);
+    let entries = paged.execute(&mut conn).await?;
+
+    Ok(axum::Json(AuditLogResponse { entries, total }))
+}
+
+/// Expose the full list of event type names so the admin UI can populate its
+/// filter dropdown without hardcoding. Ordering follows `AuditEventType::ALL`
+/// for deterministic display.
+#[utoipa::path(
+    get,
+    path = "/api/audit/event-types",
+    responses(
+        (status = 200, description = "All audit event types"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Admin required"),
+    ),
+    tag = ADMIN_TAG,
+)]
+pub async fn get_audit_event_types(
+    _admin: AdminUser,
+) -> axum::Json<Vec<&'static str>> {
+    axum::Json(AuditEventType::ALL.iter().map(|t| t.as_str()).collect())
+}
+
+#[derive(Debug, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ExportFormat {
+    #[default]
+    Json,
+    Csv,
+}
+
+#[derive(Deserialize)]
+pub struct AuditExportParams {
+    #[serde(default)]
+    format: ExportFormat,
+    user_id: Option<Uuid>,
+    actor_id: Option<Uuid>,
+    event_type: Option<String>,
+    since: Option<i64>,
+    until: Option<i64>,
+}
+
+impl AuditExportParams {
+    fn to_list_params(&self) -> AuditLogParams {
+        AuditLogParams {
+            limit: None,
+            offset: None,
+            user_id: self.user_id,
+            actor_id: self.actor_id,
+            event_type: self.event_type.clone(),
+            since: self.since,
+            until: self.until,
+        }
     }
-    if let Some(ts) = params.since {
-        query = query.since(ts);
+}
+
+/// Serialize a list of audit records as CSV. Columns are stable so downstream
+/// pipelines can rely on the shape. Details/user_agent are quoted so embedded
+/// commas/quotes/newlines don't break parsing.
+pub fn records_to_csv(records: &[AuditLogRecord]) -> String {
+    let mut out = String::from(
+        "id,timestamp,event_type,user_id,username,actor_id,actor_username,ip_address,user_agent,details\n",
+    );
+    for r in records {
+        out.push_str(&csv_field(&r.id.to_string()));
+        out.push(',');
+        out.push_str(&r.timestamp.to_string());
+        out.push(',');
+        out.push_str(&csv_field(&r.event_type));
+        out.push(',');
+        out.push_str(&csv_field(&r.user_id.map(|u| u.to_string()).unwrap_or_default()));
+        out.push(',');
+        out.push_str(&csv_field(r.username.as_deref().unwrap_or("")));
+        out.push(',');
+        out.push_str(&csv_field(&r.actor_id.map(|u| u.to_string()).unwrap_or_default()));
+        out.push(',');
+        out.push_str(&csv_field(r.actor_username.as_deref().unwrap_or("")));
+        out.push(',');
+        out.push_str(&csv_field(r.ip_address.as_deref().unwrap_or("")));
+        out.push(',');
+        out.push_str(&csv_field(r.user_agent.as_deref().unwrap_or("")));
+        out.push(',');
+        out.push_str(&csv_field(r.details.as_deref().unwrap_or("")));
+        out.push('\n');
     }
-    if let Some(ts) = params.until {
-        query = query.until(ts);
+    out
+}
+
+/// Quote a CSV field per RFC 4180: wrap in double quotes if it contains a comma,
+/// newline, CR, or double-quote, and double any embedded double-quotes.
+fn csv_field(value: &str) -> String {
+    if value
+        .chars()
+        .any(|c| c == ',' || c == '\n' || c == '\r' || c == '"')
+    {
+        let escaped = value.replace('"', "\"\"");
+        format!("\"{escaped}\"")
+    } else {
+        value.to_string()
     }
+}
+
+fn export_filename(format: &ExportFormat) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let ext = match format {
+        ExportFormat::Json => "json",
+        ExportFormat::Csv => "csv",
+    };
+    format!("authere-audit-{now}.{ext}")
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/audit/export",
+    responses(
+        (status = 200, description = "Audit log export in the requested format"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Admin required"),
+    ),
+    tag = ADMIN_TAG,
+)]
+pub async fn export_audit_log(
+    _admin: AdminUser,
+    State(state): State<AppState>,
+    Query(params): Query<AuditExportParams>,
+) -> Result<axum::response::Response, AppError> {
+    let list_params = params.to_list_params();
+    let query = build_query(&list_params).limit(EXPORT_LIMIT);
 
     let mut conn = state.db_pool.acquire().await?;
     let records = query.execute(&mut conn).await?;
-    Ok(axum::Json(records))
+
+    let filename = export_filename(&params.format);
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
+            .unwrap_or_else(|_| HeaderValue::from_static("attachment")),
+    );
+
+    match params.format {
+        ExportFormat::Json => {
+            headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+            let body = serde_json::to_string_pretty(&records)
+                .map_err(|e| AppError::InternalError(format!("json serialize: {e}")))?;
+            Ok((StatusCode::OK, headers, body).into_response())
+        }
+        ExportFormat::Csv => {
+            headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/csv; charset=utf-8"));
+            let body = records_to_csv(&records);
+            Ok((StatusCode::OK, headers, body).into_response())
+        }
+    }
 }
 
 // ============================================================================
@@ -128,7 +323,12 @@ pub async fn update_settings(
         apply_ldap_input(&ldap, &mut changes, &mut conn).await?;
     }
 
-    let _ = log_settings_updated(admin.0.user_id, changes, &audit_ctx, &mut conn).await;
+    let _ = audit(AuditEventType::SettingsUpdated)
+        .actor(admin.0.user_id)
+        .ctx(&audit_ctx)
+        .details(changes)
+        .save(&mut conn)
+        .await;
 
     let open_registration = open_registration_enabled(&mut conn).await?;
     let ldap_cfg = load_ldap_config(&mut conn).await?;
@@ -207,7 +407,11 @@ pub async fn regenerate_ldap_bind_password(
     set_setting(KEY_LDAP_SERVICE_PASSWORD_HASH, &hash, &mut conn).await?;
 
     info!(admin = %admin.0.user_id, "ldap service bind password rotated");
-    let _ = log_ldap_bind_password_rotated(admin.0.user_id, &audit_ctx, &mut conn).await;
+    let _ = audit(AuditEventType::LdapBindPasswordRotated)
+        .actor(admin.0.user_id)
+        .ctx(&audit_ctx)
+        .save(&mut conn)
+        .await;
 
     Ok(axum::Json(RegenerateLdapPasswordResponse { password }))
 }
@@ -243,13 +447,11 @@ pub async fn restart_service(
     info!(admin = %admin.0.user_id, "admin-initiated service restart");
 
     let mut conn = state.db_pool.acquire().await?;
-    let _ = log_settings_updated(
-        admin.0.user_id,
-        serde_json::json!({ "action": "restart" }),
-        &audit_ctx,
-        &mut conn,
-    )
-    .await;
+    let _ = audit(AuditEventType::SystemRestarted)
+        .actor(admin.0.user_id)
+        .ctx(&audit_ctx)
+        .save(&mut conn)
+        .await;
     drop(conn);
 
     let shutdown = state.shutdown.clone();
@@ -309,7 +511,12 @@ pub async fn create_invitation(
     invitation.save(&mut conn).await?;
 
     info!(admin = %admin.0.user_id, invite_id = %invitation.id, label = ?invitation.label, "invitation created");
-    let _ = log_invitation_created(admin.0.user_id, &invitation.id, invitation.label.as_deref(), &audit_ctx, &mut conn).await;
+    let _ = audit(AuditEventType::InvitationCreated)
+        .actor(admin.0.user_id)
+        .ctx(&audit_ctx)
+        .details(serde_json::json!({ "invite_id": invitation.id, "label": invitation.label }))
+        .save(&mut conn)
+        .await;
 
     Ok((StatusCode::CREATED, axum::Json(invitation)))
 }
@@ -342,7 +549,136 @@ pub async fn delete_invitation(
     }
 
     info!(admin = %admin.0.user_id, invite_id = %id, "invitation deleted");
-    let _ = log_invitation_deleted(admin.0.user_id, &id, &audit_ctx, &mut conn).await;
+    let _ = audit(AuditEventType::InvitationDeleted)
+        .actor(admin.0.user_id)
+        .ctx(&audit_ctx)
+        .details(serde_json::json!({ "invite_id": id }))
+        .save(&mut conn)
+        .await;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audit::AuditLogRecord;
+
+    fn rec(details: Option<&str>, user_agent: Option<&str>) -> AuditLogRecord {
+        AuditLogRecord {
+            id: Uuid::nil(),
+            timestamp: 1_700_000_000,
+            event_type: "login_success".into(),
+            user_id: Some(Uuid::nil()),
+            actor_id: None,
+            ip_address: Some("127.0.0.1".into()),
+            user_agent: user_agent.map(Into::into),
+            details: details.map(Into::into),
+            username: Some("alice".into()),
+            actor_username: None,
+        }
+    }
+
+    #[test]
+    fn parse_event_types_handles_absent() {
+        assert!(parse_event_types(None).is_none());
+        assert!(parse_event_types(Some("")).is_none());
+        assert!(parse_event_types(Some(",,,")).is_none());
+    }
+
+    #[test]
+    fn parse_event_types_returns_known_variants() {
+        let got = parse_event_types(Some("login_success,login_failed")).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0], AuditEventType::LoginSuccess);
+        assert_eq!(got[1], AuditEventType::LoginFailed);
+    }
+
+    #[test]
+    fn parse_event_types_skips_unknown_names() {
+        let got = parse_event_types(Some("login_success,not_a_thing,logout")).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0], AuditEventType::LoginSuccess);
+        assert_eq!(got[1], AuditEventType::Logout);
+    }
+
+    #[test]
+    fn parse_event_types_trims_whitespace() {
+        let got = parse_event_types(Some(" login_success , logout ")).unwrap();
+        assert_eq!(got.len(), 2);
+    }
+
+    #[test]
+    fn parse_event_types_all_unknown_returns_none() {
+        // If nothing parses, treat it as "no filter" rather than "match nothing",
+        // otherwise a stale client hard-blocks itself from seeing any events.
+        assert!(parse_event_types(Some("gibberish,more_gibberish")).is_none());
+    }
+
+    #[test]
+    fn csv_field_quotes_values_containing_commas() {
+        assert_eq!(csv_field("a,b"), "\"a,b\"");
+    }
+
+    #[test]
+    fn csv_field_quotes_values_containing_newlines() {
+        assert_eq!(csv_field("line1\nline2"), "\"line1\nline2\"");
+        assert_eq!(csv_field("line1\r\nline2"), "\"line1\r\nline2\"");
+    }
+
+    #[test]
+    fn csv_field_escapes_embedded_quotes() {
+        assert_eq!(csv_field(r#"she said "hi""#), r#""she said ""hi""""#);
+    }
+
+    #[test]
+    fn csv_field_leaves_plain_values_unquoted() {
+        assert_eq!(csv_field("plain"), "plain");
+        assert_eq!(csv_field(""), "");
+    }
+
+    #[test]
+    fn records_to_csv_has_header_row() {
+        let out = records_to_csv(&[]);
+        assert!(out.starts_with(
+            "id,timestamp,event_type,user_id,username,actor_id,actor_username,ip_address,user_agent,details\n"
+        ));
+    }
+
+    #[test]
+    fn records_to_csv_emits_one_line_per_record() {
+        let out = records_to_csv(&[rec(None, Some("curl")), rec(None, Some("vitest"))]);
+        // 1 header + 2 data rows = 3 newlines.
+        assert_eq!(out.matches('\n').count(), 3);
+        assert!(out.contains("curl"));
+        assert!(out.contains("vitest"));
+    }
+
+    #[test]
+    fn records_to_csv_quotes_details_with_commas() {
+        let out = records_to_csv(&[rec(Some(r#"{"a":1,"b":2}"#), None)]);
+        assert!(out.contains(r#""{""a"":1,""b"":2}""#));
+    }
+
+    #[test]
+    fn export_filename_has_correct_extension() {
+        assert!(export_filename(&ExportFormat::Json).ends_with(".json"));
+        assert!(export_filename(&ExportFormat::Csv).ends_with(".csv"));
+        assert!(export_filename(&ExportFormat::Json).starts_with("authere-audit-"));
+    }
+
+    #[test]
+    fn build_query_applies_all_filters() {
+        let params = AuditLogParams {
+            limit: None,
+            offset: None,
+            user_id: Some(Uuid::nil()),
+            actor_id: Some(Uuid::nil()),
+            event_type: Some("login_success".into()),
+            since: Some(100),
+            until: Some(200),
+        };
+        // Smoke: just make sure this doesn't panic constructing the builder.
+        let _ = build_query(&params);
+    }
 }

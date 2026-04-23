@@ -6,7 +6,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::AppState;
-use crate::audit::{AuditContext, log_admin_update_user, log_password_changed, log_user_created};
+use crate::audit::{audit, AuditContext, AuditEventType};
 use crate::auth_middleware::{AdminUser, AuthUser};
 use crate::db::DbEntity;
 use crate::errors::AppError;
@@ -24,6 +24,23 @@ pub struct UpdateUserInput {
     pub name: Option<String>,
     pub email: Option<Option<String>>,
     pub username: Option<String>,
+}
+
+/// Summarize which profile fields are being touched by an update request, for
+/// the audit log `details` blob. Includes the new values so the log records
+/// what changed, not just that *something* changed.
+fn update_user_changes(input: &UpdateUserInput) -> serde_json::Value {
+    let mut changes = serde_json::Map::new();
+    if let Some(ref name) = input.name {
+        changes.insert("name".into(), serde_json::json!(name));
+    }
+    if let Some(ref email) = input.email {
+        changes.insert("email".into(), serde_json::json!(email));
+    }
+    if let Some(ref username) = input.username {
+        changes.insert("username".into(), serde_json::json!(username));
+    }
+    serde_json::Value::Object(changes)
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -93,7 +110,13 @@ pub async fn create_user(
 
     info!(user_id = %user.id, username = %user.username, admin = %admin.0.user_id, "admin created user");
     let mut conn = state.db_pool.acquire().await?;
-    let _ = log_user_created(user.id, Some(admin.0.user_id), &audit_ctx, &mut conn).await;
+    let _ = audit(AuditEventType::AdminCreateUser)
+        .user(user.id)
+        .actor(admin.0.user_id)
+        .ctx(&audit_ctx)
+        .details(serde_json::json!({ "username": user.username }))
+        .save(&mut conn)
+        .await;
 
     Ok((StatusCode::CREATED, axum::Json(user)))
 }
@@ -169,6 +192,8 @@ pub async fn update_user(
     Path(id): Path<Uuid>,
     extract::Json(input): extract::Json<UpdateUserInput>,
 ) -> Result<axum::Json<User>, AppError> {
+    let changes = update_user_changes(&input);
+
     let mut tx = state.db_pool.begin().await?;
     let mut user = User::get(id, &mut tx).await?.ok_or(AppError::NotFound)?;
     user.update(input.name, input.email, input.username, &mut tx).await?;
@@ -178,7 +203,13 @@ pub async fn update_user(
 
     info!(user_id = %id, admin = %admin.0.user_id, "admin updated user");
     let mut conn = state.db_pool.acquire().await?;
-    let _ = log_admin_update_user(id, admin.0.user_id, &audit_ctx, &mut conn).await;
+    let _ = audit(AuditEventType::AdminUpdateUser)
+        .user(id)
+        .actor(admin.0.user_id)
+        .ctx(&audit_ctx)
+        .details(changes)
+        .save(&mut conn)
+        .await;
     Ok(axum::Json(user))
 }
 
@@ -221,15 +252,26 @@ pub async fn get_me(
 )]
 pub async fn update_me(
     State(state): State<AppState>,
+    audit_ctx: AuditContext,
     auth: AuthUser,
     extract::Json(input): extract::Json<UpdateUserInput>,
 ) -> Result<axum::Json<User>, AppError> {
+    let changes = update_user_changes(&input);
+
     let mut tx = state.db_pool.begin().await?;
     let mut user = User::get(auth.user_id, &mut tx).await?.ok_or(AppError::NotFound)?;
     user.update(input.name, input.email, input.username, &mut tx).await?;
     provisioning::enqueue(&user, UserLifecycleEvent::Updated, &state.origin, &mut tx).await?;
     tx.commit().await?;
     state.provisioning_notifier.notify_one();
+
+    let mut conn = state.db_pool.acquire().await?;
+    let _ = audit(AuditEventType::UserUpdated)
+        .user(auth.user_id)
+        .ctx(&audit_ctx)
+        .details(changes)
+        .save(&mut conn)
+        .await;
     Ok(axum::Json(user))
 }
 
@@ -262,7 +304,11 @@ pub async fn change_my_password(
     revoke_all_user_tokens(auth.user_id, &mut conn).await?;
 
     info!(user_id = %auth.user_id, "user changed their password");
-    let _ = log_password_changed(auth.user_id, None, &audit_ctx, &mut conn).await;
+    let _ = audit(AuditEventType::PasswordChanged)
+        .user(auth.user_id)
+        .ctx(&audit_ctx)
+        .save(&mut conn)
+        .await;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -298,7 +344,12 @@ pub async fn admin_change_user_password(
     revoke_all_user_tokens(id, &mut conn).await?;
 
     info!(user_id = %id, admin = %admin.0.user_id, "admin reset user password");
-    let _ = log_password_changed(id, Some(admin.0.user_id), &audit_ctx, &mut conn).await;
+    let _ = audit(AuditEventType::AdminPasswordReset)
+        .user(id)
+        .actor(admin.0.user_id)
+        .ctx(&audit_ctx)
+        .save(&mut conn)
+        .await;
 
     Ok(StatusCode::NO_CONTENT)
 }

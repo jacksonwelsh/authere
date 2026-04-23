@@ -8,7 +8,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::AppState;
-use crate::audit::{AuditContext, log_login_failed, log_login_success, log_logout, log_token_refresh};
+use crate::audit::{audit, AuditContext, AuditEventType, log_login_failed};
 use crate::db::DbEntity;
 use crate::errors::AppError;
 use crate::handlers::{LoginError, build_auth_cookie, build_refresh_cookie, clear_auth_cookies};
@@ -147,7 +147,7 @@ pub async fn login(
     let token_pair = generate_token_pair(user.id, roles, &state.signing_key, &mut conn).await?;
 
     info!(user_id = %user.id, username = %user.username, "login successful");
-    let _ = log_login_success(user.id, &audit_ctx, &mut conn).await;
+    let _ = audit(AuditEventType::LoginSuccess).user(user.id).ctx(&audit_ctx).save(&mut conn).await;
 
     Ok(axum::Json(token_pair))
 }
@@ -179,7 +179,7 @@ pub async fn refresh_token(
 
     let token_pair = generate_token_pair(user_id, roles, &state.signing_key, &mut conn).await?;
 
-    let _ = log_token_refresh(user_id, &audit_ctx, &mut conn).await;
+    let _ = audit(AuditEventType::TokenRefresh).user(user_id).ctx(&audit_ctx).save(&mut conn).await;
 
     Ok(axum::Json(token_pair))
 }
@@ -206,7 +206,7 @@ pub async fn logout(
     let _ = revoke_user_access_tokens(user_id, &mut conn).await;
 
     info!(user_id = %user_id, "user logged out");
-    let _ = log_logout(user_id, &audit_ctx, &mut conn).await;
+    let _ = audit(AuditEventType::Logout).user(user_id).ctx(&audit_ctx).save(&mut conn).await;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -288,7 +288,7 @@ pub async fn browser_login(
     let token_pair = generate_token_pair(user.id, roles, &state.signing_key, &mut conn).await?;
 
     info!(user_id = %user.id, username = %user.username, "browser login successful");
-    let _ = log_login_success(user.id, &audit_ctx, &mut conn).await;
+    let _ = audit(AuditEventType::LoginSuccess).user(user.id).ctx(&audit_ctx).save(&mut conn).await;
 
     let access_cookie = build_auth_cookie(&token_pair.access_token, token_pair.expires_in);
     let refresh_cookie = build_refresh_cookie(
@@ -368,7 +368,7 @@ pub async fn browser_logout(
         if let Ok(user_id) = verify_and_revoke_refresh_token(token, &state.signing_key, &mut conn).await {
             let _ = revoke_user_access_tokens(user_id, &mut conn).await;
             info!(user_id = %user_id, "browser logout");
-            let _ = log_logout(user_id, &audit_ctx, &mut conn).await;
+            let _ = audit(AuditEventType::Logout).user(user_id).ctx(&audit_ctx).save(&mut conn).await;
         }
     }
 
@@ -440,7 +440,7 @@ pub async fn browser_refresh(
     let roles = user.get_roles(&mut conn).await?;
     let token_pair = generate_token_pair(user_id, roles, &state.signing_key, &mut conn).await?;
 
-    let _ = log_token_refresh(user_id, &audit_ctx, &mut conn).await;
+    let _ = audit(AuditEventType::TokenRefresh).user(user_id).ctx(&audit_ctx).save(&mut conn).await;
 
     let access_cookie = build_auth_cookie(&token_pair.access_token, token_pair.expires_in);
     let refresh_cookie = build_refresh_cookie(

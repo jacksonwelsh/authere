@@ -157,12 +157,65 @@ export const deleteApplication = (id: string) =>
   request<void>(`/api/applications/${id}`, { method: 'DELETE' });
 
 // Audit log
-export const getAuditLog = (params?: { limit?: number; offset?: number }) => {
+export interface AuditLogQuery {
+  limit?: number;
+  offset?: number;
+  user_id?: string;
+  actor_id?: string;
+  event_type?: string[];
+  /** Unix seconds */
+  since?: number;
+  /** Unix seconds */
+  until?: number;
+}
+
+export interface AuditLogResponse {
+  entries: AuditEntry[];
+  total: number;
+}
+
+/**
+ * Serialize an `AuditLogQuery` to URLSearchParams. Shared between the list
+ * endpoint and the export endpoint so filter behavior stays identical.
+ */
+export function buildAuditQueryString(params: AuditLogQuery): URLSearchParams {
   const qs = new URLSearchParams();
-  if (params?.limit) qs.set('limit', String(params.limit));
-  if (params?.offset) qs.set('offset', String(params.offset));
-  return request<AuditEntry[]>(`/api/audit?${qs}`);
+  if (params.limit !== undefined) qs.set('limit', String(params.limit));
+  if (params.offset !== undefined) qs.set('offset', String(params.offset));
+  if (params.user_id) qs.set('user_id', params.user_id);
+  if (params.actor_id) qs.set('actor_id', params.actor_id);
+  if (params.event_type && params.event_type.length > 0) {
+    qs.set('event_type', params.event_type.join(','));
+  }
+  if (params.since !== undefined) qs.set('since', String(params.since));
+  if (params.until !== undefined) qs.set('until', String(params.until));
+  return qs;
+}
+
+export const getAuditLog = (params: AuditLogQuery = {}) => {
+  const qs = buildAuditQueryString(params);
+  return request<AuditLogResponse>(`/api/audit?${qs}`);
 };
+
+export const getAuditEventTypes = () =>
+  request<string[]>('/api/audit/event-types');
+
+/**
+ * Trigger a browser download of the audit log export. Uses a hidden link
+ * rather than `fetch(...)` + `Blob` so the browser streams the body straight
+ * to disk — audit exports can be large (up to 50k rows on the server).
+ */
+export function downloadAuditExport(format: 'json' | 'csv', params: AuditLogQuery = {}) {
+  const qs = buildAuditQueryString({ ...params, limit: undefined, offset: undefined });
+  qs.set('format', format);
+  const url = `/api/audit/export?${qs}`;
+  const a = document.createElement('a');
+  a.href = url;
+  a.rel = 'noopener';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
 
 // Registration
 export interface RegisterInput {

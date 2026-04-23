@@ -6,7 +6,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::AppState;
-use crate::audit::{AuditContext, AuditEventType, AuditLogEntry};
+use crate::audit::{audit, AuditContext, AuditEventType};
 use crate::auth_middleware::{AdminUser, AuthUser};
 use crate::db::DbEntity;
 use crate::errors::AppError;
@@ -59,14 +59,12 @@ async fn audit_mfa(
     ctx: &AuditContext,
     conn: &mut sqlx::SqliteConnection,
 ) {
-    let mut entry = AuditLogEntry::new(event_type).user(user_id).ip(&ctx.ip_address);
-    if let Some(a) = actor_id {
-        entry = entry.actor(a);
-    }
-    if let Some(ref ua) = ctx.user_agent {
-        entry = entry.user_agent(ua);
-    }
-    let _ = entry.save(conn).await;
+    let _ = audit(event_type)
+        .user(user_id)
+        .actor(actor_id)
+        .ctx(ctx)
+        .save(conn)
+        .await;
 }
 
 #[utoipa::path(
