@@ -112,6 +112,7 @@ export function mkScimToken(overrides: Partial<ScimToken> = {}): ScimToken {
 export function mkSettings(overrides: Partial<Settings> = {}): Settings {
   return {
     open_registration: false,
+    session_expiry_seconds: 7 * 24 * 60 * 60,
     ldap: {
       enabled: false,
       base_dn: 'dc=example,dc=com',

@@ -257,11 +257,14 @@ export interface LdapSettingsInput {
 
 export interface Settings {
   open_registration: boolean;
+  /** Browser session / refresh-token lifetime, in seconds. */
+  session_expiry_seconds: number;
   ldap: LdapSettings;
 }
 
 export interface SettingsInput {
   open_registration?: boolean;
+  session_expiry_seconds?: number;
   ldap?: LdapSettingsInput;
 }
 

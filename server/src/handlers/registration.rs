@@ -17,7 +17,7 @@ use crate::rate_limit::RateLimitExceeded;
 use crate::role::{Role, UserRole, ROLE_USER};
 use crate::settings::open_registration_enabled;
 use crate::user::auth::Authenticator;
-use crate::user::auth::token::{REFRESH_TOKEN_LIFETIME, generate_token_pair};
+use crate::user::auth::token::generate_token_pair;
 use crate::user::{CreateUserInput, User};
 
 const AUTH_TAG: &str = "auth";
@@ -150,7 +150,7 @@ pub async fn register(
     let access_cookie = build_auth_cookie(&token_pair.access_token, token_pair.expires_in);
     let refresh_cookie = build_refresh_cookie(
         &token_pair.refresh_token,
-        REFRESH_TOKEN_LIFETIME,
+        token_pair.refresh_expires_in,
     );
 
     let mut headers = axum::http::header::HeaderMap::new();

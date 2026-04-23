@@ -14,7 +14,7 @@ use crate::errors::AppError;
 use crate::handlers::{LoginError, build_auth_cookie, build_refresh_cookie, clear_auth_cookies};
 use crate::rate_limit::RateLimitExceeded;
 use crate::user::auth::Authenticator;
-use crate::user::auth::token::{self, REFRESH_TOKEN_LIFETIME, TokenPair, generate_token_pair, verify_and_revoke_refresh_token, revoke_user_access_tokens};
+use crate::user::auth::token::{self, TokenPair, generate_token_pair, verify_and_revoke_refresh_token, revoke_user_access_tokens};
 use crate::user::auth::totp::{self, UserTotp};
 use crate::user::{LoginInput, User};
 
@@ -293,7 +293,7 @@ pub async fn browser_login(
     let access_cookie = build_auth_cookie(&token_pair.access_token, token_pair.expires_in);
     let refresh_cookie = build_refresh_cookie(
         &token_pair.refresh_token,
-        REFRESH_TOKEN_LIFETIME,
+        token_pair.refresh_expires_in,
     );
 
     let mut headers = HeaderMap::new();
@@ -445,7 +445,7 @@ pub async fn browser_refresh(
     let access_cookie = build_auth_cookie(&token_pair.access_token, token_pair.expires_in);
     let refresh_cookie = build_refresh_cookie(
         &token_pair.refresh_token,
-        REFRESH_TOKEN_LIFETIME,
+        token_pair.refresh_expires_in,
     );
 
     let mut response_headers = HeaderMap::new();
@@ -727,7 +727,7 @@ pub async fn forward_auth_callback(
     let token_pair = generate_token_pair(user_id, roles, &state.signing_key, &mut conn).await?;
 
     let access_cookie = build_auth_cookie(&token_pair.access_token, token_pair.expires_in);
-    let refresh_cookie = build_refresh_cookie(&token_pair.refresh_token, REFRESH_TOKEN_LIFETIME);
+    let refresh_cookie = build_refresh_cookie(&token_pair.refresh_token, token_pair.refresh_expires_in);
 
     let redirect_path = query.redirect_uri
         .filter(|p| p.starts_with('/'))

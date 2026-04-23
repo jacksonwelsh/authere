@@ -18,6 +18,69 @@ function mockSettingsEndpoints(
   );
 }
 
+describe('Settings — Session expiry', () => {
+  it('shows the current session expiry label', async () => {
+    mockSettingsEndpoints(mkSettings({ session_expiry_seconds: 24 * 60 * 60 }));
+    render(Settings);
+    expect(await screen.findByText(/currently: 1 day/i)).toBeInTheDocument();
+  });
+
+  it('renders preset options including the current value', async () => {
+    mockSettingsEndpoints(mkSettings({ session_expiry_seconds: 7 * 24 * 60 * 60 }));
+    render(Settings);
+    const select = (await screen.findByLabelText(/session expiry/i)) as HTMLSelectElement;
+    expect(select.value).toBe(String(7 * 24 * 60 * 60));
+    expect(within(select).getByRole('option', { name: '1 hour' })).toBeInTheDocument();
+    expect(within(select).getByRole('option', { name: '90 days' })).toBeInTheDocument();
+  });
+
+  it('sends PATCH with the new session expiry and updates the display', async () => {
+    mockSettingsEndpoints(mkSettings({ session_expiry_seconds: 7 * 24 * 60 * 60 }));
+    let received: unknown = null;
+    server.use(
+      http.patch('/api/settings', async ({ request }) => {
+        received = await request.json();
+        return HttpResponse.json(
+          mkSettings({ session_expiry_seconds: 60 * 60 }),
+        );
+      }),
+    );
+    render(Settings);
+
+    const select = (await screen.findByLabelText(/session expiry/i)) as HTMLSelectElement;
+    await userEvent.selectOptions(select, String(60 * 60));
+
+    await waitForToast(/session lifetime updated/i);
+    expect(received).toEqual({ session_expiry_seconds: 60 * 60 });
+    expect(await screen.findByText(/currently: 1 hour/i)).toBeInTheDocument();
+  });
+
+  it('rolls back the UI when the server rejects the new value', async () => {
+    mockSettingsEndpoints(mkSettings({ session_expiry_seconds: 7 * 24 * 60 * 60 }));
+    server.use(
+      http.patch('/api/settings', () =>
+        HttpResponse.json({ error: 'too short' }, { status: 400 }),
+      ),
+    );
+    render(Settings);
+
+    const select = (await screen.findByLabelText(/session expiry/i)) as HTMLSelectElement;
+    await userEvent.selectOptions(select, String(60 * 60));
+
+    await waitForToast(/failed to save/i);
+    // Label reflects rolled-back value.
+    expect(await screen.findByText(/currently: 7 days/i)).toBeInTheDocument();
+  });
+
+  it('shows a Custom option when the stored value is not a preset', async () => {
+    mockSettingsEndpoints(mkSettings({ session_expiry_seconds: 12345 }));
+    render(Settings);
+    const select = (await screen.findByLabelText(/session expiry/i)) as HTMLSelectElement;
+    expect(within(select).getByRole('option', { name: /custom/i })).toBeInTheDocument();
+    expect(select.value).toBe('12345');
+  });
+});
+
 describe('Settings — SCIM tokens', () => {
   it('shows empty state when no tokens exist', async () => {
     mockSettingsEndpoints();

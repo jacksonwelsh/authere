@@ -1,4 +1,5 @@
 use crate::errors::AppError;
+use crate::settings::{DEFAULT_SESSION_EXPIRY_SECONDS, session_expiry_seconds};
 
 use aes_gcm::{
     Aes256Gcm, Key, Nonce,
@@ -15,8 +16,10 @@ use uuid::Uuid;
 
 /// Access token lifetime in seconds (15 minutes)
 pub const ACCESS_TOKEN_LIFETIME: i64 = 15 * 60;
-/// Refresh token lifetime in seconds (7 days)
-pub const REFRESH_TOKEN_LIFETIME: i64 = 7 * 24 * 60 * 60;
+/// Legacy fallback refresh-token lifetime (7 days). The effective lifetime is now
+/// loaded from the `session_expiry_seconds` setting per-call; this constant only
+/// survives as a default when no database is reachable.
+pub const REFRESH_TOKEN_LIFETIME: i64 = DEFAULT_SESSION_EXPIRY_SECONDS;
 
 const TOKEN_ISSUER: &str = "authere";
 const TOKEN_AUDIENCE: &str = "authere";
@@ -45,7 +48,11 @@ pub struct Claims {
 pub struct TokenPair {
     pub access_token: String,
     pub refresh_token: String,
+    /// Access-token lifetime in seconds.
     pub expires_in: i64,
+    /// Refresh-token lifetime in seconds, reflecting the configured
+    /// `session_expiry_seconds` setting at issue time.
+    pub refresh_expires_in: i64,
     pub token_type: String,
 }
 
@@ -237,9 +244,10 @@ pub fn generate_access_token(
         .map_err(|e| AppError::InternalError(format!("Failed to encode JWT: {e}")))
 }
 
-/// Generates a refresh token and stores it in the database
+/// Generates a refresh token with the given lifetime (seconds) and stores it in the database.
 pub async fn generate_refresh_token(
     user_id: Uuid,
+    lifetime_seconds: i64,
     signing_key: &SigningKey,
     conn: &mut SqliteConnection,
 ) -> Result<String, AppError> {
@@ -250,7 +258,7 @@ pub async fn generate_refresh_token(
         iss: TOKEN_ISSUER.to_string(),
         aud: TOKEN_AUDIENCE.to_string(),
         roles: vec![], // Refresh tokens don't carry roles
-        exp: now + REFRESH_TOKEN_LIFETIME,
+        exp: now + lifetime_seconds,
         iat: now,
         jti: Uuid::new_v4().to_string(),
         typ: "refresh".to_string(),
@@ -266,7 +274,7 @@ pub async fn generate_refresh_token(
 
     let token_hash = hash_token(&token);
     let id = Uuid::now_v7();
-    let expires_at = now + REFRESH_TOKEN_LIFETIME;
+    let expires_at = now + lifetime_seconds;
 
     query!(
         "INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at, created_at) VALUES (?, ?, ?, ?, ?)",
@@ -282,20 +290,23 @@ pub async fn generate_refresh_token(
     Ok(token)
 }
 
-/// Generates both access and refresh tokens for a user
+/// Generates both access and refresh tokens for a user, honoring the configured
+/// `session_expiry_seconds` setting for the refresh-token lifetime.
 pub async fn generate_token_pair(
     user_id: Uuid,
     roles: Vec<String>,
     signing_key: &SigningKey,
     conn: &mut SqliteConnection,
 ) -> Result<TokenPair, AppError> {
+    let refresh_lifetime = session_expiry_seconds(conn).await?;
     let access_token = generate_access_token(user_id, roles, signing_key)?;
-    let refresh_token = generate_refresh_token(user_id, signing_key, conn).await?;
+    let refresh_token = generate_refresh_token(user_id, refresh_lifetime, signing_key, conn).await?;
 
     Ok(TokenPair {
         access_token,
         refresh_token,
         expires_in: ACCESS_TOKEN_LIFETIME,
+        refresh_expires_in: refresh_lifetime,
         token_type: "Bearer".to_string(),
     })
 }
@@ -620,6 +631,7 @@ mod tests {
             access_token: "at".into(),
             refresh_token: "rt".into(),
             expires_in: 900,
+            refresh_expires_in: 604_800,
             token_type: "Bearer".into(),
         };
         let json = serde_json::to_string(&pair).unwrap();
@@ -627,6 +639,7 @@ mod tests {
         assert_eq!(pair.access_token, deserialized.access_token);
         assert_eq!(pair.refresh_token, deserialized.refresh_token);
         assert_eq!(pair.expires_in, deserialized.expires_in);
+        assert_eq!(pair.refresh_expires_in, deserialized.refresh_expires_in);
         assert_eq!(pair.token_type, deserialized.token_type);
     }
 
@@ -756,6 +769,59 @@ mod tests {
             "inactive users must not be able to present access tokens",
         );
         assert!(matches!(err, AppError::AuthenticationRequired));
+    }
+
+    #[tokio::test]
+    async fn token_pair_reflects_configured_session_expiry() {
+        use crate::settings::{KEY_SESSION_EXPIRY_SECONDS, set_setting};
+
+        let pool = in_memory_pool().await;
+        let mut conn = pool.acquire().await.unwrap();
+
+        let user = User::new("expiry-user".into(), "Expiry".into(), None);
+        user.save(&mut conn).await.unwrap();
+
+        set_setting(KEY_SESSION_EXPIRY_SECONDS, "3600", &mut conn)
+            .await
+            .unwrap();
+
+        let key = generate_key();
+        let pair = generate_token_pair(user.id, vec![], &key, &mut conn)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            pair.refresh_expires_in, 3600,
+            "refresh_expires_in should mirror the configured setting"
+        );
+        assert_eq!(
+            pair.expires_in, ACCESS_TOKEN_LIFETIME,
+            "access token lifetime remains a compile-time constant"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_token_expiry_honors_lifetime_arg() {
+        let pool = in_memory_pool().await;
+        let mut conn = pool.acquire().await.unwrap();
+
+        let user = User::new("rt-user".into(), "Refresh".into(), None);
+        user.save(&mut conn).await.unwrap();
+
+        let key = generate_key();
+        let _ = generate_refresh_token(user.id, 600, &key, &mut conn)
+            .await
+            .unwrap();
+
+        let row = query!(
+            r#"SELECT expires_at, created_at FROM refresh_tokens WHERE user_id = ?"#,
+            user.id
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+
+        assert_eq!(row.expires_at - row.created_at, 600);
     }
 
     #[tokio::test]

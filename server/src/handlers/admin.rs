@@ -17,9 +17,10 @@ use crate::errors::AppError;
 use crate::invitation::{CreateInvitationInput, Invitation, InvitationWithStatus};
 use crate::settings::{
     KEY_LDAP_BASE_DN, KEY_LDAP_BIND_ADDRESS, KEY_LDAP_ENABLED, KEY_LDAP_PASSWORD_MODE,
-    KEY_LDAP_SERVICE_PASSWORD_HASH, KEY_OPEN_REGISTRATION, LdapSettingsInput, SettingsResponse,
-    UpdateSettingsInput, load_ldap_config, open_registration_enabled, set_setting,
-    to_ldap_settings, validate_base_dn, validate_bind_address,
+    KEY_LDAP_SERVICE_PASSWORD_HASH, KEY_OPEN_REGISTRATION, KEY_SESSION_EXPIRY_SECONDS,
+    LdapSettingsInput, SettingsResponse, UpdateSettingsInput, load_ldap_config,
+    open_registration_enabled, session_expiry_seconds, set_setting, to_ldap_settings,
+    validate_base_dn, validate_bind_address, validate_session_expiry_seconds,
 };
 
 const ADMIN_TAG: &str = "admin";
@@ -284,9 +285,11 @@ pub async fn get_settings(
 ) -> Result<axum::Json<SettingsResponse>, AppError> {
     let mut conn = state.db_pool.acquire().await?;
     let open_registration = open_registration_enabled(&mut conn).await?;
+    let session_expiry = session_expiry_seconds(&mut conn).await?;
     let ldap_cfg = load_ldap_config(&mut conn).await?;
     Ok(axum::Json(SettingsResponse {
         open_registration,
+        session_expiry_seconds: session_expiry,
         ldap: to_ldap_settings(&ldap_cfg),
     }))
 }
@@ -319,6 +322,14 @@ pub async fn update_settings(
         info!(admin = %admin.0.user_id, open_registration = open_reg, "settings updated");
     }
 
+    if let Some(expiry) = input.session_expiry_seconds {
+        let validated = validate_session_expiry_seconds(expiry)
+            .map_err(|e| AppError::InputError(vec![e]))?;
+        set_setting(KEY_SESSION_EXPIRY_SECONDS, &validated.to_string(), &mut conn).await?;
+        changes["session_expiry_seconds"] = serde_json::json!(validated);
+        info!(admin = %admin.0.user_id, session_expiry_seconds = validated, "settings updated");
+    }
+
     if let Some(ldap) = input.ldap {
         apply_ldap_input(&ldap, &mut changes, &mut conn).await?;
     }
@@ -331,9 +342,11 @@ pub async fn update_settings(
         .await;
 
     let open_registration = open_registration_enabled(&mut conn).await?;
+    let session_expiry = session_expiry_seconds(&mut conn).await?;
     let ldap_cfg = load_ldap_config(&mut conn).await?;
     Ok(axum::Json(SettingsResponse {
         open_registration,
+        session_expiry_seconds: session_expiry,
         ldap: to_ldap_settings(&ldap_cfg),
     }))
 }

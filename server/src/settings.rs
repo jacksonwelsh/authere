@@ -8,6 +8,7 @@ use utoipa::ToSchema;
 use crate::errors::AppError;
 
 pub const KEY_OPEN_REGISTRATION: &str = "open_registration";
+pub const KEY_SESSION_EXPIRY_SECONDS: &str = "session_expiry_seconds";
 pub const KEY_LDAP_ENABLED: &str = "ldap_enabled";
 pub const KEY_LDAP_BASE_DN: &str = "ldap_base_dn";
 pub const KEY_LDAP_BIND_ADDRESS: &str = "ldap_bind_address";
@@ -16,6 +17,16 @@ pub const KEY_LDAP_PASSWORD_MODE: &str = "ldap_password_mode";
 
 pub const DEFAULT_LDAP_BASE_DN: &str = "dc=authere,dc=local";
 pub const DEFAULT_LDAP_BIND_ADDRESS: &str = "0.0.0.0:3389";
+
+/// Default refresh-token / browser-session lifetime (7 days). Used as a fallback
+/// when the `session_expiry_seconds` setting is unset or unparsable.
+pub const DEFAULT_SESSION_EXPIRY_SECONDS: i64 = 7 * 24 * 60 * 60;
+/// Minimum allowed session expiry (5 minutes). Shorter values would cause the
+/// browser to hit the refresh endpoint constantly and would likely log admins
+/// out mid-click.
+pub const MIN_SESSION_EXPIRY_SECONDS: i64 = 5 * 60;
+/// Maximum allowed session expiry (1 year).
+pub const MAX_SESSION_EXPIRY_SECONDS: i64 = 365 * 24 * 60 * 60;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -83,12 +94,15 @@ pub struct LdapSettingsInput {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SettingsResponse {
     pub open_registration: bool,
+    /// Browser session / refresh-token lifetime, in seconds.
+    pub session_expiry_seconds: i64,
     pub ldap: LdapSettings,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateSettingsInput {
     pub open_registration: Option<bool>,
+    pub session_expiry_seconds: Option<i64>,
     pub ldap: Option<LdapSettingsInput>,
 }
 
@@ -137,6 +151,32 @@ pub async fn set_setting(key: &str, value: &str, conn: &mut SqliteConnection) ->
 pub async fn open_registration_enabled(conn: &mut SqliteConnection) -> Result<bool, AppError> {
     let value = get_setting(KEY_OPEN_REGISTRATION, conn).await?;
     Ok(value.as_deref() == Some("true"))
+}
+
+/// Load the configured session (refresh-token) lifetime in seconds. Falls back to
+/// [`DEFAULT_SESSION_EXPIRY_SECONDS`] if unset or garbled, clamped to the valid range so
+/// a past-bad-write can't wedge login forever.
+pub async fn session_expiry_seconds(conn: &mut SqliteConnection) -> Result<i64, AppError> {
+    let raw = get_setting(KEY_SESSION_EXPIRY_SECONDS, conn).await?;
+    let parsed = raw
+        .as_deref()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(DEFAULT_SESSION_EXPIRY_SECONDS);
+    Ok(parsed.clamp(MIN_SESSION_EXPIRY_SECONDS, MAX_SESSION_EXPIRY_SECONDS))
+}
+
+pub fn validate_session_expiry_seconds(value: i64) -> Result<i64, String> {
+    if value < MIN_SESSION_EXPIRY_SECONDS {
+        return Err(format!(
+            "Session expiry must be at least {MIN_SESSION_EXPIRY_SECONDS} seconds"
+        ));
+    }
+    if value > MAX_SESSION_EXPIRY_SECONDS {
+        return Err(format!(
+            "Session expiry must be at most {MAX_SESSION_EXPIRY_SECONDS} seconds"
+        ));
+    }
+    Ok(value)
 }
 
 /// Load the typed LDAP config from the settings KV store. Missing/blank values fall back to
@@ -338,5 +378,107 @@ mod tests {
         assert!(validate_bind_address("").is_err());
         assert!(validate_bind_address("example.com:389").is_err());
         assert!(validate_bind_address("0.0.0.0").is_err());
+    }
+
+    #[test]
+    fn validate_session_expiry_accepts_range() {
+        assert_eq!(
+            validate_session_expiry_seconds(MIN_SESSION_EXPIRY_SECONDS).unwrap(),
+            MIN_SESSION_EXPIRY_SECONDS
+        );
+        assert_eq!(
+            validate_session_expiry_seconds(DEFAULT_SESSION_EXPIRY_SECONDS).unwrap(),
+            DEFAULT_SESSION_EXPIRY_SECONDS
+        );
+        assert_eq!(
+            validate_session_expiry_seconds(MAX_SESSION_EXPIRY_SECONDS).unwrap(),
+            MAX_SESSION_EXPIRY_SECONDS
+        );
+    }
+
+    #[test]
+    fn validate_session_expiry_rejects_out_of_range() {
+        assert!(validate_session_expiry_seconds(0).is_err());
+        assert!(validate_session_expiry_seconds(MIN_SESSION_EXPIRY_SECONDS - 1).is_err());
+        assert!(validate_session_expiry_seconds(MAX_SESSION_EXPIRY_SECONDS + 1).is_err());
+        assert!(validate_session_expiry_seconds(-3600).is_err());
+    }
+
+    #[test]
+    fn default_session_expiry_matches_legacy_constant() {
+        // Historical REFRESH_TOKEN_LIFETIME was 7 days; keep parity so upgrades
+        // don't silently shorten or lengthen sessions for existing deployments.
+        assert_eq!(DEFAULT_SESSION_EXPIRY_SECONDS, 7 * 24 * 60 * 60);
+    }
+
+    use sqlx::SqlitePool;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    async fn memory_pool() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        sqlx::migrate!("../migrations")
+            .run(&pool)
+            .await
+            .expect("run migrations");
+        pool
+    }
+
+    #[tokio::test]
+    async fn session_expiry_default_when_setting_unset() {
+        let pool = memory_pool().await;
+        let mut conn = pool.acquire().await.unwrap();
+        sqlx::query("DELETE FROM settings WHERE key = 'session_expiry_seconds'")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        let got = session_expiry_seconds(&mut conn).await.unwrap();
+        assert_eq!(got, DEFAULT_SESSION_EXPIRY_SECONDS);
+    }
+
+    #[tokio::test]
+    async fn session_expiry_reads_stored_value() {
+        let pool = memory_pool().await;
+        let mut conn = pool.acquire().await.unwrap();
+        set_setting(KEY_SESSION_EXPIRY_SECONDS, "3600", &mut conn)
+            .await
+            .unwrap();
+        let got = session_expiry_seconds(&mut conn).await.unwrap();
+        assert_eq!(got, 3600);
+    }
+
+    #[tokio::test]
+    async fn session_expiry_clamps_out_of_range_stored_values() {
+        let pool = memory_pool().await;
+        let mut conn = pool.acquire().await.unwrap();
+        set_setting(KEY_SESSION_EXPIRY_SECONDS, "1", &mut conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            session_expiry_seconds(&mut conn).await.unwrap(),
+            MIN_SESSION_EXPIRY_SECONDS
+        );
+        set_setting(KEY_SESSION_EXPIRY_SECONDS, "9999999999", &mut conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            session_expiry_seconds(&mut conn).await.unwrap(),
+            MAX_SESSION_EXPIRY_SECONDS
+        );
+    }
+
+    #[tokio::test]
+    async fn session_expiry_falls_back_on_unparsable_value() {
+        let pool = memory_pool().await;
+        let mut conn = pool.acquire().await.unwrap();
+        set_setting(KEY_SESSION_EXPIRY_SECONDS, "not a number", &mut conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            session_expiry_seconds(&mut conn).await.unwrap(),
+            DEFAULT_SESSION_EXPIRY_SECONDS
+        );
     }
 }

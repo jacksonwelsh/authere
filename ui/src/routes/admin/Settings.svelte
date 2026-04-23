@@ -31,6 +31,17 @@
   let baseDnError = $state('');
   let bindAddressError = $state('');
 
+  // Session expiry presets. Admins pick from a fixed set rather than typing seconds;
+  // this avoids them accidentally entering "60" and getting locked out every minute.
+  const SESSION_EXPIRY_PRESETS: { label: string; value: number }[] = [
+    { label: '1 hour', value: 60 * 60 },
+    { label: '8 hours', value: 8 * 60 * 60 },
+    { label: '1 day', value: 24 * 60 * 60 },
+    { label: '7 days', value: 7 * 24 * 60 * 60 },
+    { label: '30 days', value: 30 * 24 * 60 * 60 },
+    { label: '90 days', value: 90 * 24 * 60 * 60 },
+  ];
+
   // One-time reveal of the generated service bind password.
   let revealedPassword = $state<string | null>(null);
   let confirmRegenerate = $state(false);
@@ -70,6 +81,30 @@
       scimLoading = false;
     }
   });
+
+  async function handleSessionExpiryChange(value: number) {
+    if (!settings || saving || settings.session_expiry_seconds === value) return;
+    const prev = settings.session_expiry_seconds;
+    settings = { ...settings, session_expiry_seconds: value };
+    saving = true;
+    try {
+      settings = await updateSettings({ session_expiry_seconds: value });
+      toasts.success('Session lifetime updated.');
+    } catch (err: any) {
+      settings = { ...settings!, session_expiry_seconds: prev };
+      toasts.error(`Failed to save: ${err.message}`);
+    } finally {
+      saving = false;
+    }
+  }
+
+  function formatSessionExpiry(seconds: number): string {
+    const preset = SESSION_EXPIRY_PRESETS.find((p) => p.value === seconds);
+    if (preset) return preset.label;
+    if (seconds % 86400 === 0) return `${seconds / 86400} days`;
+    if (seconds % 3600 === 0) return `${seconds / 3600} hours`;
+    return `${seconds} seconds`;
+  }
 
   async function handleRegistrationToggle() {
     if (!settings || saving) return;
@@ -279,6 +314,38 @@
           >
             <span class="toggle-thumb"></span>
           </button>
+        </div>
+      </div>
+    </div>
+
+    <div class="settings-section">
+      <div class="section-title au-small font-medium au-fg-2">Sessions</div>
+      <div class="settings-card">
+        <div class="setting-row">
+          <div class="setting-info">
+            <span class="au-small font-medium">Session expiry</span>
+            <span class="au-micro au-fg-3">
+              How long a signed-in session stays valid before users must reauthenticate.
+              Applies to new logins; existing sessions keep their current expiry.
+              Currently: {formatSessionExpiry(settings.session_expiry_seconds)}.
+            </span>
+          </div>
+          <select
+            class="au-input session-expiry-select"
+            value={settings.session_expiry_seconds}
+            onchange={(e) => handleSessionExpiryChange(Number((e.currentTarget as HTMLSelectElement).value))}
+            disabled={saving}
+            aria-label="Session expiry"
+          >
+            {#each SESSION_EXPIRY_PRESETS as opt}
+              <option value={opt.value}>{opt.label}</option>
+            {/each}
+            {#if !SESSION_EXPIRY_PRESETS.some((p) => p.value === settings.session_expiry_seconds)}
+              <option value={settings.session_expiry_seconds}>
+                Custom ({formatSessionExpiry(settings.session_expiry_seconds)})
+              </option>
+            {/if}
+          </select>
         </div>
       </div>
     </div>
@@ -680,6 +747,11 @@
 
   .danger-card {
     border-color: var(--danger, #EF4444);
+  }
+
+  .session-expiry-select {
+    flex-shrink: 0;
+    min-width: 140px;
   }
 
   /* Toggle switch */
