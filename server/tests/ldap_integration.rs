@@ -118,10 +118,12 @@ async fn seed(pool: &SqlitePool, mode: LdapPasswordMode) -> (Uuid, Uuid, String)
     .execute(&mut *conn)
     .await
     .unwrap();
-    let bob_totp_id = Uuid::now_v7();
+    // Mark Bob as having an activated TOTP. Stored ciphertext is opaque to the LDAP code,
+    // which only inspects `activated_at IS NOT NULL`.
     sqlx::query!(
-        "INSERT INTO authenticators (id, type, value, owner_id) VALUES (?, 'totp', 'JBSWY3DPEHPK3PXP', ?)",
-        bob_totp_id,
+        r#"INSERT INTO user_totps
+               (user_id, secret_encrypted, last_used_step, activated_at, created_at, updated_at)
+           VALUES (?, 'test-ct', NULL, 1, 1, 1)"#,
         bob_id
     )
     .execute(&mut *conn)

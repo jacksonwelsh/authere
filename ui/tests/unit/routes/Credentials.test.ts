@@ -64,6 +64,97 @@ describe('Credentials — password change', () => {
   });
 });
 
+function mockTotpStatus(status: { enabled: boolean; pending: boolean } = { enabled: false, pending: false }) {
+  server.use(http.get('/api/me/totp', () => HttpResponse.json(status)));
+}
+
+describe('Credentials — TOTP', () => {
+  it('offers an Add button when TOTP is not enrolled', async () => {
+    mockSettings();
+    mockAppPasswords();
+    mockTotpStatus();
+    render(Credentials);
+    expect(
+      await screen.findByRole('button', { name: /add authenticator app/i }),
+    ).toBeInTheDocument();
+  });
+
+  it('walks through enrollment: shows QR, activates, reveals recovery codes', async () => {
+    mockSettings();
+    mockAppPasswords();
+    mockTotpStatus();
+    server.use(
+      http.post('/api/me/totp/enroll', () =>
+        HttpResponse.json({
+          secret: 'JBSWY3DPEHPK3PXP',
+          otpauth_uri:
+            'otpauth://totp/Authere:alice?secret=JBSWY3DPEHPK3PXP&issuer=Authere&algorithm=SHA1&digits=6&period=30',
+        }),
+      ),
+      http.post('/api/me/totp/activate', () =>
+        HttpResponse.json({ recovery_codes: ['ABCDE-FGHIJ', 'KLMNO-PQRST'] }),
+      ),
+    );
+
+    render(Credentials);
+
+    await userEvent.click(
+      await screen.findByRole('button', { name: /add authenticator app/i }),
+    );
+
+    // QR code rendered inline as SVG.
+    const qr = await screen.findByLabelText(/TOTP enrollment QR code/i);
+    await waitFor(() => expect(qr.querySelector('svg')).toBeTruthy());
+
+    // Manual-entry secret is revealed on demand.
+    await userEvent.click(screen.getByText(/can't scan/i));
+    expect(screen.getByText('JBSWY3DPEHPK3PXP')).toBeInTheDocument();
+
+    const codeInput = screen.getByLabelText(/6-digit code/i);
+    await userEvent.type(codeInput, '123456');
+    await userEvent.click(screen.getByRole('button', { name: /verify and enable/i }));
+
+    // Recovery codes reveal modal
+    expect(await screen.findByRole('heading', { name: /save your recovery codes/i })).toBeInTheDocument();
+    expect(screen.getByText('ABCDE-FGHIJ')).toBeInTheDocument();
+    expect(screen.getByText('KLMNO-PQRST')).toBeInTheDocument();
+  });
+
+  it('blocks the activate button while the code is not six digits', async () => {
+    mockSettings();
+    mockAppPasswords();
+    mockTotpStatus();
+    server.use(
+      http.post('/api/me/totp/enroll', () =>
+        HttpResponse.json({
+          secret: 'JBSWY3DPEHPK3PXP',
+          otpauth_uri: 'otpauth://totp/Authere:alice?secret=JBSWY3DPEHPK3PXP&issuer=Authere',
+        }),
+      ),
+    );
+    render(Credentials);
+    await userEvent.click(
+      await screen.findByRole('button', { name: /add authenticator app/i }),
+    );
+    const verify = await screen.findByRole('button', { name: /verify and enable/i });
+    expect(verify).toBeDisabled();
+    await userEvent.type(screen.getByLabelText(/6-digit code/i), '123');
+    expect(verify).toBeDisabled();
+    await userEvent.type(screen.getByLabelText(/6-digit code/i), '456');
+    expect(verify).toBeEnabled();
+  });
+
+  it('renders an Active state and a Disable button when TOTP is enabled', async () => {
+    mockSettings();
+    mockAppPasswords();
+    mockTotpStatus({ enabled: true, pending: false });
+    render(Credentials);
+    expect(
+      await screen.findByRole('button', { name: /disable/i }),
+    ).toBeInTheDocument();
+  });
+});
+
 describe('Credentials — app passwords', () => {
   it('hides the app-passwords section when ldap password_mode is primary_only', async () => {
     mockSettings({

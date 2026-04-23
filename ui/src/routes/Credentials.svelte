@@ -1,14 +1,21 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import QRCode from 'qrcode';
   import {
     changeMyPassword,
     listMyAppPasswords,
     createMyAppPassword,
     deleteMyAppPassword,
     getSettings,
+    getMyTotpStatus,
+    enrollMyTotp,
+    activateMyTotp,
+    disableMyTotp,
     ApiError,
     type AppPassword,
     type Settings,
+    type TotpStatus,
+    type TotpEnrollResponse,
   } from '../lib/api';
   import Button from '../lib/components/Button.svelte';
   import Input from '../lib/components/Input.svelte';
@@ -29,6 +36,18 @@
   let creating = $state(false);
   let revealed = $state<{ name: string; password: string } | null>(null);
   let deleting = $state<string | null>(null);
+
+  // TOTP
+  let totpStatus = $state<TotpStatus | null>(null);
+  let totpLoading = $state(true);
+  let totpEnroll = $state<TotpEnrollResponse | null>(null);
+  let totpCode = $state('');
+  let totpBusy = $state(false);
+  let totpError = $state('');
+  let totpRecoveryCodes = $state<string[] | null>(null);
+  let totpQrSvg = $state('');
+  let totpDisablePassword = $state('');
+  let showDisableTotp = $state(false);
 
   const lengthError = $derived(
     newPassword.length > 0 && newPassword.length < 12
@@ -70,7 +89,87 @@
     } finally {
       loadingApp = false;
     }
+    try {
+      totpStatus = await getMyTotpStatus();
+    } catch {
+      // Leave totpStatus null; the section will render a lightweight error state.
+    } finally {
+      totpLoading = false;
+    }
   });
+
+  async function handleStartEnroll() {
+    totpBusy = true;
+    totpError = '';
+    try {
+      totpEnroll = await enrollMyTotp();
+      totpCode = '';
+      totpStatus = { enabled: false, pending: true };
+      // Render QR inline as SVG. `margin: 0` matches the container padding so the quiet
+      // zone isn't duplicated; `width: 192` keeps it crisp on retina at 50% CSS width.
+      totpQrSvg = await QRCode.toString(totpEnroll.otpauth_uri, {
+        type: 'svg',
+        errorCorrectionLevel: 'M',
+        margin: 0,
+        width: 192,
+      });
+    } catch (err: any) {
+      totpError = err instanceof ApiError ? err.message : 'Could not start enrollment.';
+    } finally {
+      totpBusy = false;
+    }
+  }
+
+  async function handleActivate() {
+    if (!/^\d{6}$/.test(totpCode) || totpBusy) return;
+    totpBusy = true;
+    totpError = '';
+    try {
+      const resp = await activateMyTotp(totpCode);
+      totpRecoveryCodes = resp.recovery_codes;
+      totpEnroll = null;
+      totpQrSvg = '';
+      totpCode = '';
+      totpStatus = { enabled: true, pending: false };
+    } catch (err: any) {
+      if (err instanceof ApiError && err.status === 401) {
+        totpError = 'That code did not match. Try again — codes rotate every 30 seconds.';
+      } else {
+        totpError = err instanceof ApiError ? err.message : 'Could not activate TOTP.';
+      }
+    } finally {
+      totpBusy = false;
+    }
+  }
+
+  async function handleDisableTotp() {
+    if (!totpDisablePassword || totpBusy) return;
+    totpBusy = true;
+    totpError = '';
+    try {
+      await disableMyTotp(totpDisablePassword);
+      totpStatus = { enabled: false, pending: false };
+      totpDisablePassword = '';
+      showDisableTotp = false;
+      toasts.success('Two-factor authentication disabled.');
+    } catch (err: any) {
+      if (err instanceof ApiError && err.status === 401) {
+        totpError = 'Password is incorrect.';
+      } else {
+        totpError = err instanceof ApiError ? err.message : 'Could not disable TOTP.';
+      }
+    } finally {
+      totpBusy = false;
+    }
+  }
+
+  function cancelEnroll() {
+    totpEnroll = null;
+    totpQrSvg = '';
+    totpCode = '';
+    totpError = '';
+    totpStatus = { enabled: false, pending: false };
+  }
 
   async function handleChangePassword() {
     if (!canSave) return;
@@ -182,6 +281,89 @@
     </div>
   </div>
 
+  <!-- TOTP / Two-factor authentication -->
+  <div class="credential-card">
+    <div class="credential-header">
+      <div>
+        <h2 class="au-h4">Two-factor authentication</h2>
+        <p class="au-small au-fg-3">
+          {#if totpStatus?.enabled}
+            An authenticator app is required for every sign-in.
+          {:else}
+            Add an authenticator app (e.g. 1Password, Authy, Google Authenticator) for a second
+            factor on sign-in. Optional.
+          {/if}
+        </p>
+      </div>
+      {#if totpStatus?.enabled && !totpEnroll}
+        <Button variant="ghost" size="sm" onclick={() => { showDisableTotp = true; totpError = ''; }}>
+          Disable
+        </Button>
+      {/if}
+    </div>
+
+    {#if totpLoading}
+      <p class="au-small au-fg-3">Loading…</p>
+    {:else if totpEnroll}
+      <div class="totp-enroll">
+        <p class="au-small">
+          Scan the QR code with your authenticator app, or tap the link on your phone. Then
+          enter the 6-digit code it shows to finish.
+        </p>
+        {#if totpQrSvg}
+          <div class="totp-qr" aria-label="TOTP enrollment QR code">
+            {@html totpQrSvg}
+          </div>
+        {/if}
+        <details class="totp-manual">
+          <summary class="au-small au-fg-3">Can't scan? Enter details manually</summary>
+          <div class="totp-manual-body">
+            <code class="au-code-sm totp-secret">{totpEnroll.secret}</code>
+            <a class="au-code-sm totp-uri-link" href={totpEnroll.otpauth_uri}>
+              Open in authenticator app
+            </a>
+          </div>
+        </details>
+        <Input
+          label="6-digit code"
+          bind:value={totpCode}
+          placeholder="123456"
+          autocomplete="one-time-code"
+          onkeydown={(e) => { if (e.key === 'Enter' && /^\d{6}$/.test(totpCode)) handleActivate(); }}
+          error={totpError}
+        />
+        <div class="card-actions totp-actions">
+          <Button variant="ghost" onclick={cancelEnroll} disabled={totpBusy}>Cancel</Button>
+          <Button
+            variant="primary"
+            onclick={handleActivate}
+            loading={totpBusy}
+            disabled={!/^\d{6}$/.test(totpCode) || totpBusy}
+          >
+            Verify and enable
+          </Button>
+        </div>
+      </div>
+    {:else if totpStatus?.enabled}
+      <p class="au-small au-fg-3">
+        <i class="ph ph-shield-check"></i>
+        Active.
+      </p>
+    {:else}
+      {#if totpError}
+        <div class="form-error au-small" role="alert">
+          <i class="ph ph-warning"></i>
+          {totpError}
+        </div>
+      {/if}
+      <div class="card-actions">
+        <Button variant="primary" onclick={handleStartEnroll} loading={totpBusy} disabled={totpBusy}>
+          Add authenticator app
+        </Button>
+      </div>
+    {/if}
+  </div>
+
   {#if appPasswordsAvailable}
     <div class="credential-card">
       <div class="credential-header">
@@ -239,6 +421,62 @@
       <Button variant="ghost" onclick={() => (showCreate = false)}>Cancel</Button>
       <Button variant="primary" onclick={handleCreateAppPassword} loading={creating} disabled={!newName.trim()}>
         Create
+      </Button>
+    {/snippet}
+  </Modal>
+{/if}
+
+{#if totpRecoveryCodes}
+  <Modal title="Save your recovery codes" onclose={() => (totpRecoveryCodes = null)}>
+    <p class="au-small">
+      Each code can be used <strong>once</strong> to sign in if you lose access to your
+      authenticator. Store them somewhere safe — they won't be shown again.
+    </p>
+    <ul class="totp-recovery-list">
+      {#each totpRecoveryCodes as code (code)}
+        <li><code class="au-code-sm">{code}</code></li>
+      {/each}
+    </ul>
+    <div class="reveal-row">
+      <Button variant="secondary" onclick={() => copy(totpRecoveryCodes!.join('\n'))}>
+        Copy all
+      </Button>
+    </div>
+    {#snippet actions()}
+      <Button variant="primary" onclick={() => (totpRecoveryCodes = null)}>
+        I've saved them
+      </Button>
+    {/snippet}
+  </Modal>
+{/if}
+
+{#if showDisableTotp}
+  <Modal title="Disable two-factor authentication" onclose={() => { showDisableTotp = false; totpError = ''; totpDisablePassword = ''; }}>
+    <p class="au-small">
+      Confirm your password to turn off 2FA. You can always re-enable it later.
+    </p>
+    <div class="create-field">
+      <Input
+        label="Current password"
+        type="password"
+        bind:value={totpDisablePassword}
+        autocomplete="current-password"
+        placeholder="••••••••••••"
+        error={totpError}
+        onkeydown={(e) => { if (e.key === 'Enter' && totpDisablePassword) handleDisableTotp(); }}
+      />
+    </div>
+    {#snippet actions()}
+      <Button variant="ghost" onclick={() => { showDisableTotp = false; totpError = ''; totpDisablePassword = ''; }}>
+        Cancel
+      </Button>
+      <Button
+        variant="primary"
+        onclick={handleDisableTotp}
+        loading={totpBusy}
+        disabled={!totpDisablePassword || totpBusy}
+      >
+        Disable 2FA
       </Button>
     {/snippet}
   </Modal>
@@ -339,5 +577,96 @@
     border-radius: var(--radius);
     font-family: var(--mono, ui-monospace, monospace);
     word-break: break-all;
+  }
+
+  .form-error {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    color: var(--danger);
+    background: var(--danger-subtle);
+    border: 1px solid rgba(239,68,68,0.2);
+    border-radius: var(--radius);
+    padding: var(--sp-2) var(--sp-3);
+  }
+
+  .totp-enroll {
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-3);
+  }
+
+  .totp-qr {
+    display: flex;
+    justify-content: center;
+    padding: var(--sp-4);
+    background: #fff;
+    border: 1px solid var(--border-1);
+    border-radius: var(--radius);
+  }
+  .totp-qr :global(svg) {
+    width: 192px;
+    height: 192px;
+    display: block;
+  }
+
+  .totp-manual {
+    border: 1px solid var(--border-1);
+    border-radius: var(--radius);
+    padding: var(--sp-2) var(--sp-3);
+    background: var(--bg-2);
+  }
+  .totp-manual summary {
+    cursor: pointer;
+    list-style: none;
+  }
+  .totp-manual summary::-webkit-details-marker { display: none; }
+  .totp-manual summary::before {
+    content: '▸ ';
+    display: inline-block;
+    transition: transform var(--duration-micro) var(--ease-out);
+    margin-right: var(--sp-1);
+  }
+  .totp-manual[open] summary::before { transform: rotate(90deg); }
+  .totp-manual-body {
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-2);
+    margin-top: var(--sp-3);
+  }
+  .totp-uri-link {
+    color: var(--accent);
+    text-decoration: underline;
+    word-break: break-all;
+  }
+
+  .totp-secret {
+    display: inline-block;
+    padding: var(--sp-1) var(--sp-2);
+    background: var(--bg-2);
+    border: 1px solid var(--border-1);
+    border-radius: var(--radius);
+    letter-spacing: 0.1em;
+  }
+
+  .totp-actions {
+    gap: var(--sp-2);
+  }
+
+  .totp-recovery-list {
+    list-style: none;
+    padding: var(--sp-3);
+    margin: var(--sp-3) 0 0;
+    background: var(--bg-2);
+    border: 1px solid var(--border-1);
+    border-radius: var(--radius);
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: var(--sp-2);
+  }
+  .totp-recovery-list li { text-align: center; }
+
+  @media (max-width: 480px) {
+    .totp-recovery-list { grid-template-columns: 1fr; }
   }
 </style>

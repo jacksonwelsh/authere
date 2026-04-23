@@ -10,7 +10,9 @@ argon2 = { version = "0.5.3", features = ["std"] }
 clap = { version = "4", features = ["derive"] }
 dotenvy = "0.15"
 hex = "0.4"
+sha1 = "0.10"
 sha2 = "0.10"
+hmac = "0.12"
 axum = "0.8.7"
 axum-extra = { version = "0.10", features = ["typed-header"] }
 headers = "0.4"

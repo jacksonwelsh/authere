@@ -171,7 +171,7 @@ async fn main() -> Result<(), AppError> {
         }
     }
 
-    use authere_server::handlers::{admin, app_passwords, application, auth, registration, role, user};
+    use authere_server::handlers::{admin, app_passwords, application, auth, registration, role, totp, user};
     use authere_server::scim;
 
     let (router, api) = OpenApiRouter::with_openapi(ApiDoc::openapi())
@@ -216,6 +216,11 @@ async fn main() -> Result<(), AppError> {
         // Admin invitations
         .routes(routes!(admin::list_invitations, admin::create_invitation))
         .routes(routes!(admin::delete_invitation))
+        // TOTP (user self-service + admin force-disable)
+        .routes(routes!(totp::get_my_totp_status, totp::disable_my_totp))
+        .routes(routes!(totp::enroll_my_totp))
+        .routes(routes!(totp::activate_my_totp))
+        .routes(routes!(totp::admin_disable_user_totp))
         // App passwords (user self-service)
         .routes(routes!(
             app_passwords::list_my_app_passwords,

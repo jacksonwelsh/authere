@@ -100,10 +100,10 @@ async function request<T>(path: string, init?: RequestInit, retry = true): Promi
 }
 
 // Auth
-export const login = (username: string, password: string) =>
+export const login = (username: string, password: string, totp_code?: string) =>
   request<TokenPair>('/api/auth/login', {
     method: 'POST',
-    body: JSON.stringify({ username, password }),
+    body: JSON.stringify({ username, password, totp_code }),
   });
 
 export const logout = () =>
@@ -246,6 +246,37 @@ export const listUserAppPasswords = (userId: string) =>
   request<AppPassword[]>(`/api/users/${userId}/app-passwords`);
 export const deleteUserAppPassword = (userId: string, id: string) =>
   request<void>(`/api/users/${userId}/app-passwords/${id}`, { method: 'DELETE' });
+
+// TOTP
+export interface TotpStatus {
+  enabled: boolean;
+  pending: boolean;
+}
+
+export interface TotpEnrollResponse {
+  secret: string;
+  otpauth_uri: string;
+}
+
+export interface TotpActivateResponse {
+  recovery_codes: string[];
+}
+
+export const getMyTotpStatus = () => request<TotpStatus>('/api/me/totp');
+export const enrollMyTotp = () =>
+  request<TotpEnrollResponse>('/api/me/totp/enroll', { method: 'POST' });
+export const activateMyTotp = (code: string) =>
+  request<TotpActivateResponse>('/api/me/totp/activate', {
+    method: 'POST',
+    body: JSON.stringify({ code }),
+  });
+export const disableMyTotp = (currentPassword: string) =>
+  request<void>('/api/me/totp', {
+    method: 'DELETE',
+    body: JSON.stringify({ current_password: currentPassword }),
+  });
+export const adminDisableUserTotp = (userId: string) =>
+  request<void>(`/api/user/${userId}/totp`, { method: 'DELETE' });
 
 // Invitations
 export interface Invitation {

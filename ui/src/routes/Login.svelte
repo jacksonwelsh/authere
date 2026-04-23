@@ -5,6 +5,8 @@
 
   let username = $state('');
   let password = $state('');
+  let totpCode = $state('');
+  let mfaRequired = $state(false);
   let error = $state('');
   let loading = $state(false);
 
@@ -23,19 +25,39 @@
 
   const redirectUri = sanitizeRedirect(rawRedirect);
 
+  function parseErrorCode(body: string): string | null {
+    try {
+      const parsed = JSON.parse(body);
+      return typeof parsed.error === 'string' ? parsed.error : null;
+    } catch {
+      return null;
+    }
+  }
+
   async function handleSubmit(e: SubmitEvent) {
     e.preventDefault();
     if (loading) return;
     error = '';
     loading = true;
     try {
-      await login(username, password);
+      await login(username, password, mfaRequired ? totpCode : undefined);
       window.location.href = redirectUri;
     } catch (err) {
       if (err instanceof ApiError) {
+        const code = parseErrorCode(err.message);
         if (err.status === 429) {
           error = 'Too many attempts. Wait a minute and try again.';
+        } else if (err.status === 401 && code === 'mfa_required') {
+          mfaRequired = true;
+          error = '';
+          totpCode = '';
+        } else if (err.status === 401 && code === 'invalid_totp') {
+          error = 'That code did not match. Try again — codes rotate every 30 seconds.';
+          totpCode = '';
         } else if (err.status === 401) {
+          // Password was wrong — reset MFA state in case this retry used a stale code.
+          mfaRequired = false;
+          totpCode = '';
           error = 'Username or password is incorrect.';
         } else {
           error = `Sign-in failed (${err.status}).`;
@@ -66,20 +88,34 @@
 
     <form onsubmit={handleSubmit} novalidate>
       <div class="form-fields">
-        <Input
-          label="Username"
-          bind:value={username}
-          autocomplete="username"
-          autofocus
-          placeholder="you"
-        />
-        <Input
-          label="Password"
-          type="password"
-          bind:value={password}
-          autocomplete="current-password"
-          placeholder="••••••••••••"
-        />
+        {#if !mfaRequired}
+          <Input
+            label="Username"
+            bind:value={username}
+            autocomplete="username"
+            autofocus
+            placeholder="you"
+          />
+          <Input
+            label="Password"
+            type="password"
+            bind:value={password}
+            autocomplete="current-password"
+            placeholder="••••••••••••"
+          />
+        {:else}
+          <p class="au-small au-fg-3">
+            Enter the 6-digit code from your authenticator app, or a recovery code if you've
+            lost your device.
+          </p>
+          <Input
+            label="Authentication code"
+            bind:value={totpCode}
+            autocomplete="one-time-code"
+            autofocus
+            placeholder="123456"
+          />
+        {/if}
       </div>
 
       {#if error}
@@ -89,9 +125,15 @@
         </div>
       {/if}
 
-      <Button variant="primary" size="lg" type="submit" {loading} disabled={!username || !password || loading}>
-        Sign in
-      </Button>
+      {#if !mfaRequired}
+        <Button variant="primary" size="lg" type="submit" {loading} disabled={!username || !password || loading}>
+          Sign in
+        </Button>
+      {:else}
+        <Button variant="primary" size="lg" type="submit" {loading} disabled={!totpCode || loading}>
+          Verify
+        </Button>
+      {/if}
     </form>
   </div>
 </div>

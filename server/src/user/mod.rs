@@ -34,10 +34,14 @@ pub struct CreateUserInput {
     pub email: Option<String>,
 }
 
-#[derive(Deserialize, Serialize, ToSchema)]
+#[derive(Clone, Deserialize, Serialize, ToSchema)]
 pub struct LoginInput {
     pub username: String,
     pub password: String,
+    /// TOTP code or recovery code, required on the second step of login for users who have
+    /// activated MFA. Absent on the first step.
+    #[serde(default)]
+    pub totp_code: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]

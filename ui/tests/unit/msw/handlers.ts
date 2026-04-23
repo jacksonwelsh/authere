@@ -5,6 +5,7 @@ import { mkMe } from './factories';
 // Individual tests override specific endpoints via `server.use(...)`.
 export const defaultHandlers = [
   http.get('/api/me', () => HttpResponse.json(mkMe())),
+  http.get('/api/me/totp', () => HttpResponse.json({ enabled: false, pending: false })),
   http.post('/api/auth/browser-refresh', () => HttpResponse.json({})),
   http.post('/api/auth/browser-logout', () => HttpResponse.json({})),
 ];

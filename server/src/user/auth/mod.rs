@@ -11,6 +11,7 @@ use sqlx::{FromRow, Row, SqliteConnection, sqlite::SqliteRow};
 use uuid::Uuid;
 
 pub mod token;
+pub mod totp;
 
 const MIN_PASSWORD_LEN: usize = 12;
 const MAX_PASSWORD_LEN: usize = 512;

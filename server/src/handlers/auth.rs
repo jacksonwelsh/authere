@@ -15,7 +15,39 @@ use crate::handlers::{LoginError, build_auth_cookie, build_refresh_cookie, clear
 use crate::rate_limit::RateLimitExceeded;
 use crate::user::auth::Authenticator;
 use crate::user::auth::token::{self, REFRESH_TOKEN_LIFETIME, TokenPair, generate_token_pair, verify_and_revoke_refresh_token, revoke_user_access_tokens};
+use crate::user::auth::totp::{self, UserTotp};
 use crate::user::{LoginInput, User};
+
+/// Enforce MFA for users who have activated TOTP. Call AFTER successful password check.
+/// Returns Ok(()) if the user has no MFA, or if the provided code matches. Returns
+/// `LoginError::MfaRequired` when no code is provided and `MfaInvalid` when the code is wrong.
+async fn enforce_mfa(
+    user_id: uuid::Uuid,
+    totp_code: Option<&str>,
+    conn: &mut sqlx::SqliteConnection,
+) -> Result<(), LoginError> {
+    let Some(totp_row) = UserTotp::get(user_id, conn).await.map_err(LoginError::App)? else {
+        return Ok(());
+    };
+    if !totp_row.is_activated() {
+        return Ok(());
+    }
+    let Some(code) = totp_code.map(|c| c.trim()).filter(|c| !c.is_empty()) else {
+        return Err(LoginError::MfaRequired);
+    };
+
+    let secret = totp::decrypt_secret(&totp_row.secret_encrypted).map_err(LoginError::App)?;
+    let now = totp::now_epoch();
+    if let Some(step) = totp::verify_code(&secret, code, now, totp_row.last_used_step) {
+        UserTotp::record_step(user_id, step, conn).await.map_err(LoginError::App)?;
+        return Ok(());
+    }
+    // Fall back to recovery codes. Consumption is atomic; a valid unused code is accepted once.
+    if totp::consume_recovery_code(user_id, code, conn).await.map_err(LoginError::App)? {
+        return Ok(());
+    }
+    Err(LoginError::MfaInvalid)
+}
 
 const AUTH_TAG: &str = "auth";
 
@@ -60,6 +92,7 @@ fn build_auth_headers(user: &User, roles: &[String], email: Option<&str>) -> Hea
         example = json!(LoginInput {
             username: String::from("bob_burger"),
             password: String::from("hunter2hunter2"),
+            totp_code: None,
         }),
     ),
     responses(
@@ -87,6 +120,7 @@ pub async fn login(
     }
 
     let username = input.username.clone();
+    let totp_code = input.totp_code.clone();
     let user = match User::login(input, &mut conn).await {
         Ok(user) => user,
         Err(e) => {
@@ -97,6 +131,17 @@ pub async fn login(
             return Err(e.into());
         }
     };
+
+    match enforce_mfa(user.id, totp_code.as_deref(), &mut conn).await {
+        Ok(()) => {}
+        Err(LoginError::MfaRequired) => return Err(LoginError::MfaRequired),
+        Err(e) => {
+            state.login_rate_limiter.record_failure(audit_ctx.ip).await;
+            warn!(user_id = %user.id, username = %username, ip = %audit_ctx.ip, "login failed: bad totp");
+            let _ = log_login_failed(&username, Some(user.id), &audit_ctx, &mut conn).await;
+            return Err(e);
+        }
+    }
 
     let roles = user.get_roles(&mut conn).await?;
     let token_pair = generate_token_pair(user.id, roles, &state.signing_key, &mut conn).await?;
@@ -216,6 +261,7 @@ pub async fn browser_login(
     }
 
     let username = input.username.clone();
+    let totp_code = input.totp_code.clone();
     let user = match User::login(input, &mut conn).await {
         Ok(user) => user,
         Err(e) => {
@@ -226,6 +272,17 @@ pub async fn browser_login(
             return Err(e.into());
         }
     };
+
+    match enforce_mfa(user.id, totp_code.as_deref(), &mut conn).await {
+        Ok(()) => {}
+        Err(LoginError::MfaRequired) => return Err(LoginError::MfaRequired),
+        Err(e) => {
+            state.login_rate_limiter.record_failure(audit_ctx.ip).await;
+            warn!(user_id = %user.id, username = %username, ip = %audit_ctx.ip, "browser login failed: bad totp");
+            let _ = log_login_failed(&username, Some(user.id), &audit_ctx, &mut conn).await;
+            return Err(e);
+        }
+    }
 
     let roles = user.get_roles(&mut conn).await?;
     let token_pair = generate_token_pair(user.id, roles, &state.signing_key, &mut conn).await?;

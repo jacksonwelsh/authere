@@ -4,6 +4,7 @@ pub mod application;
 pub mod auth;
 pub mod registration;
 pub mod role;
+pub mod totp;
 pub mod user;
 
 use axum::response::{IntoResponse, Response};
@@ -43,13 +44,31 @@ pub fn clear_auth_cookies() -> Vec<String> {
 pub enum LoginError {
     App(AppError),
     RateLimit(RateLimitExceeded),
+    /// Password was correct, but the account requires a TOTP second factor and none was
+    /// provided. The client should prompt for a code and retry.
+    MfaRequired,
+    /// A TOTP/recovery code was provided but did not match.
+    MfaInvalid,
 }
 
 impl IntoResponse for LoginError {
     fn into_response(self) -> Response {
+        use axum::http::StatusCode;
         match self {
             LoginError::App(e) => e.into_response(),
             LoginError::RateLimit(e) => e.into_response(),
+            LoginError::MfaRequired => (
+                StatusCode::UNAUTHORIZED,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                r#"{"error":"mfa_required"}"#,
+            )
+                .into_response(),
+            LoginError::MfaInvalid => (
+                StatusCode::UNAUTHORIZED,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                r#"{"error":"invalid_totp"}"#,
+            )
+                .into_response(),
         }
     }
 }

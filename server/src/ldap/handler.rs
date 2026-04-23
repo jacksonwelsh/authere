@@ -347,7 +347,7 @@ fn service_dn(cfg: &LdapConfig) -> Dn {
 
 async fn user_has_totp(user_id: Uuid, conn: &mut SqliteConnection) -> Result<bool, sqlx::Error> {
     let row = sqlx::query!(
-        "SELECT COUNT(*) as count FROM authenticators WHERE owner_id = ? AND type = 'totp'",
+        "SELECT COUNT(*) as count FROM user_totps WHERE user_id = ? AND activated_at IS NOT NULL",
         user_id
     )
     .fetch_one(conn)
