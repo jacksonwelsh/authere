@@ -331,7 +331,7 @@
             </span>
           </div>
           <select
-            class="au-input session-expiry-select"
+            class="session-expiry-select"
             value={settings.session_expiry_seconds}
             onchange={(e) => handleSessionExpiryChange(Number((e.currentTarget as HTMLSelectElement).value))}
             disabled={saving}
@@ -749,9 +749,53 @@
     border-color: var(--danger, #EF4444);
   }
 
+  /* Mirrors the .au-input styling from Input.svelte. The class is component-
+     scoped there, so we restate the look here rather than relying on it
+     leaking globally. */
   .session-expiry-select {
     flex-shrink: 0;
-    min-width: 140px;
+    min-width: 160px;
+    height: 40px;
+    padding: 0 var(--sp-8) 0 var(--sp-3);
+    background-color: var(--bg-2);
+    border: 1px solid var(--border-1);
+    border-radius: var(--radius);
+    color: var(--fg-1);
+    font-family: inherit;
+    font-size: 16px;
+    line-height: 1;
+    outline: none;
+    appearance: none;
+    -webkit-appearance: none;
+    cursor: pointer;
+    transition: border-color var(--duration-micro) var(--ease-out),
+                box-shadow var(--duration-micro) var(--ease-out);
+    /* Caret. Encoded inline so we don't depend on an asset path. */
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 8' fill='none' stroke='%23888' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'><path d='M1 1.5l5 5 5-5'/></svg>");
+    background-repeat: no-repeat;
+    background-position: right var(--sp-3) center;
+    background-size: 12px 8px;
+  }
+
+  .session-expiry-select:hover:not(:disabled) {
+    border-color: var(--border-2);
+  }
+
+  .session-expiry-select:focus {
+    border-color: var(--border-focus);
+    box-shadow: 0 0 0 2px var(--accent-subtle) inset;
+  }
+
+  .session-expiry-select:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+
+  @media (min-width: 640px) {
+    .session-expiry-select {
+      height: 32px;
+      font-size: 13px;
+    }
   }
 
   /* Toggle switch */

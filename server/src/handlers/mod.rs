@@ -25,19 +25,27 @@ pub fn build_auth_cookie(token: &str, max_age_secs: i64) -> String {
     )
 }
 
-/// Build Set-Cookie header for refresh token
+/// Build Set-Cookie header for refresh token.
+///
+/// Path is `/api/auth` so the browser sends the cookie to both the refresh and
+/// browser-logout endpoints (both live under `/api/auth/...`). An earlier version
+/// used `Path=/auth`, which never matched any real endpoint and silently broke
+/// session refresh — sessions then ended up bounded by the access-token TTL
+/// regardless of `session_expiry_seconds`.
 pub fn build_refresh_cookie(token: &str, max_age_secs: i64) -> String {
     format!(
-        "{}={}; HttpOnly; Secure; SameSite=Strict; Path=/auth; Max-Age={}",
+        "{}={}; HttpOnly; Secure; SameSite=Strict; Path=/api/auth; Max-Age={}",
         REFRESH_COOKIE_NAME, token, max_age_secs
     )
 }
 
-/// Clear authentication cookies
+/// Clear authentication cookies. The refresh-cookie Path here must match the
+/// Path used in [`build_refresh_cookie`], otherwise the browser keeps the old
+/// cookie around.
 pub fn clear_auth_cookies() -> Vec<String> {
     vec![
         format!("{}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0", AUTH_COOKIE_NAME),
-        format!("{}=; HttpOnly; Secure; SameSite=Strict; Path=/auth; Max-Age=0", REFRESH_COOKIE_NAME),
+        format!("{}=; HttpOnly; Secure; SameSite=Strict; Path=/api/auth; Max-Age=0", REFRESH_COOKIE_NAME),
     ]
 }
 
@@ -135,8 +143,21 @@ mod tests {
         assert!(cookie.contains("HttpOnly"));
         assert!(cookie.contains("Secure"));
         assert!(cookie.contains("SameSite=Strict"));
-        assert!(cookie.contains("Path=/auth"));
+        assert!(cookie.contains("Path=/api/auth"));
         assert!(cookie.contains("Max-Age=604800"));
+    }
+
+    #[test]
+    fn refresh_cookie_path_matches_refresh_endpoint() {
+        // Regression: previously this was `/auth`, which never matched the real
+        // `/api/auth/browser-refresh` path, so the browser silently dropped the
+        // cookie on refresh and sessions died at access-token TTL.
+        let cookie = build_refresh_cookie("t", 60);
+        assert!(
+            cookie.contains("Path=/api/auth"),
+            "refresh cookie Path must cover /api/auth/browser-refresh and \
+             /api/auth/browser-logout, got: {cookie}"
+        );
     }
 
     #[test]
@@ -150,7 +171,8 @@ mod tests {
 
         assert!(cookies[1].contains("authere_refresh="));
         assert!(cookies[1].contains("Max-Age=0"));
-        assert!(cookies[1].contains("Path=/auth"));
+        // Must match build_refresh_cookie's Path or the browser keeps the old cookie.
+        assert!(cookies[1].contains("Path=/api/auth"));
     }
 
     #[test]
