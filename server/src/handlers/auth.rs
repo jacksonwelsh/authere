@@ -491,6 +491,248 @@ fn build_forward_auth_redirect(origin: &str, headers: &HeaderMap) -> Response {
         .into_response()
 }
 
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+/// Render a styled HTML 403 page for forward-auth denials. The body is shown to humans
+/// by the reverse proxy when verify_auth returns 403, so it gets the same dark/dotgrid
+/// vibe as the login page rather than plain text.
+fn build_forward_auth_denied_html(
+    origin: &str,
+    headers: &HeaderMap,
+    app_name: Option<&str>,
+    required_roles: &[String],
+) -> Response {
+    let proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("https");
+    let host = headers
+        .get("x-forwarded-host")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let uri = headers
+        .get("x-forwarded-uri")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("/");
+
+    let switch_user_url = if host.is_empty() {
+        format!("{origin}/login")
+    } else {
+        let target = format!("{proto}://{host}{uri}");
+        format!(
+            "{origin}/api/auth/forward-redirect?redirect_uri={}",
+            urlencoding::encode(&target)
+        )
+    };
+    let switch_user_url = html_escape(&switch_user_url);
+
+    let app_block = match app_name {
+        Some(name) if !name.is_empty() => format!(
+            r#"<div class="row"><span class="label">Application</span><span class="value">{}</span></div>"#,
+            html_escape(name)
+        ),
+        _ => String::new(),
+    };
+
+    let roles_block = if required_roles.is_empty() {
+        String::new()
+    } else {
+        let chips: String = required_roles
+            .iter()
+            .map(|r| format!(r#"<span class="chip">{}</span>"#, html_escape(r)))
+            .collect::<Vec<_>>()
+            .join("");
+        format!(
+            r#"<div class="row"><span class="label">Required roles</span><span class="value chips">{chips}</span></div>"#
+        )
+    };
+
+    let details = if app_block.is_empty() && roles_block.is_empty() {
+        String::new()
+    } else {
+        format!(r#"<div class="details">{app_block}{roles_block}</div>"#)
+    };
+
+    let body = format!(
+        r##"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Access denied</title>
+<style>
+  *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  html, body {{ height: 100%; }}
+  body {{
+    background: #05080f;
+    color: #f4f6fa;
+    font-family: 'IBM Plex Sans', system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    background-image: radial-gradient(circle, rgba(255,255,255,0.04) 1px, transparent 1px);
+    background-size: 24px 24px;
+  }}
+  .wrap {{
+    min-height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 32px;
+  }}
+  .card {{
+    width: 100%;
+    max-width: 440px;
+    background: #0a0f1c;
+    border: 1px solid rgba(255,255,255,0.10);
+    border-radius: 2px;
+    padding: 32px;
+    display: flex;
+    flex-direction: column;
+    gap: 24px;
+  }}
+  @media (max-width: 639.98px) {{
+    .wrap {{ padding: 16px; }}
+    .card {{ padding: 24px 16px; }}
+  }}
+  .header {{ display: flex; flex-direction: column; gap: 8px; }}
+  .logo {{
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: #f4f6fa;
+    margin-bottom: 8px;
+    font-size: 15px;
+    font-weight: 600;
+  }}
+  h1 {{
+    font-size: 18px;
+    line-height: 1.3;
+    letter-spacing: -0.005em;
+    font-weight: 600;
+    color: #f4f6fa;
+  }}
+  .subtle {{ font-size: 13px; line-height: 1.45; color: #b4bcd0; }}
+  .alert {{
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: #ef4444;
+    background: #2d0a0a;
+    border: 1px solid rgba(239,68,68,0.2);
+    border-radius: 2px;
+    padding: 8px 12px;
+    font-size: 13px;
+  }}
+  .alert::before {{
+    content: "";
+    width: 14px;
+    height: 14px;
+    flex: 0 0 14px;
+    background: #ef4444;
+    -webkit-mask: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><path fill='black' d='M7.001 2a1 1 0 0 1 1.998 0l-.25 7a.75.75 0 0 1-1.498 0L7.001 2zm.999 12a1.25 1.25 0 1 1 0-2.5 1.25 1.25 0 0 1 0 2.5z'/></svg>") center/contain no-repeat;
+            mask: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><path fill='black' d='M7.001 2a1 1 0 0 1 1.998 0l-.25 7a.75.75 0 0 1-1.498 0L7.001 2zm.999 12a1.25 1.25 0 1 1 0-2.5 1.25 1.25 0 0 1 0 2.5z'/></svg>") center/contain no-repeat;
+  }}
+  .details {{
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 12px;
+    border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 2px;
+    background: #0f1524;
+  }}
+  .row {{ display: flex; flex-direction: column; gap: 4px; }}
+  .label {{
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: #8390ad;
+  }}
+  .value {{ color: #dce1ed; font-size: 13px; word-break: break-word; }}
+  .chips {{ display: flex; flex-wrap: wrap; gap: 4px; }}
+  .chip {{
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 8px;
+    border: 1px solid rgba(255,255,255,0.10);
+    border-radius: 2px;
+    background: #141b2d;
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-size: 12px;
+    color: #dce1ed;
+  }}
+  .actions {{ display: flex; flex-direction: column; gap: 8px; }}
+  .btn {{
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    height: 40px;
+    padding: 0 16px;
+    border-radius: 2px;
+    font-size: 14px;
+    font-weight: 500;
+    text-decoration: none;
+    border: 1px solid transparent;
+    cursor: pointer;
+    transition: background-color 140ms cubic-bezier(0.2, 0, 0, 1);
+  }}
+  .btn-primary {{ background: #3b82f6; color: #ffffff; }}
+  .btn-primary:hover {{ background: #2563eb; }}
+  .btn-ghost {{
+    background: transparent;
+    color: #dce1ed;
+    border-color: rgba(255,255,255,0.10);
+  }}
+  .btn-ghost:hover {{ background: #141b2d; }}
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <div class="header">
+        <div class="logo">
+          <svg width="28" height="28" viewBox="0 0 28 28" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+            <rect width="28" height="28" rx="4" fill="#3B82F6" fill-opacity="0.15"/>
+            <path d="M14 5L21 9.5v9L14 23l-7-4.5v-9L14 5z" stroke="#3B82F6" stroke-width="1.5" stroke-linejoin="round" fill="none"/>
+            <circle cx="14" cy="14" r="2.5" fill="#3B82F6"/>
+          </svg>
+          <span>authere</span>
+        </div>
+        <h1>Access denied</h1>
+        <p class="subtle">You're signed in, but your account doesn't have permission to view this page.</p>
+      </div>
+
+      <div class="alert" role="alert">Your roles don't grant access to this application.</div>
+
+      {details}
+
+      <div class="actions">
+        <a class="btn btn-primary" href="{switch_user_url}">Sign in as a different user</a>
+        <a class="btn btn-ghost" href="javascript:history.back()">Go back</a>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
+"##
+    );
+
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(axum::body::Body::from(body))
+        .unwrap()
+}
+
 #[utoipa::path(
     get,
     path = "/api/auth/verify",
@@ -569,7 +811,12 @@ pub async fn verify_auth(
                 required_roles = ?app.required_roles,
                 "forward auth denied: insufficient roles"
             );
-            return Err(AppError::Forbidden.into_response());
+            return Err(build_forward_auth_denied_html(
+                &state.origin,
+                &headers,
+                Some(&app.name),
+                &app.required_roles,
+            ));
         }
     }
 
@@ -865,5 +1112,84 @@ mod tests {
             extract_location(&resp),
             "https://auth.example.com/api/auth/forward-redirect?redirect_uri=https%3A%2F%2Fapp.example.com%2F"
         );
+    }
+
+    #[test]
+    fn html_escape_replaces_special_chars() {
+        assert_eq!(
+            html_escape(r#"<script>alert("x&y's")</script>"#),
+            "&lt;script&gt;alert(&quot;x&amp;y&#39;s&quot;)&lt;/script&gt;"
+        );
+    }
+
+    async fn collect_body(resp: Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn forward_auth_denied_html_returns_styled_403() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        headers.insert("x-forwarded-host", "app.example.com".parse().unwrap());
+        headers.insert("x-forwarded-uri", "/dashboard".parse().unwrap());
+
+        let resp = build_forward_auth_denied_html(
+            "https://auth.example.com",
+            &headers,
+            Some("Production Dashboard"),
+            &["admin".to_string(), "ops".to_string()],
+        );
+
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/html; charset=utf-8"
+        );
+
+        let body = collect_body(resp).await;
+        assert!(body.contains("<title>Access denied</title>"));
+        assert!(body.contains("Access denied"));
+        assert!(body.contains("Production Dashboard"));
+        assert!(body.contains(r#"<span class="chip">admin</span>"#));
+        assert!(body.contains(r#"<span class="chip">ops</span>"#));
+        assert!(body.contains(
+            "https://auth.example.com/api/auth/forward-redirect?redirect_uri=https%3A%2F%2Fapp.example.com%2Fdashboard"
+        ));
+    }
+
+    #[tokio::test]
+    async fn forward_auth_denied_html_escapes_app_name_and_roles() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-host", "app.example.com".parse().unwrap());
+
+        let resp = build_forward_auth_denied_html(
+            "https://auth.example.com",
+            &headers,
+            Some("<evil> & co"),
+            &["<role>".to_string()],
+        );
+
+        let body = collect_body(resp).await;
+        assert!(body.contains("&lt;evil&gt; &amp; co"));
+        assert!(body.contains("&lt;role&gt;"));
+        assert!(!body.contains("<evil>"));
+    }
+
+    #[tokio::test]
+    async fn forward_auth_denied_html_omits_details_when_unknown() {
+        let headers = HeaderMap::new();
+
+        let resp = build_forward_auth_denied_html(
+            "https://auth.example.com",
+            &headers,
+            None,
+            &[],
+        );
+
+        let body = collect_body(resp).await;
+        assert!(!body.contains(r#"class="details""#));
+        // Falls back to plain /login when no forwarded host is present.
+        assert!(body.contains(r#"href="https://auth.example.com/login""#));
     }
 }
