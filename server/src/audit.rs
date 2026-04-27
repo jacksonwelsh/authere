@@ -41,10 +41,15 @@ fn extract_client_ip(xff: Option<&str>, peer_ip: IpAddr) -> IpAddr {
 }
 
 /// Request context for audit logging — IP address and user agent, extracted once per request.
+///
+/// `ip` is always an `IpAddr` (UNSPECIFIED if no peer info was available) so
+/// rate limiters can use it as a bucket key. `ip_address` is the value we
+/// actually persist to the audit log, and is `None` when there was no real
+/// remote — recording `0.0.0.0` for an unknown peer would muddy the log.
 #[derive(Debug, Clone)]
 pub struct AuditContext {
     pub ip: IpAddr,
-    pub ip_address: String,
+    pub ip_address: Option<String>,
     pub user_agent: Option<String>,
 }
 
@@ -55,15 +60,20 @@ impl<S: Send + Sync> FromRequestParts<S> for AuditContext {
         let peer_ip = parts
             .extensions
             .get::<ConnectInfo<SocketAddr>>()
-            .map(|ci| ci.0.ip())
-            .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+            .map(|ci| ci.0.ip());
 
         let xff = parts
             .headers
             .get("x-forwarded-for")
             .and_then(|v| v.to_str().ok());
 
-        let ip = extract_client_ip(xff, peer_ip);
+        let (ip, ip_address) = match peer_ip {
+            Some(p) => {
+                let resolved = extract_client_ip(xff, p);
+                (resolved, Some(resolved.to_string()))
+            }
+            None => (IpAddr::V4(Ipv4Addr::UNSPECIFIED), None),
+        };
 
         let user_agent = TypedHeader::<UserAgent>::from_request_parts(parts, state)
             .await
@@ -72,7 +82,7 @@ impl<S: Send + Sync> FromRequestParts<S> for AuditContext {
 
         Ok(AuditContext {
             ip,
-            ip_address: ip.to_string(),
+            ip_address,
             user_agent,
         })
     }
@@ -306,9 +316,13 @@ impl AuditLogEntry {
 
     /// Pull IP and user-agent from an HTTP request's audit context. This is the
     /// one-call replacement for `.ip(&ctx.ip_address).user_agent(ua)` that most
-    /// producers used to repeat.
+    /// producers used to repeat. The IP is forwarded only when the request
+    /// actually had a remote peer; otherwise the audit row's `ip_address`
+    /// stays NULL rather than recording a fake address.
     pub fn ctx(mut self, ctx: &AuditContext) -> Self {
-        self.ip_address = Some(ctx.ip_address.clone());
+        if let Some(ref ip) = ctx.ip_address {
+            self.ip_address = Some(ip.clone());
+        }
         if let Some(ref ua) = ctx.user_agent {
             self.user_agent = Some(ua.clone());
         }
@@ -672,7 +686,7 @@ mod tests {
     fn builder_applies_ctx_ip_and_user_agent() {
         let ctx = AuditContext {
             ip: "10.0.0.5".parse().unwrap(),
-            ip_address: "10.0.0.5".into(),
+            ip_address: Some("10.0.0.5".into()),
             user_agent: Some("Mozilla/5.0".into()),
         };
         let entry = audit(AuditEventType::LoginSuccess).ctx(&ctx);
@@ -684,12 +698,25 @@ mod tests {
     fn builder_ctx_without_user_agent_leaves_field_empty() {
         let ctx = AuditContext {
             ip: "127.0.0.1".parse().unwrap(),
-            ip_address: "127.0.0.1".into(),
+            ip_address: Some("127.0.0.1".into()),
             user_agent: None,
         };
         let entry = audit(AuditEventType::Logout).ctx(&ctx);
         assert_eq!(entry.ip_address.as_deref(), Some("127.0.0.1"));
         assert!(entry.user_agent.is_none());
+    }
+
+    #[test]
+    fn builder_ctx_without_peer_ip_records_no_ip() {
+        // No ConnectInfo at extraction time → no real remote IP. The audit row's
+        // ip_address stays NULL rather than getting a fake "0.0.0.0".
+        let ctx = AuditContext {
+            ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            ip_address: None,
+            user_agent: None,
+        };
+        let entry = audit(AuditEventType::SystemRestarted).ctx(&ctx);
+        assert!(entry.ip_address.is_none());
     }
 
     #[test]
@@ -888,10 +915,10 @@ mod tests {
     fn test_audit_context_default_ip() {
         let ctx = AuditContext {
             ip: "127.0.0.1".parse().unwrap(),
-            ip_address: "127.0.0.1".into(),
+            ip_address: Some("127.0.0.1".into()),
             user_agent: None,
         };
-        assert_eq!(ctx.ip_address, "127.0.0.1");
+        assert_eq!(ctx.ip_address.as_deref(), Some("127.0.0.1"));
         assert!(ctx.user_agent.is_none());
     }
 }
