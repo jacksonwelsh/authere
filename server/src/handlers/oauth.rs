@@ -15,7 +15,9 @@
 
 use axum::extract::{Form, Query, State};
 use axum::http::Uri;
-use axum::http::header::{AUTHORIZATION, LOCATION, SET_COOKIE, WWW_AUTHENTICATE};
+use axum::http::header::{
+    self, AUTHORIZATION, LOCATION, SET_COOKIE, WWW_AUTHENTICATE,
+};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use base64::Engine;
@@ -838,12 +840,168 @@ pub async fn end_session(
         return (StatusCode::FOUND, resp_headers).into_response();
     }
 
-    (
-        StatusCode::OK,
-        resp_headers,
-        axum::Json(json!({ "signed_out": true })),
+    let html = build_signed_out_html(&state.origin, app.as_ref().map(|a| a.name.as_str()));
+    resp_headers.insert(header::CONTENT_TYPE, "text/html; charset=utf-8".parse().unwrap());
+    resp_headers.insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+    (StatusCode::OK, resp_headers, html).into_response()
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+/// Render the styled HTML page shown after RP-initiated logout when no
+/// `post_logout_redirect_uri` redirect is performed. Matches the login screen's
+/// dark dot-grid look and surfaces the application name (when known) so the user
+/// knows which session was ended.
+fn build_signed_out_html(origin: &str, app_name: Option<&str>) -> String {
+    let sign_in_url = html_escape(&format!("{origin}/login"));
+
+    let app_block = match app_name {
+        Some(name) if !name.is_empty() => format!(
+            r#"<div class="details"><div class="row"><span class="label">Application</span><span class="value">{}</span></div></div>"#,
+            html_escape(name)
+        ),
+        _ => String::new(),
+    };
+
+    let lede = match app_name {
+        Some(name) if !name.is_empty() => format!(
+            r#"<p class="subtle">Your session for {} has ended. You can sign back in to continue.</p>"#,
+            html_escape(name)
+        ),
+        _ => r#"<p class="subtle">Your session has ended. You can sign back in to continue.</p>"#
+            .to_string(),
+    };
+
+    format!(
+        r##"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Signed out</title>
+<style>
+  *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  html, body {{ height: 100%; }}
+  body {{
+    background: #05080f;
+    color: #f4f6fa;
+    font-family: 'IBM Plex Sans', system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    background-image: radial-gradient(circle, rgba(255,255,255,0.04) 1px, transparent 1px);
+    background-size: 24px 24px;
+  }}
+  .wrap {{
+    min-height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 32px;
+  }}
+  .card {{
+    width: 100%;
+    max-width: 440px;
+    background: #0a0f1c;
+    border: 1px solid rgba(255,255,255,0.10);
+    border-radius: 2px;
+    padding: 32px;
+    display: flex;
+    flex-direction: column;
+    gap: 24px;
+  }}
+  @media (max-width: 639.98px) {{
+    .wrap {{ padding: 16px; }}
+    .card {{ padding: 24px 16px; }}
+  }}
+  .header {{ display: flex; flex-direction: column; gap: 8px; }}
+  .logo {{
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: #f4f6fa;
+    margin-bottom: 8px;
+    font-size: 15px;
+    font-weight: 600;
+  }}
+  h1 {{
+    font-size: 18px;
+    line-height: 1.3;
+    letter-spacing: -0.005em;
+    font-weight: 600;
+    color: #f4f6fa;
+  }}
+  .subtle {{ font-size: 13px; line-height: 1.45; color: #b4bcd0; }}
+  .details {{
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 12px;
+    border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 2px;
+    background: #0f1524;
+  }}
+  .row {{ display: flex; flex-direction: column; gap: 4px; }}
+  .label {{
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: #8390ad;
+  }}
+  .value {{ color: #dce1ed; font-size: 13px; word-break: break-word; }}
+  .actions {{ display: flex; flex-direction: column; gap: 8px; }}
+  .btn {{
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    height: 40px;
+    padding: 0 16px;
+    border-radius: 2px;
+    font-size: 14px;
+    font-weight: 500;
+    text-decoration: none;
+    border: 1px solid transparent;
+    cursor: pointer;
+    transition: background-color 140ms cubic-bezier(0.2, 0, 0, 1);
+  }}
+  .btn-primary {{ background: #3b82f6; color: #ffffff; }}
+  .btn-primary:hover {{ background: #2563eb; }}
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <div class="header">
+        <div class="logo">
+          <svg width="28" height="28" viewBox="0 0 28 28" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+            <rect width="28" height="28" rx="4" fill="#3B82F6" fill-opacity="0.15"/>
+            <path d="M14 5L21 9.5v9L14 23l-7-4.5v-9L14 5z" stroke="#3B82F6" stroke-width="1.5" stroke-linejoin="round" fill="none"/>
+            <circle cx="14" cy="14" r="2.5" fill="#3B82F6"/>
+          </svg>
+          <span>authere</span>
+        </div>
+        <h1>You're signed out</h1>
+        {lede}
+      </div>
+
+      {app_block}
+
+      <div class="actions">
+        <a class="btn btn-primary" href="{sign_in_url}">Sign in again</a>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
+"##
     )
-        .into_response()
 }
 
 #[cfg(test)]
@@ -978,6 +1136,46 @@ mod tests {
     fn extract_session_cookie_returns_none_without_cookie() {
         let h = HeaderMap::new();
         assert!(extract_session_cookie(&h).is_none());
+    }
+
+    #[test]
+    fn html_escape_replaces_special_chars() {
+        assert_eq!(
+            html_escape(r#"<script>alert("x&y's")</script>"#),
+            "&lt;script&gt;alert(&quot;x&amp;y&#39;s&quot;)&lt;/script&gt;",
+        );
+    }
+
+    #[test]
+    fn signed_out_html_contains_brand_and_sign_in_link() {
+        let body = build_signed_out_html("https://authere.example", Some("Production Dashboard"));
+        assert!(body.contains("<title>Signed out</title>"));
+        assert!(body.contains("You're signed out"));
+        assert!(body.contains("Production Dashboard"));
+        // Sign-in CTA points back at the host's /login.
+        assert!(body.contains(r#"href="https://authere.example/login""#));
+        // Same brand mark as the login screen.
+        assert!(body.contains(">authere</span>"));
+    }
+
+    #[test]
+    fn signed_out_html_omits_app_block_when_unknown() {
+        let body = build_signed_out_html("https://authere.example", None);
+        assert!(!body.contains(r#"class="details""#));
+        assert!(body.contains("Your session has ended."));
+    }
+
+    #[test]
+    fn signed_out_html_escapes_app_name() {
+        let body = build_signed_out_html("https://authere.example", Some("<evil> & co"));
+        assert!(body.contains("&lt;evil&gt; &amp; co"));
+        assert!(!body.contains("<evil>"));
+    }
+
+    #[test]
+    fn signed_out_html_treats_empty_app_name_as_missing() {
+        let body = build_signed_out_html("https://authere.example", Some(""));
+        assert!(!body.contains(r#"class="details""#));
     }
 }
 

@@ -919,4 +919,13 @@ async fn end_session_refuses_unregistered_post_logout_uri() {
     // Falls back to the default signed-out landing (200) rather than redirecting anywhere
     // untrusted.
     assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("content-type").unwrap(),
+        "text/html; charset=utf-8",
+    );
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert!(body.contains("<title>Signed out</title>"));
+    assert!(body.contains("You're signed out"));
+    assert!(body.contains(&format!("href=\"{}/login\"", fx.origin)));
 }
