@@ -8,6 +8,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::AppState;
+use crate::application::Application;
 use crate::audit::{audit, AuditContext, AuditEventType, log_login_failed};
 use crate::db::DbEntity;
 use crate::errors::AppError;
@@ -986,6 +987,54 @@ pub async fn forward_auth_callback(
     resp_headers.insert(header::LOCATION, redirect_path.parse().unwrap());
 
     Ok((StatusCode::TEMPORARY_REDIRECT, resp_headers).into_response())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ForwardAppQuery {
+    /// Full external URL the user is trying to reach (the one originally
+    /// passed to `/api/auth/forward-redirect`).
+    pub redirect_uri: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ForwardAppResponse {
+    /// Display name of the matched forward_auth application.
+    pub name: String,
+}
+
+/// Look up the forward_auth application that owns the given URL so the login
+/// page can show "Sign in to continue to {appName}". Public on purpose — the
+/// host pattern is just a domain the caller already knows.
+#[utoipa::path(
+    get,
+    path = "/api/auth/forward-app",
+    params(
+        ("redirect_uri" = String, Query, description = "Full external URL the user is trying to reach")
+    ),
+    responses(
+        (status = 200, description = "Matching forward_auth application", body = ForwardAppResponse),
+        (status = 400, description = "redirect_uri is malformed"),
+        (status = 404, description = "No forward_auth application matches"),
+        (status = 500, description = "Internal server error")
+    ),
+    tag = AUTH_TAG,
+)]
+pub async fn lookup_forward_app(
+    State(state): State<AppState>,
+    Query(query): Query<ForwardAppQuery>,
+) -> Result<axum::Json<ForwardAppResponse>, AppError> {
+    let parsed = url::Url::parse(&query.redirect_uri)
+        .map_err(|_| AppError::InputError(vec!["Invalid redirect_uri".into()]))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| AppError::InputError(vec!["redirect_uri has no host".into()]))?;
+    let path = parsed.path();
+
+    let mut conn = state.db_pool.acquire().await?;
+    match Application::find_matching(host, path, &mut conn).await? {
+        Some(app) => Ok(axum::Json(ForwardAppResponse { name: app.name })),
+        None => Err(AppError::NotFound),
+    }
 }
 
 #[cfg(test)]

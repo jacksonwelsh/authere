@@ -256,6 +256,22 @@ export const registerUser = (data: RegisterInput) =>
 export const validateInvite = (code: string) =>
   request<{ valid: boolean }>(`/api/register/validate-invite?code=${encodeURIComponent(code)}`);
 
+/**
+ * Look up the forward_auth application that owns the given redirect URL so
+ * the login page can show "Sign in to continue to {appName}". Returns null
+ * if no forward_auth app matches (e.g., OIDC redirect, unknown host).
+ */
+export async function lookupForwardApp(redirectUri: string): Promise<{ name: string } | null> {
+  try {
+    return await request<{ name: string }>(
+      `/api/auth/forward-app?redirect_uri=${encodeURIComponent(redirectUri)}`,
+    );
+  } catch (err) {
+    if (err instanceof ApiError && (err.status === 404 || err.status === 400)) return null;
+    throw err;
+  }
+}
+
 // Settings
 export type LdapPasswordMode = 'primary_and_app' | 'app_only' | 'primary_only';
 

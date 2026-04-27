@@ -277,6 +277,7 @@ async fn run() -> Result<bool, AppError> {
         .routes(routes!(auth::verify_auth))
         .routes(routes!(auth::forward_redirect))
         .routes(routes!(auth::forward_auth_callback))
+        .routes(routes!(auth::lookup_forward_app))
         // Browser-friendly auth
         .routes(routes!(auth::browser_login))
         .routes(routes!(auth::browser_logout))

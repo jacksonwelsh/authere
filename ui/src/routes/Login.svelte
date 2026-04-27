@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { login, ApiError } from '../lib/api';
+  import { login, lookupForwardApp, ApiError } from '../lib/api';
   import Button from '../lib/components/Button.svelte';
   import Input from '../lib/components/Input.svelte';
 
@@ -9,6 +9,7 @@
   let mfaRequired = $state(false);
   let error = $state('');
   let loading = $state(false);
+  let appName = $state<string | null>(null);
 
   const rawRedirect = new URLSearchParams(window.location.search).get('redirect_uri') ?? '/';
 
@@ -24,6 +25,23 @@
   }
 
   const redirectUri = sanitizeRedirect(rawRedirect);
+
+  // When forward auth bounces a user here, the redirect_uri looks like
+  // /api/auth/forward-redirect?redirect_uri=https%3A%2F%2Fapp.example.com%2F...
+  // Pull the inner URL so we can ask the server which app it belongs to.
+  function extractForwardTarget(raw: string): string | null {
+    const prefix = '/api/auth/forward-redirect?';
+    if (!raw.startsWith(prefix)) return null;
+    const params = new URLSearchParams(raw.slice(prefix.length));
+    return params.get('redirect_uri');
+  }
+
+  const forwardTarget = extractForwardTarget(redirectUri);
+  if (forwardTarget) {
+    lookupForwardApp(forwardTarget)
+      .then(result => { if (result) appName = result.name; })
+      .catch(() => { /* fall back to generic prompt */ });
+  }
 
   function parseErrorCode(body: string): string | null {
     try {
@@ -83,7 +101,13 @@
         <span class="au-h4">authere</span>
       </div>
       <h1 class="au-h3">Sign in</h1>
-      <p class="au-small au-fg-3">Sign in to continue.</p>
+      <p class="au-small au-fg-3">
+        {#if appName}
+          Sign in to continue to {appName}.
+        {:else}
+          Sign in to continue.
+        {/if}
+      </p>
     </header>
 
     <form onsubmit={handleSubmit} novalidate>
