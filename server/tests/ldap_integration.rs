@@ -197,13 +197,11 @@ async fn start_server(mode: LdapPasswordMode) -> Fixture {
         login_rate_limiter: RateLimiter::new(RateLimitConfig::default()),
         register_rate_limiter: RateLimiter::new(RateLimitConfig::default()),
         ldap_bind_rate_limiter,
-        scim_rate_limiter: RateLimiter::new(RateLimitConfig::default()),
         oidc_token_rate_limiter: RateLimiter::new(RateLimitConfig::default()),
         signing_key,
         signing_kid: "test-kid".to_string(),
         origin: String::from("http://localhost:3000"),
         shutdown: Arc::new(tokio::sync::Notify::new()),
-        provisioning_notifier: authere_server::provisioning::Notifier::new(),
     };
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -408,7 +406,7 @@ async fn primary_only_rejects_totp_user() {
 
 #[tokio::test]
 async fn bind_rejected_for_deactivated_user() {
-    // Deactivation is the SCIM control surface for revoking access; LDAP bind must honor it.
+    // Admins deactivate users to revoke access; LDAP bind must honor it.
     let fx = start_server(LdapPasswordMode::PrimaryAndApp).await;
 
     let mut conn = fx.state.db_pool.acquire().await.unwrap();

@@ -1049,7 +1049,6 @@ mod tests {
             name: "Test User".into(),
             email: Some("test@example.com".into()),
             active: true,
-            external_id: None,
             created_at: 0,
             updated_at: 0,
         };
@@ -1074,7 +1073,6 @@ mod tests {
             name: "Test User".into(),
             email: None,
             active: true,
-            external_id: None,
             created_at: 0,
             updated_at: 0,
         };
@@ -1095,7 +1093,6 @@ mod tests {
             name: "Test".into(),
             email: None,
             active: true,
-            external_id: None,
             created_at: 0,
             updated_at: 0,
         };

@@ -132,7 +132,6 @@ async fn setup() -> Fixture {
         login_rate_limiter: RateLimiter::new(RateLimitConfig::default()),
         register_rate_limiter: RateLimiter::new(RateLimitConfig::default()),
         ldap_bind_rate_limiter: RateLimiter::new(RateLimitConfig::default()),
-        scim_rate_limiter: RateLimiter::new(RateLimitConfig::default()),
         oidc_token_rate_limiter: RateLimiter::new(RateLimitConfig {
             max_requests: 10_000,
             window: Duration::from_secs(60),
@@ -141,7 +140,6 @@ async fn setup() -> Fixture {
         signing_kid: "test-kid".to_string(),
         origin: origin.clone(),
         shutdown: Arc::new(tokio::sync::Notify::new()),
-        provisioning_notifier: authere_server::provisioning::Notifier::new(),
     };
 
     let (router, _) = OpenApiRouter::new()

@@ -349,7 +349,6 @@ mod tests {
             name: "Alice".into(),
             email: Some("alice@example.com".into()),
             active: true,
-            external_id: None,
             created_at: 0,
             updated_at: 0,
         };
@@ -375,7 +374,6 @@ mod tests {
             name: "Bob".into(),
             email: None,
             active: true,
-            external_id: None,
             created_at: 0,
             updated_at: 0,
         };
@@ -426,7 +424,6 @@ mod tests {
             name: "Alice".into(),
             email: Some("a@b.co".into()),
             active: true,
-            external_id: None,
             created_at: 0,
             updated_at: 0,
         };

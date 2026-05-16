@@ -12,7 +12,6 @@ use crate::errors::AppError;
 use crate::handlers::{RegisterError, build_auth_cookie, build_refresh_cookie};
 use crate::handlers::auth::BrowserLoginResponse;
 use crate::invitation::Invitation;
-use crate::provisioning::{self, event::UserLifecycleEvent};
 use crate::rate_limit::RateLimitExceeded;
 use crate::role::{Role, UserRole, ROLE_USER};
 use crate::settings::open_registration_enabled;
@@ -118,10 +117,7 @@ pub async fn register(
         let _ = UserRole::assign(user.id, user_role.id, &mut tx).await;
     }
 
-    provisioning::enqueue(&user, UserLifecycleEvent::Created, &state.origin, &mut tx).await?;
-
     tx.commit().await?;
-    state.provisioning_notifier.notify_one();
 
     info!(user_id = %user.id, username = %user.username, invite = consumed_invite.is_some(), "user registered");
 

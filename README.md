@@ -7,7 +7,6 @@ Authere is a small Rust auth service intended to replace [Authentik](https://goa
 - **Forward auth** for Caddy, with redirect-to-login and per-app role requirements
 - **OIDC provider** with discovery, JWKS, authorization code + PKCE, and end-session
 - **LDAP** with enough surface area to authenticate Jellyfin against
-- **SCIM 2.0** in both directions: inbound for IdP-driven provisioning, outbound for pushing users to downstream apps
 - **TOTP** as a second factor
 - **Audit log** with an admin UI
 
@@ -40,14 +39,13 @@ export DATABASE_URL=sqlite:./data.db
 
 ### Configuration
 
-LDAP, session expiry, invitations, SCIM tokens, and provisioning targets are all configured at runtime through the admin UI. The handful of things that need to be set as env vars:
+LDAP, session expiry, and invitations are all configured at runtime through the admin UI. The handful of things that need to be set as env vars:
 
 - `AUTHERE_KEY_SECRET`: 32 hex bytes, used to encrypt the JWT signing key at rest
 - `DATABASE_URL`: SQLite connection string (default `sqlite:./data.db`)
 - `AUTHERE_BIND_ADDR`: listen address (default `0.0.0.0:3000`)
 - `AUTHERE_ORIGIN`: public URL, used for forward-auth redirects and as the OIDC issuer
 - `AUTHERE_ALLOWED_ORIGINS`: comma-separated CORS allowlist for browser API clients
-- `AUTHERE_PROVISIONING_KEY`: 32 hex bytes, required to enable the outbound provisioning worker
 - `AUTHERE_SWAGGER_ENABLED`: set to anything to expose `/docs` in release builds
 
 ## Deploying

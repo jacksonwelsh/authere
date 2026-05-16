@@ -353,9 +353,8 @@ pub async fn verify_access_token(
         }
     }
 
-    // Deactivated users must not be able to present access tokens. The revocation table is
-    // populated by the SCIM deactivation flow, but we also check the flag directly as
-    // belt-and-suspenders against races with in-flight tokens.
+    // Deactivated users must not be able to present access tokens. Belt-and-suspenders
+    // against races with in-flight tokens issued before deactivation.
     let active_row = query!(
         r#"SELECT active as "active!: bool" FROM users WHERE id = ?"#,
         user_id

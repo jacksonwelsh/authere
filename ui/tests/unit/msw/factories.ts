@@ -7,7 +7,6 @@ import type {
   Settings,
   AuditEntry,
   AppPassword,
-  ScimToken,
 } from '../../../src/lib/api';
 
 let counter = 0;
@@ -93,18 +92,6 @@ export function mkAppPassword(overrides: Partial<AppPassword> = {}): AppPassword
     name: 'My app password',
     created_at: 1700000000,
     last_used_at: null,
-    ...overrides,
-  };
-}
-
-export function mkScimToken(overrides: Partial<ScimToken> = {}): ScimToken {
-  return {
-    id: id(),
-    name: 'Okta Production',
-    created_at: 1700000000,
-    created_by: 'admin-id',
-    last_used_at: null,
-    revoked_at: null,
     ...overrides,
   };
 }

@@ -10,7 +10,6 @@ use crate::audit::{audit, AuditContext, AuditEventType};
 use crate::auth_middleware::{AdminUser, AuthUser};
 use crate::db::DbEntity;
 use crate::errors::AppError;
-use crate::provisioning::{self, event::UserLifecycleEvent};
 use crate::role::{Role, UserRole, ROLE_USER};
 use crate::user::auth::Authenticator;
 use crate::user::auth::token::{revoke_all_user_tokens};
@@ -104,9 +103,7 @@ pub async fn create_user(
     if let Some(user_role) = Role::get_by_name(ROLE_USER, &mut tx).await? {
         let _ = UserRole::assign(user.id, user_role.id, &mut tx).await;
     }
-    provisioning::enqueue(&user, UserLifecycleEvent::Created, &state.origin, &mut tx).await?;
     tx.commit().await?;
-    state.provisioning_notifier.notify_one();
 
     info!(user_id = %user.id, username = %user.username, admin = %admin.0.user_id, "admin created user");
     let mut conn = state.db_pool.acquire().await?;
@@ -197,9 +194,7 @@ pub async fn update_user(
     let mut tx = state.db_pool.begin().await?;
     let mut user = User::get(id, &mut tx).await?.ok_or(AppError::NotFound)?;
     user.update(input.name, input.email, input.username, &mut tx).await?;
-    provisioning::enqueue(&user, UserLifecycleEvent::Updated, &state.origin, &mut tx).await?;
     tx.commit().await?;
-    state.provisioning_notifier.notify_one();
 
     info!(user_id = %id, admin = %admin.0.user_id, "admin updated user");
     let mut conn = state.db_pool.acquire().await?;
@@ -261,9 +256,7 @@ pub async fn update_me(
     let mut tx = state.db_pool.begin().await?;
     let mut user = User::get(auth.user_id, &mut tx).await?.ok_or(AppError::NotFound)?;
     user.update(input.name, input.email, input.username, &mut tx).await?;
-    provisioning::enqueue(&user, UserLifecycleEvent::Updated, &state.origin, &mut tx).await?;
     tx.commit().await?;
-    state.provisioning_notifier.notify_one();
 
     let mut conn = state.db_pool.acquire().await?;
     let _ = audit(AuditEventType::UserUpdated)

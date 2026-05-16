@@ -290,7 +290,6 @@ mod tests {
             name: "Alice".into(),
             email: Some("alice@example.com".into()),
             active: true,
-            external_id: None,
             created_at: 1_700_000_000,
             updated_at: 1_700_000_100,
         }

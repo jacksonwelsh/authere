@@ -16,7 +16,6 @@
     { id: 'users',        label: 'Users',        icon: 'ph-users',                 href: '/admin' },
     { id: 'roles',        label: 'Roles',        icon: 'ph-shield-check',          href: '/admin/roles' },
     { id: 'applications', label: 'Applications', icon: 'ph-app-window',            href: '/admin/applications' },
-    { id: 'provisioning', label: 'Provisioning', icon: 'ph-share-network',         href: '/admin/provisioning' },
     { id: 'invitations',  label: 'Invitations',  icon: 'ph-envelope-simple',       href: '/admin/invitations' },
     { id: 'audit',        label: 'Audit log',    icon: 'ph-list-magnifying-glass', href: '/admin/audit' },
     { id: 'settings',     label: 'Settings',     icon: 'ph-gear',                  href: '/admin/settings' },

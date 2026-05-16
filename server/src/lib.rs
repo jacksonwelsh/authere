@@ -22,10 +22,8 @@ pub mod handlers;
 pub mod invitation;
 pub mod ldap;
 pub mod oidc;
-pub mod provisioning;
 pub mod rate_limit;
 pub mod role;
-pub mod scim;
 pub mod settings;
 pub mod static_files;
 pub mod user;
@@ -36,15 +34,12 @@ pub struct AppState {
     pub login_rate_limiter: RateLimiter,
     pub register_rate_limiter: RateLimiter,
     pub ldap_bind_rate_limiter: RateLimiter,
-    pub scim_rate_limiter: RateLimiter,
     pub oidc_token_rate_limiter: RateLimiter,
     pub signing_key: Arc<SigningKey>,
     /// UUID of the `default` signing key — used as JWT `kid` and JWKS `kid`.
     pub signing_kid: String,
     pub origin: String,
     pub shutdown: Arc<Notify>,
-    /// Wake the outbound-provisioning worker after a user write commits. Cheap to clone.
-    pub provisioning_notifier: provisioning::Notifier,
 }
 
 impl FromRef<AppState> for SqlitePool {
@@ -56,16 +51,5 @@ impl FromRef<AppState> for SqlitePool {
 impl FromRef<AppState> for Arc<SigningKey> {
     fn from_ref(state: &AppState) -> Self {
         state.signing_key.clone()
-    }
-}
-
-/// Newtype over the SCIM rate limiter so `ScimAuth` can extract it via `FromRef` without
-/// colliding with the other RateLimiter fields on AppState.
-#[derive(Clone)]
-pub struct ScimRateLimiter(pub RateLimiter);
-
-impl FromRef<AppState> for ScimRateLimiter {
-    fn from_ref(state: &AppState) -> Self {
-        ScimRateLimiter(state.scim_rate_limiter.clone())
     }
 }

@@ -156,9 +156,9 @@ fn current_timestamp() -> i64 {
         .as_secs() as i64
 }
 
-/// SHA-256-then-hex a secret. Follows the same pattern as SCIM tokens: the OIDC client
-/// secret is 32 bytes of `OsRng` entropy, so argon2 would add no defense-in-depth — it exists
-/// to slow down dictionary attacks on human-chosen passwords.
+/// SHA-256-then-hex a secret. The OIDC client secret is 32 bytes of `OsRng` entropy, so
+/// argon2 would add no defense-in-depth; it exists to slow down dictionary attacks on
+/// human-chosen passwords.
 pub fn hash_secret(secret: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(secret.as_bytes());

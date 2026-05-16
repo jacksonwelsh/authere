@@ -1,7 +1,7 @@
 //! Short-lived authorization codes for the OIDC Authorization Code flow.
 //!
 //! Codes are 32 bytes of entropy, hex-encoded, and stored SHA-256 hashed (same treatment as
-//! SCIM tokens and refresh tokens). Each code is single-use and tied to a specific client +
+//! refresh tokens). Each code is single-use and tied to a specific client +
 //! redirect_uri + PKCE challenge. Consumption flips `consumed_at`; replay attempts fail the
 //! single-UPDATE guard.
 

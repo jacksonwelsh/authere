@@ -123,14 +123,6 @@ pub enum AuditEventType {
     LdapBindFailed,
     LdapBindRejectedMfaRequired,
     LdapBindPasswordRotated,
-    // SCIM
-    ScimTokenCreated,
-    ScimTokenRevoked,
-    ScimUserCreated,
-    ScimUserUpdated,
-    ScimUserDeactivated,
-    ScimUserReactivated,
-    ScimUserDeleted,
     // App passwords
     AppPasswordCreated,
     AppPasswordDeleted,
@@ -182,13 +174,6 @@ impl AuditEventType {
             AuditEventType::LdapBindFailed => "ldap_bind_failed",
             AuditEventType::LdapBindRejectedMfaRequired => "ldap_bind_rejected_mfa_required",
             AuditEventType::LdapBindPasswordRotated => "ldap_bind_password_rotated",
-            AuditEventType::ScimTokenCreated => "scim_token_created",
-            AuditEventType::ScimTokenRevoked => "scim_token_revoked",
-            AuditEventType::ScimUserCreated => "scim_user_created",
-            AuditEventType::ScimUserUpdated => "scim_user_updated",
-            AuditEventType::ScimUserDeactivated => "scim_user_deactivated",
-            AuditEventType::ScimUserReactivated => "scim_user_reactivated",
-            AuditEventType::ScimUserDeleted => "scim_user_deleted",
             AuditEventType::AppPasswordCreated => "app_password_created",
             AuditEventType::AppPasswordDeleted => "app_password_deleted",
             AuditEventType::AdminAppPasswordDeleted => "admin_app_password_deleted",
@@ -241,13 +226,6 @@ impl AuditEventType {
         AuditEventType::LdapBindFailed,
         AuditEventType::LdapBindRejectedMfaRequired,
         AuditEventType::LdapBindPasswordRotated,
-        AuditEventType::ScimTokenCreated,
-        AuditEventType::ScimTokenRevoked,
-        AuditEventType::ScimUserCreated,
-        AuditEventType::ScimUserUpdated,
-        AuditEventType::ScimUserDeactivated,
-        AuditEventType::ScimUserReactivated,
-        AuditEventType::ScimUserDeleted,
         AuditEventType::AppPasswordCreated,
         AuditEventType::AppPasswordDeleted,
         AuditEventType::AdminAppPasswordDeleted,
@@ -627,27 +605,6 @@ pub async fn log_ldap_bind_rejected_mfa_required(
         .await
 }
 
-/// Build the details block for SCIM events — token identity is included on every
-/// SCIM mutation so admins can trace downstream user changes back to a specific
-/// integration ("Okta prod" vs. "Azure").
-pub fn scim_details(
-    token_id: Uuid,
-    token_name: &str,
-    extra: Option<serde_json::Value>,
-) -> serde_json::Value {
-    match extra {
-        None => json!({ "scim_token_id": token_id, "scim_token_name": token_name }),
-        Some(serde_json::Value::Object(mut map)) => {
-            map.insert("scim_token_id".into(), json!(token_id));
-            map.insert("scim_token_name".into(), json!(token_name));
-            serde_json::Value::Object(map)
-        }
-        Some(other) => {
-            json!({ "scim_token_id": token_id, "scim_token_name": token_name, "extra": other })
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -757,35 +714,6 @@ mod tests {
         assert_eq!(entry.ip_address, Some("192.168.1.1".to_string()));
         assert_eq!(entry.user_agent, Some("Mozilla/5.0".to_string()));
         assert!(entry.details.is_some());
-    }
-
-    #[test]
-    fn scim_details_merges_extra_object() {
-        let token_id = Uuid::nil();
-        let extra = json!({ "fields_changed": ["email"] });
-        let merged = scim_details(token_id, "Okta prod", Some(extra));
-        let obj = merged.as_object().unwrap();
-        assert_eq!(obj["scim_token_id"], json!(token_id));
-        assert_eq!(obj["scim_token_name"], "Okta prod");
-        assert_eq!(obj["fields_changed"], json!(["email"]));
-    }
-
-    #[test]
-    fn scim_details_wraps_non_object_extra() {
-        let token_id = Uuid::nil();
-        let merged = scim_details(token_id, "Azure", Some(json!("raw-string")));
-        let obj = merged.as_object().unwrap();
-        assert_eq!(obj["extra"], json!("raw-string"));
-    }
-
-    #[test]
-    fn scim_details_without_extra_only_has_token_fields() {
-        let token_id = Uuid::nil();
-        let merged = scim_details(token_id, "OneLogin", None);
-        let obj = merged.as_object().unwrap();
-        assert_eq!(obj.len(), 2);
-        assert!(obj.contains_key("scim_token_id"));
-        assert!(obj.contains_key("scim_token_name"));
     }
 
     #[test]

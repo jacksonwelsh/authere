@@ -129,11 +129,6 @@ async fn run() -> Result<bool, AppError> {
         window: Duration::from_secs(env_override("AUTHERE_LDAP_WINDOW_SECS", 60).into()),
     });
 
-    let scim_rate_limiter = RateLimiter::new(RateLimitConfig {
-        max_requests: env_override("AUTHERE_SCIM_MAX_REQUESTS", 60),
-        window: Duration::from_secs(env_override("AUTHERE_SCIM_WINDOW_SECS", 60).into()),
-    });
-
     let oidc_token_rate_limiter = RateLimiter::new(RateLimitConfig {
         max_requests: env_override("AUTHERE_OIDC_TOKEN_MAX_REQUESTS", 60),
         window: Duration::from_secs(env_override("AUTHERE_OIDC_TOKEN_WINDOW_SECS", 60).into()),
@@ -144,7 +139,6 @@ async fn run() -> Result<bool, AppError> {
         let login_rl = login_rate_limiter.clone();
         let register_rl = register_rate_limiter.clone();
         let ldap_rl = ldap_bind_rate_limiter.clone();
-        let scim_rl = scim_rate_limiter.clone();
         let oidc_rl = oidc_token_rate_limiter.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(300));
@@ -153,7 +147,6 @@ async fn run() -> Result<bool, AppError> {
                 login_rl.cleanup().await;
                 register_rl.cleanup().await;
                 ldap_rl.cleanup().await;
-                scim_rl.cleanup().await;
                 oidc_rl.cleanup().await;
                 tracing::debug!("rate limiter cleanup completed");
             }
@@ -184,41 +177,17 @@ async fn run() -> Result<bool, AppError> {
 
     let shutdown = Arc::new(tokio::sync::Notify::new());
 
-    let provisioning_notifier = authere_server::provisioning::Notifier::new();
-
     let state = AppState {
         db_pool,
         login_rate_limiter,
         register_rate_limiter,
         ldap_bind_rate_limiter,
-        scim_rate_limiter,
         oidc_token_rate_limiter,
         signing_key,
         signing_kid,
         origin,
         shutdown,
-        provisioning_notifier: provisioning_notifier.clone(),
     };
-
-    // Start the outbound-provisioning worker. If AUTHERE_PROVISIONING_KEY isn't set the
-    // worker can't decrypt target tokens, so we don't spawn it — admins who want this
-    // feature supply the key; other deployments run unaffected.
-    match authere_server::provisioning::targets::load_master_key() {
-        Ok(key) => {
-            let pool = state.db_pool.clone();
-            let notifier = provisioning_notifier.clone();
-            let http = reqwest::Client::builder()
-                .build()
-                .expect("failed to build reqwest client");
-            tokio::spawn(async move {
-                authere_server::provisioning::worker::run(pool, notifier, key, http).await;
-            });
-            info!("outbound provisioning worker started");
-        }
-        Err(e) => {
-            warn!(error = ?e, "outbound provisioning disabled");
-        }
-    }
 
     // Start the LDAP listener if enabled. Settings changes take effect on the next
     // restart — rebinding to a different port at runtime is out of scope for the MVP.
@@ -245,8 +214,6 @@ async fn run() -> Result<bool, AppError> {
     }
 
     use authere_server::handlers::{admin, app_passwords, application, auth, oauth, registration, role, totp, user};
-    use authere_server::provisioning::admin as provisioning_admin;
-    use authere_server::scim;
 
     let shutdown_handle = state.shutdown.clone();
 
@@ -310,39 +277,6 @@ async fn run() -> Result<bool, AppError> {
         // App passwords (admin)
         .routes(routes!(app_passwords::admin_list_app_passwords))
         .routes(routes!(app_passwords::admin_delete_app_password))
-        // SCIM admin token management (uses AdminUser JWT auth)
-        .routes(routes!(
-            scim::admin::create_scim_token,
-            scim::admin::list_scim_tokens
-        ))
-        .routes(routes!(scim::admin::revoke_scim_token))
-        // SCIM 2.0 discovery
-        .routes(routes!(scim::discovery::service_provider_config))
-        .routes(routes!(scim::discovery::list_resource_types))
-        .routes(routes!(scim::discovery::get_resource_type))
-        .routes(routes!(scim::discovery::list_schemas))
-        .routes(routes!(scim::discovery::get_schema))
-        // SCIM 2.0 Users
-        .routes(routes!(scim::users::list_users, scim::users::create_user))
-        .routes(routes!(scim::users::search_users))
-        .routes(routes!(scim::users::search_root))
-        .routes(routes!(
-            scim::users::get_user,
-            scim::users::replace_user,
-            scim::users::patch_user,
-            scim::users::delete_user
-        ))
-        // Outbound provisioning (admin-only CRUD + job observability)
-        .routes(routes!(
-            provisioning_admin::create_target,
-            provisioning_admin::list_targets
-        ))
-        .routes(routes!(
-            provisioning_admin::update_target,
-            provisioning_admin::delete_target
-        ))
-        .routes(routes!(provisioning_admin::list_jobs))
-        .routes(routes!(provisioning_admin::retry_job))
         // OIDC provider
         .routes(routes!(oauth::discovery))
         .routes(routes!(oauth::jwks))
@@ -357,14 +291,6 @@ async fn run() -> Result<bool, AppError> {
     if cfg!(debug_assertions) || env::var("AUTHERE_SWAGGER_ENABLED").is_ok() {
         router = router.merge(SwaggerUi::new("/docs").url("/apidoc/openapi.json", api));
     }
-
-    // SCIM 2.0 catch-all: any unknown path under /scim/v2 must still return a spec-shaped
-    // error (application/scim+json body, Error URN, string status). Without this, axum's
-    // default 404 produces a plain-text "not found" that trips compliance testers.
-    let router = router.route(
-        "/scim/v2/{*rest}",
-        axum::routing::any(|| async { authere_server::scim::error::ScimError::not_found() }),
-    );
 
     let router = router
         .route("/assets/{*path}", axum::routing::get(static_files::serve_asset))

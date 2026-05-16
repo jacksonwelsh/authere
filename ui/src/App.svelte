@@ -15,9 +15,8 @@
   import AuditLog from './routes/admin/AuditLog.svelte';
   import Settings from './routes/admin/Settings.svelte';
   import Invitations from './routes/admin/Invitations.svelte';
-  import Provisioning from './routes/admin/Provisioning.svelte';
 
-  type Page = 'login' | 'register' | 'users' | 'roles' | 'applications' | 'audit' | 'settings' | 'invitations' | 'provisioning' | 'account' | 'credentials';
+  type Page = 'login' | 'register' | 'users' | 'roles' | 'applications' | 'audit' | 'settings' | 'invitations' | 'account' | 'credentials';
 
   let me = $state<Me | null>(null);
   let ready = $state(false);
@@ -27,7 +26,6 @@
     const p = window.location.pathname;
     if (p.startsWith('/admin/roles'))        return 'roles';
     if (p.startsWith('/admin/applications')) return 'applications';
-    if (p.startsWith('/admin/provisioning')) return 'provisioning';
     if (p.startsWith('/admin/audit'))        return 'audit';
     if (p.startsWith('/admin/settings'))     return 'settings';
     if (p.startsWith('/admin/invitations'))  return 'invitations';
@@ -90,8 +88,6 @@
         <Roles />
       {:else if page === 'applications'}
         <Applications />
-      {:else if page === 'provisioning'}
-        <Provisioning />
       {:else if page === 'audit'}
         <AuditLog />
       {:else if page === 'settings'}
