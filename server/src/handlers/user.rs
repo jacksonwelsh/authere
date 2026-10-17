@@ -21,8 +21,17 @@ const AUTH_TAG: &str = "auth";
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateUserInput {
     pub name: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_email")]
     pub email: Option<Option<String>>,
     pub username: Option<String>,
+}
+
+// An omitted email leaves it unchanged; an explicit JSON null clears it.
+fn deserialize_optional_email<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
 }
 
 /// Summarize which profile fields are being touched by an update request, for
@@ -101,7 +110,7 @@ pub async fn create_user(
     user.save(&mut tx).await?;
     authenticator.save(&mut tx).await?;
     if let Some(user_role) = Role::get_by_name(ROLE_USER, &mut tx).await? {
-        let _ = UserRole::assign(user.id, user_role.id, &mut tx).await;
+        UserRole::assign(user.id, user_role.id, &mut tx).await?;
     }
     tx.commit().await?;
 
@@ -289,13 +298,15 @@ pub async fn change_my_password(
     Authenticator::validate_password(&input.new_password)
         .map_err(|e| AppError::InputError(vec![e]))?;
 
+    let mut tx = state.db_pool.begin().await?;
+    let user = User::get(auth.user_id, &mut tx).await?.ok_or(AppError::NotFound)?;
+
+    Authenticator::try_password_login(&user, input.current_password, &mut tx).await?;
+    Authenticator::update_password(auth.user_id, input.new_password, &mut tx).await?;
+    revoke_all_user_tokens(auth.user_id, &mut tx).await?;
+    tx.commit().await?;
+
     let mut conn = state.db_pool.acquire().await?;
-    let user = User::get(auth.user_id, &mut conn).await?.ok_or(AppError::NotFound)?;
-
-    Authenticator::try_password_login(&user, input.current_password, &mut conn).await?;
-    Authenticator::update_password(auth.user_id, input.new_password, &mut conn).await?;
-    revoke_all_user_tokens(auth.user_id, &mut conn).await?;
-
     info!(user_id = %auth.user_id, "user changed their password");
     let _ = audit(AuditEventType::PasswordChanged)
         .user(auth.user_id)
@@ -330,12 +341,14 @@ pub async fn admin_change_user_password(
     Authenticator::validate_password(&input.new_password)
         .map_err(|e| AppError::InputError(vec![e]))?;
 
+    let mut tx = state.db_pool.begin().await?;
+    User::get(id, &mut tx).await?.ok_or(AppError::NotFound)?;
+
+    Authenticator::update_password(id, input.new_password, &mut tx).await?;
+    revoke_all_user_tokens(id, &mut tx).await?;
+    tx.commit().await?;
+
     let mut conn = state.db_pool.acquire().await?;
-    User::get(id, &mut conn).await?.ok_or(AppError::NotFound)?;
-
-    Authenticator::update_password(id, input.new_password, &mut conn).await?;
-    revoke_all_user_tokens(id, &mut conn).await?;
-
     info!(user_id = %id, admin = %admin.0.user_id, "admin reset user password");
     let _ = audit(AuditEventType::AdminPasswordReset)
         .user(id)
@@ -350,6 +363,16 @@ pub async fn admin_change_user_password(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_update_distinguishes_clear_from_omitted_email() {
+        let omitted: UpdateUserInput = serde_json::from_value(serde_json::json!({})).unwrap();
+        let cleared: UpdateUserInput = serde_json::from_value(serde_json::json!({"email": null})).unwrap();
+        let changed: UpdateUserInput = serde_json::from_value(serde_json::json!({"email": "alice@example.com"})).unwrap();
+        assert_eq!(omitted.email, None);
+        assert_eq!(cleared.email, Some(None));
+        assert_eq!(changed.email, Some(Some("alice@example.com".into())));
+    }
 
     #[test]
     fn me_response_serializes_profile_fields() {

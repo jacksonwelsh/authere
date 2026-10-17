@@ -1,5 +1,6 @@
 <script lang="ts">
   import { login, lookupForwardApp, ApiError } from '../lib/api';
+  import { sanitizeLoginRedirect } from '../lib/redirect';
   import Button from '../lib/components/Button.svelte';
   import Input from '../lib/components/Input.svelte';
 
@@ -13,18 +14,7 @@
 
   const rawRedirect = new URLSearchParams(window.location.search).get('redirect_uri') ?? '/';
 
-  function sanitizeRedirect(raw: string): string {
-    if (raw.startsWith('/') && !raw.startsWith('//')) return raw;
-    try {
-      const url = new URL(raw);
-      if (url.protocol === 'https:' || (url.protocol === 'http:' && url.hostname === 'localhost')) {
-        return url.href;
-      }
-    } catch {}
-    return '/';
-  }
-
-  const redirectUri = sanitizeRedirect(rawRedirect);
+  const redirectUri = sanitizeLoginRedirect(rawRedirect, window.location.origin);
 
   // When forward auth bounces a user here, the redirect_uri looks like
   // /api/auth/forward-redirect?redirect_uri=https%3A%2F%2Fapp.example.com%2F...

@@ -14,8 +14,18 @@ use crate::errors::AppError;
 use crate::rate_limit::RateLimitExceeded;
 
 /// Cookie configuration
-pub const AUTH_COOKIE_NAME: &str = "authere_token";
-pub const REFRESH_COOKIE_NAME: &str = "authere_refresh";
+pub const AUTH_COOKIE_NAME: &str = "__Host-authere_token";
+pub const REFRESH_COOKIE_NAME: &str = "__Host-authere_refresh";
+
+/// Accept only an origin-relative path; browsers treat backslashes and a
+/// leading double slash as a different authority. Reject control characters
+/// before constructing Location headers.
+pub fn is_local_redirect(path: &str) -> bool {
+    path.starts_with('/')
+        && !path.starts_with("//")
+        && !path.contains('\\')
+        && !path.chars().any(char::is_control)
+}
 
 /// Build Set-Cookie header for authentication
 pub fn build_auth_cookie(token: &str, max_age_secs: i64) -> String {
@@ -25,16 +35,13 @@ pub fn build_auth_cookie(token: &str, max_age_secs: i64) -> String {
     )
 }
 
-/// Build Set-Cookie header for refresh token.
-///
-/// Path is `/api/auth` so the browser sends the cookie to both the refresh and
-/// browser-logout endpoints (both live under `/api/auth/...`). An earlier version
-/// used `Path=/auth`, which never matched any real endpoint and silently broke
-/// session refresh — sessions then ended up bounded by the access-token TTL
-/// regardless of `session_expiry_seconds`.
+/// Build the host-only refresh cookie. The __Host prefix requires Secure and
+/// Path=/, and prevents sibling applications from planting a Domain cookie.
+/// SameSite=Lax permits SSO redirects; unsafe browser requests also require a
+/// trusted Origin through the browser-security middleware.
 pub fn build_refresh_cookie(token: &str, max_age_secs: i64) -> String {
     format!(
-        "{}={}; HttpOnly; Secure; SameSite=Strict; Path=/api/auth; Max-Age={}",
+        "{}={}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age={}",
         REFRESH_COOKIE_NAME, token, max_age_secs
     )
 }
@@ -44,8 +51,14 @@ pub fn build_refresh_cookie(token: &str, max_age_secs: i64) -> String {
 /// cookie around.
 pub fn clear_auth_cookies() -> Vec<String> {
     vec![
-        format!("{}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0", AUTH_COOKIE_NAME),
-        format!("{}=; HttpOnly; Secure; SameSite=Strict; Path=/api/auth; Max-Age=0", REFRESH_COOKIE_NAME),
+        format!(
+            "{}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0",
+            AUTH_COOKIE_NAME
+        ),
+        format!(
+            "{}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0",
+            REFRESH_COOKIE_NAME
+        ),
     ]
 }
 
@@ -128,7 +141,7 @@ mod tests {
     #[test]
     fn test_build_auth_cookie_format() {
         let cookie = build_auth_cookie("my-token", 900);
-        assert!(cookie.contains("authere_token=my-token"));
+        assert!(cookie.contains("__Host-authere_token=my-token"));
         assert!(cookie.contains("HttpOnly"));
         assert!(cookie.contains("Secure"));
         assert!(cookie.contains("SameSite=Lax"));
@@ -139,22 +152,20 @@ mod tests {
     #[test]
     fn test_build_refresh_cookie_format() {
         let cookie = build_refresh_cookie("refresh-tok", 604800);
-        assert!(cookie.contains("authere_refresh=refresh-tok"));
+        assert!(cookie.contains("__Host-authere_refresh=refresh-tok"));
         assert!(cookie.contains("HttpOnly"));
         assert!(cookie.contains("Secure"));
-        assert!(cookie.contains("SameSite=Strict"));
-        assert!(cookie.contains("Path=/api/auth"));
+        assert!(cookie.contains("SameSite=Lax"));
+        assert!(cookie.contains("Path=/"));
         assert!(cookie.contains("Max-Age=604800"));
     }
 
     #[test]
     fn refresh_cookie_path_matches_refresh_endpoint() {
-        // Regression: previously this was `/auth`, which never matched the real
-        // `/api/auth/browser-refresh` path, so the browser silently dropped the
-        // cookie on refresh and sessions died at access-token TTL.
+        // The __Host prefix requires Path=/, covering every auth endpoint.
         let cookie = build_refresh_cookie("t", 60);
         assert!(
-            cookie.contains("Path=/api/auth"),
+            cookie.contains("Path=/"),
             "refresh cookie Path must cover /api/auth/browser-refresh and \
              /api/auth/browser-logout, got: {cookie}"
         );
@@ -165,20 +176,20 @@ mod tests {
         let cookies = clear_auth_cookies();
         assert_eq!(cookies.len(), 2);
 
-        assert!(cookies[0].contains("authere_token="));
+        assert!(cookies[0].contains("__Host-authere_token="));
         assert!(cookies[0].contains("Max-Age=0"));
         assert!(cookies[0].contains("Path=/"));
 
-        assert!(cookies[1].contains("authere_refresh="));
+        assert!(cookies[1].contains("__Host-authere_refresh="));
         assert!(cookies[1].contains("Max-Age=0"));
         // Must match build_refresh_cookie's Path or the browser keeps the old cookie.
-        assert!(cookies[1].contains("Path=/api/auth"));
+        assert!(cookies[1].contains("Path=/"));
     }
 
     #[test]
     fn test_cookie_constants() {
-        assert_eq!(AUTH_COOKIE_NAME, "authere_token");
-        assert_eq!(REFRESH_COOKIE_NAME, "authere_refresh");
+        assert_eq!(AUTH_COOKIE_NAME, "__Host-authere_token");
+        assert_eq!(REFRESH_COOKIE_NAME, "__Host-authere_refresh");
     }
 
     #[test]

@@ -60,3 +60,6 @@ jobs:
 
       - name: Run deploy script tests
         run: bash deploy/test_deploy.sh
+
+      - name: Run webhook tests
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s deploy -p test_webhook.py

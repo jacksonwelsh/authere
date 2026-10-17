@@ -92,6 +92,9 @@ pub async fn register(
             return Err(AppError::InputError(vec!["Invitation is invalid or expired".to_string()]).into());
         }
     }
+    // Registration opens a transaction below. Release this read connection first so
+    // concurrent registrations cannot exhaust the pool while waiting for a second one.
+    drop(conn);
 
     let user = User::new(input.username, input.name, input.email);
     let authenticator = Authenticator::new_password(input.password, user.id).map_err(|e| {
@@ -114,10 +117,12 @@ pub async fn register(
     authenticator.save(&mut tx).await?;
 
     if let Some(user_role) = Role::get_by_name(ROLE_USER, &mut tx).await? {
-        let _ = UserRole::assign(user.id, user_role.id, &mut tx).await;
+        UserRole::assign(user.id, user_role.id, &mut tx).await?;
     }
 
     tx.commit().await?;
+
+    let mut conn = state.db_pool.acquire().await?;
 
     info!(user_id = %user.id, username = %user.username, invite = consumed_invite.is_some(), "user registered");
 

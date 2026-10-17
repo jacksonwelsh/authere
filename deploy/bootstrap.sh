@@ -35,7 +35,7 @@ APTEOF
 systemctl enable --now unattended-upgrades
 
 echo "==> Installing runtime dependencies"
-apt-get install -y sqlite3 ca-certificates curl python3
+apt-get install -y sqlite3 ca-certificates curl python3 openssl util-linux
 
 echo "==> Creating authere user and directories"
 useradd --system --shell /usr/sbin/nologin --home-dir /opt/authere authere || true

@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 aes-gcm = "0.10"
-anyhow = "1.0.100"
+anyhow = "1.0.103"
 argon2 = { version = "0.5.3", features = ["std"] }
 clap = { version = "4", features = ["derive"] }
 dotenvy = "0.15"
@@ -17,12 +17,12 @@ axum = "0.8.7"
 axum-extra = { version = "0.10", features = ["typed-header"] }
 headers = "0.4"
 ed25519-dalek = { version = "2.2.0", features = ["pkcs8", "rand_core"] }
-jsonwebtoken = { version = "10.2.0", features = ["rust_crypto"] }
-rand = "0.8"
+jsonwebtoken = { version = "10.4.0", default-features = false, features = ["aws_lc_rs"] }
+rand = "0.8.6"
 regex = "1.12.2"
 serde = { version = "1.0.228", features = ["serde_derive"] }
 serde_json = "1.0.145"
-sqlx = { version = "0.8.6", features = ["chrono", "json", "macros", "runtime-tokio", "sqlite", "uuid"] }
+sqlx = { version = "0.8.6", default-features = false, features = ["json", "macros", "migrate", "runtime-tokio", "sqlite", "uuid"] }
 thiserror = "2.0.17"
 tokio = { version = "1.48.0", features = ["full"] }
 mime_guess = "2"
@@ -33,19 +33,17 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 utoipa = { version = "5", features = ["uuid"] }
 utoipa-axum = "0.2.0"
-utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
+utoipa-swagger-ui = { version = "9.0.2", default-features = false, features = ["axum", "vendored"] }
 url = "2"
 urlencoding = "2"
 uuid = { version = "1.19.0", features = ["serde", "v4", "v7"] }
 ldap3_proto = "0.5"
 tokio-util = { version = "0.7", features = ["codec"] }
 futures-util = "0.3"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 base64 = "0.22"
 
 [dev-dependencies]
-ldap3 = { version = "0.11", default-features = false, features = ["tls-rustls"] }
-wiremock = "0.6"
+ldap3 = { version = "0.11", default-features = false }
 
 [lints.rust]
 async_fn_in_trait = "allow"

@@ -46,7 +46,67 @@ LDAP, session expiry, and invitations are all configured at runtime through the 
 - `AUTHERE_BIND_ADDR`: listen address (default `0.0.0.0:3000`)
 - `AUTHERE_ORIGIN`: public URL, used for forward-auth redirects and as the OIDC issuer
 - `AUTHERE_ALLOWED_ORIGINS`: comma-separated CORS allowlist for browser API clients
+- `AUTHERE_TRUSTED_PROXIES`: comma-separated IP addresses of the reverse proxies allowed to supply client IPs for rate limiting and audit logs
 - `AUTHERE_SWAGGER_ENABLED`: set to anything to expose `/docs` in release builds
+
+`AUTHERE_ALLOWED_ORIGINS` grants access to the authenticated Authere API. Only list
+browser front ends you trust with account administration; a protected application's
+origin does not need to be added for normal forward auth or server-side OIDC.
+
+### Sessions
+
+Session expiry is an absolute deadline measured from password/MFA sign-in. Refreshing
+credentials, visiting another protected app, and issuing OIDC tokens do not extend it.
+Access tokens expire after at most 15 minutes and never outlive the session. Changing
+the setting affects new logins; existing sessions keep their original deadline.
+Role changes and account deactivation are checked on each authenticated request.
+Logout and password changes revoke Authere, forward-auth, and provider-side OIDC sessions.
+An OIDC application may also keep its own local session; configure its logout and
+session lifetime separately.
+
+### Forward-auth security and upgrades
+
+Register every protected HTTPS host in Applications. Unknown hosts, disabled apps,
+and ambiguous policies are denied. Plain hostname patterns match literally; regex
+patterns match the whole hostname. The longest matching path prefix takes precedence,
+with a literal hostname preferred over a regex at the same path length. Equally
+specific overlapping policies are denied, and disabling a specific policy does not
+expose that path through a broader one. Encoded ambiguous paths are rejected.
+
+Keep the Authere origin dedicated to Authere. Protected sites receive a separate
+credential bound to their origin and application; it cannot authenticate to the
+Authere API or another application. Sign-in handoffs expire after 60 seconds, can be
+redeemed once, and require the browser state set on the protected origin.
+Use separate HTTPS origins for applications with different trust levels: browser
+same-origin rules do not isolate applications hosted under different paths.
+
+When upgrading from the older global-cookie flow, sign in again and regenerate the
+Caddy configuration from the Applications UI. Proxy all `/.authere/*` routes to
+Authere, including `/.authere/start`, and set this header on that proxy:
+
+```caddyfile
+header_up X-Authere-Target-Host {http.request.host}
+```
+
+Use a direct internal Authere upstream for forward-auth checks. Replace the generated
+`AUTHERE_INTERNAL_HOST:3000` placeholder with that listener's internal address. Proxy hops must
+preserve the original `X-Forwarded-Host`, `X-Forwarded-Proto`, and `X-Forwarded-Uri`;
+missing or invalid metadata is denied. Keep Authere's listener and protected backends
+reachable only through the intended reverse proxy. LDAP currently uses plaintext
+simple bind and belongs on a private network or inside a TLS tunnel.
+
+OIDC supports authorization code flow with S256 PKCE. `prompt=none` returns
+`login_required` when no session exists. `max_age`, `prompt=login`, and `prompt=consent`
+are rejected until their reauthentication/consent flows are implemented.
+
+### Dependency checks
+
+Run `npm audit` in `ui/` and `cargo audit` in `server/` when updating dependencies.
+Swagger UI uses a fixed vendored archive rather than downloading code during builds.
+The lockfile still includes RSA through SQLx's disabled MySQL dependency, and the
+Swagger build dependency uses a ZIP version with extraction advisories. RSA is not
+compiled, and ZIP extraction processes the fixed vendored archive, not request data.
+These are residual dependency warnings, not claims that the lockfile is advisory-free.
 
 ## Deploying
 

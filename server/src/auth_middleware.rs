@@ -12,7 +12,7 @@ use crate::errors::AppError;
 use crate::role::ROLE_ADMIN;
 use crate::user::auth::token::verify_access_token;
 
-/// Extract a token string from either the Authorization header or the authere_token cookie.
+/// Extract a token string from either the Authorization header or the __Host-authere_token cookie.
 fn extract_token(parts: &Parts) -> Option<String> {
     // Authorization: Bearer <token>
     if let Some(bearer) = parts
@@ -24,7 +24,7 @@ fn extract_token(parts: &Parts) -> Option<String> {
         return Some(bearer.to_owned());
     }
 
-    // Cookie: authere_token=<token>
+    // Cookie: __Host-authere_token=<token>
     parts
         .headers
         .get(axum::http::header::COOKIE)
@@ -33,8 +33,8 @@ fn extract_token(parts: &Parts) -> Option<String> {
             cookies
                 .split(';')
                 .map(|s| s.trim())
-                .find(|s| s.starts_with("authere_token="))
-                .and_then(|s| s.strip_prefix("authere_token="))
+                .find(|s| s.starts_with("__Host-authere_token="))
+                .and_then(|s| s.strip_prefix("__Host-authere_token="))
                 .map(|s| s.to_owned())
         })
 }
@@ -130,7 +130,10 @@ mod tests {
 
     #[test]
     fn extract_token_from_cookie() {
-        let parts = make_parts(vec![("Cookie", "other=val; authere_token=cookie-jwt; foo=bar")]);
+        let parts = make_parts(vec![(
+            "Cookie",
+            "other=val; __Host-authere_token=cookie-jwt; foo=bar",
+        )]);
         assert_eq!(extract_token(&parts).unwrap(), "cookie-jwt");
     }
 
@@ -138,7 +141,7 @@ mod tests {
     fn extract_token_bearer_takes_precedence() {
         let parts = make_parts(vec![
             ("Authorization", "Bearer bearer-jwt"),
-            ("Cookie", "authere_token=cookie-jwt"),
+            ("Cookie", "__Host-authere_token=cookie-jwt"),
         ]);
         assert_eq!(extract_token(&parts).unwrap(), "bearer-jwt");
     }

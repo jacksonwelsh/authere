@@ -111,7 +111,10 @@ async fn run() -> Result<bool, AppError> {
     }
 
     fn env_override(name: &str, default: u32) -> u32 {
-        env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+        env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
     }
 
     let login_rate_limiter = RateLimiter::new(RateLimitConfig {
@@ -161,10 +164,13 @@ async fn run() -> Result<bool, AppError> {
             let mut interval = tokio::time::interval(Duration::from_secs(300));
             loop {
                 interval.tick().await;
-                if let Ok(mut conn) = pool.acquire().await
-                    && let Err(e) = authere_server::oidc::codes::sweep_expired(&mut conn).await
-                {
-                    tracing::warn!(error = ?e, "oidc code sweep failed");
+                if let Ok(mut conn) = pool.acquire().await {
+                    if let Err(e) = authere_server::oidc::codes::sweep_expired(&mut conn).await {
+                        tracing::warn!(error = ?e, "oidc code sweep failed");
+                    }
+                    if let Err(e) = token::sweep_expired_sessions(&mut conn).await {
+                        tracing::warn!(error = ?e, "session sweep failed");
+                    }
                 }
             }
         });
@@ -174,6 +180,19 @@ async fn run() -> Result<bool, AppError> {
         warn!("AUTHERE_ORIGIN not set — forward auth redirects will use http://localhost:3000");
         String::from("http://localhost:3000")
     });
+    let origin = origin.trim_end_matches('/').to_string();
+    let mut allowed_browser_origins = vec![origin.clone()];
+    allowed_browser_origins.extend(
+        env::var("AUTHERE_ALLOWED_ORIGINS")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|origin| !origin.is_empty())
+            .map(str::to_string),
+    );
+    let browser_security = authere_server::browser_security::BrowserSecurity {
+        allowed_origins: allowed_browser_origins,
+    };
 
     let shutdown = Arc::new(tokio::sync::Notify::new());
 
@@ -213,7 +232,9 @@ async fn run() -> Result<bool, AppError> {
         }
     }
 
-    use authere_server::handlers::{admin, app_passwords, application, auth, oauth, registration, role, totp, user};
+    use authere_server::handlers::{
+        admin, app_passwords, application, auth, oauth, registration, role, totp, user,
+    };
 
     let shutdown_handle = state.shutdown.clone();
 
@@ -244,6 +265,7 @@ async fn run() -> Result<bool, AppError> {
         .routes(routes!(auth::verify_auth))
         .routes(routes!(auth::forward_redirect))
         .routes(routes!(auth::forward_auth_callback))
+        .routes(routes!(auth::forward_auth_start))
         .routes(routes!(auth::lookup_forward_app))
         // Browser-friendly auth
         .routes(routes!(auth::browser_login))
@@ -284,6 +306,7 @@ async fn run() -> Result<bool, AppError> {
         .routes(routes!(oauth::token))
         .routes(routes!(oauth::userinfo))
         .routes(routes!(oauth::end_session))
+        .routes(routes!(oauth::end_session_post))
         .with_state(state)
         .split_for_parts();
 
@@ -293,11 +316,17 @@ async fn run() -> Result<bool, AppError> {
     }
 
     let router = router
-        .route("/assets/{*path}", axum::routing::get(static_files::serve_asset))
+        .route(
+            "/assets/{*path}",
+            axum::routing::get(static_files::serve_asset),
+        )
         .route("/", axum::routing::get(static_files::serve_spa))
         .route("/login", axum::routing::get(static_files::serve_spa))
         .route("/admin", axum::routing::get(static_files::serve_spa))
-        .route("/admin/{*path}", axum::routing::get(static_files::serve_spa))
+        .route(
+            "/admin/{*path}",
+            axum::routing::get(static_files::serve_spa),
+        )
         .route("/account", axum::routing::get(static_files::serve_spa))
         .route("/credentials", axum::routing::get(static_files::serve_spa))
         .route("/register", axum::routing::get(static_files::serve_spa));
@@ -310,31 +339,45 @@ async fn run() -> Result<bool, AppError> {
             .collect();
         tower_http::cors::CorsLayer::new()
             .allow_origin(allowed)
-            .allow_methods([http::Method::GET, http::Method::POST, http::Method::PUT, http::Method::DELETE])
+            .allow_methods([
+                http::Method::GET,
+                http::Method::POST,
+                http::Method::PUT,
+                http::Method::PATCH,
+                http::Method::DELETE,
+            ])
             .allow_headers([http::header::CONTENT_TYPE, http::header::AUTHORIZATION])
             .allow_credentials(true)
     } else {
         tower_http::cors::CorsLayer::new()
-            .allow_origin(tower_http::cors::AllowOrigin::exact("null".parse().unwrap()))
-            .allow_methods([http::Method::GET, http::Method::POST, http::Method::PUT, http::Method::DELETE])
-            .allow_headers([http::header::CONTENT_TYPE, http::header::AUTHORIZATION])
     };
 
     // Request tracing
     let trace_layer = tower_http::trace::TraceLayer::new_for_http()
-        .make_span_with(tower_http::trace::DefaultMakeSpan::new().level(tracing::Level::INFO))
+        // Query strings can contain one-time handoffs, OIDC codes, and ID hints.
+        .make_span_with(|request: &axum::http::Request<axum::body::Body>| {
+            tracing::info_span!("http_request", method = %request.method(), path = request.uri().path())
+        })
         .on_response(tower_http::trace::DefaultOnResponse::new().level(tracing::Level::INFO));
 
-    let router = router.layer(cors).layer(trace_layer);
+    let router = router
+        .layer(axum::middleware::from_fn_with_state(
+            browser_security,
+            authere_server::browser_security::protect_browser_requests,
+        ))
+        .layer(cors)
+        .layer(trace_layer);
 
-    let bind_addr =
-        env::var("AUTHERE_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
+    let bind_addr = env::var("AUTHERE_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
     info!("starting server on {bind_addr}");
 
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
-    axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())
-        .with_graceful_shutdown(async move { shutdown_handle.notified().await })
-        .await?;
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move { shutdown_handle.notified().await })
+    .await?;
 
     info!("server stopped, exiting with restart code {EXIT_RESTART}");
     Ok(true)

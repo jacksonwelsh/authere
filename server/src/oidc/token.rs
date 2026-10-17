@@ -38,6 +38,8 @@ pub struct IdTokenClaims {
     pub exp: i64,
     pub iat: i64,
     pub auth_time: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_version: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nonce: Option<String>,
 
@@ -73,6 +75,8 @@ pub struct OidcAccessClaims {
     pub jti: String,
     pub scope: String,
     pub typ: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_version: Option<i64>,
 }
 
 /// Split a space-separated scope string into unique tokens. OIDC scope strings are whitespace-
@@ -124,6 +128,7 @@ pub fn build_id_token_claims(
         exp: now + ID_TOKEN_LIFETIME,
         iat: now,
         auth_time,
+        session_version: None,
         nonce,
         name: None,
         preferred_username: None,
@@ -176,17 +181,20 @@ pub fn generate_oidc_access_token(
     scope: &[String],
     signing_key: &SigningKey,
     kid: &str,
+    session_version: Option<i64>,
+    session_exp: Option<i64>,
 ) -> Result<String, AppError> {
     let now = now_epoch();
     let claims = OidcAccessClaims {
         iss: issuer.to_string(),
         sub: user_id.to_string(),
         aud: client_id.to_string(),
-        exp: now + OIDC_ACCESS_TOKEN_LIFETIME,
+        exp: (now + OIDC_ACCESS_TOKEN_LIFETIME).min(session_exp.unwrap_or(i64::MAX)),
         iat: now,
         jti: Uuid::new_v4().to_string(),
         scope: scope.join(" "),
         typ: "oidc_access".to_string(),
+        session_version,
     };
     let mut header = Header::new(Algorithm::EdDSA);
     header.kid = Some(kid.to_string());
@@ -207,13 +215,14 @@ pub fn verify_oidc_access_token(
     let mut validation = Validation::new(Algorithm::EdDSA);
     validation.set_required_spec_claims(&["sub", "exp", "iat", "jti", "typ", "iss"]);
     validation.set_issuer(&[issuer]);
+    validation.leeway = 0;
     // Don't bind to a specific aud — /userinfo accepts any OIDC access token minted by this
     // issuer. jsonwebtoken requires we explicitly disable the aud check.
     validation.validate_aud = false;
 
     let data = decode::<OidcAccessClaims>(token, &decoding_key, &validation)
         .map_err(|_| AppError::AuthenticationRequired)?;
-    if data.claims.typ != "oidc_access" {
+    if data.claims.typ != "oidc_access" || data.claims.exp <= now_epoch() {
         return Err(AppError::AuthenticationRequired);
     }
     Ok(data.claims)
@@ -259,20 +268,35 @@ pub fn mint_token_pair(
     auth_time: i64,
     signing_key: &SigningKey,
     kid: &str,
+    session_version: Option<i64>,
+    session_exp: Option<i64>,
 ) -> Result<TokenResponse, AppError> {
     let client_id = app
         .oidc_client_id
         .as_deref()
         .ok_or_else(|| AppError::InternalError("OIDC app has no client_id".into()))?;
     let now = now_epoch();
-    let id_claims = build_id_token_claims(issuer, client_id, user, user_roles, scope, nonce, auth_time, now);
+    let mut id_claims = build_id_token_claims(
+        issuer, client_id, user, user_roles, scope, nonce, auth_time, now,
+    );
+    id_claims.session_version = session_version;
+    id_claims.exp = id_claims.exp.min(session_exp.unwrap_or(i64::MAX));
     let id_token = encode_id_token(&id_claims, signing_key, kid)?;
-    let access_token = generate_oidc_access_token(issuer, user.id, client_id, scope, signing_key, kid)?;
+    let access_token = generate_oidc_access_token(
+        issuer,
+        user.id,
+        client_id,
+        scope,
+        signing_key,
+        kid,
+        session_version,
+        session_exp,
+    )?;
     Ok(TokenResponse {
         access_token,
         id_token,
         token_type: "Bearer".to_string(),
-        expires_in: OIDC_ACCESS_TOKEN_LIFETIME,
+        expires_in: (id_claims.exp - now).max(0),
         scope: scope.join(" "),
     })
 }
@@ -387,7 +411,8 @@ mod tests {
     #[test]
     fn encoded_id_token_has_kid_header() {
         let u = test_user();
-        let claims = build_id_token_claims("iss", "cli", &u, &[], &["openid".to_string()], None, 0, 0);
+        let claims =
+            build_id_token_claims("iss", "cli", &u, &[], &["openid".to_string()], None, 0, 0);
         let sk = key();
         let jwt = encode_id_token(&claims, &sk, "kid-abc").unwrap();
         let header = jsonwebtoken::decode_header(&jwt).unwrap();
@@ -406,6 +431,8 @@ mod tests {
             &["openid".to_string(), "profile".to_string()],
             &sk,
             "kid",
+            Some(0),
+            None,
         )
         .unwrap();
         let claims = verify_oidc_access_token(&token, "https://authere", &sk).unwrap();
@@ -425,6 +452,8 @@ mod tests {
             &["openid".to_string()],
             &sk,
             "kid",
+            None,
+            None,
         )
         .unwrap();
         let err = verify_oidc_access_token(&token, "https://other", &sk).unwrap_err();
@@ -441,6 +470,8 @@ mod tests {
             &["openid".to_string()],
             &sk,
             "kid",
+            None,
+            None,
         )
         .unwrap();
         let other = key();
@@ -463,6 +494,7 @@ mod tests {
             jti: Uuid::new_v4().to_string(),
             scope: "openid".into(),
             typ: "access".into(),
+            session_version: None,
         };
         let mut header = Header::new(Algorithm::EdDSA);
         header.kid = Some("kid".into());
@@ -470,5 +502,49 @@ mod tests {
         let token = encode(&header, &claims, &key).unwrap();
         let err = verify_oidc_access_token(&token, "iss", &sk).unwrap_err();
         assert!(matches!(err, AppError::AuthenticationRequired));
+    }
+
+    #[test]
+    fn access_token_cannot_outlive_parent_session() {
+        let sk = key();
+        let deadline = now_epoch() + 30;
+        let token = generate_oidc_access_token(
+            "iss",
+            Uuid::now_v7(),
+            "cli",
+            &["openid".into()],
+            &sk,
+            "kid",
+            Some(3),
+            Some(deadline),
+        )
+        .unwrap();
+        let claims = verify_oidc_access_token(&token, "iss", &sk).unwrap();
+        assert_eq!(claims.exp, deadline);
+        assert_eq!(claims.session_version, Some(3));
+        let expired = generate_oidc_access_token(
+            "iss",
+            Uuid::now_v7(),
+            "cli",
+            &["openid".into()],
+            &sk,
+            "kid",
+            Some(3),
+            Some(now_epoch() - 1),
+        )
+        .unwrap();
+        assert!(verify_oidc_access_token(&expired, "iss", &sk).is_err());
+        let at_deadline = generate_oidc_access_token(
+            "iss",
+            Uuid::now_v7(),
+            "cli",
+            &["openid".into()],
+            &sk,
+            "kid",
+            Some(3),
+            Some(now_epoch()),
+        )
+        .unwrap();
+        assert!(verify_oidc_access_token(&at_deadline, "iss", &sk).is_err());
     }
 }

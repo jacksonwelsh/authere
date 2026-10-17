@@ -287,30 +287,53 @@ impl Application {
         Ok(row.map(Application::from))
     }
 
-    /// Find forward_auth application matching the given host and path. OIDC apps are skipped.
+    /// Select the most specific forward-auth policy. Disabled policies still take
+    /// precedence, so disabling a restricted path cannot expose it via a broader app.
+    /// Equally specific overlapping policies are ambiguous and fail closed.
     pub async fn find_matching(
         host: &str,
         path: &str,
         conn: &mut SqliteConnection,
     ) -> Result<Option<Application>, AppError> {
-        let apps = Application::list_enabled(conn).await?;
-
+        let apps = Application::list(conn).await?;
+        let mut selected: Option<Application> = None;
+        let mut selected_rank = None;
+        let mut ambiguous = false;
         for app in apps {
-            if app.app_type == AppType::ForwardAuth && app.matches(host, path) {
-                return Ok(Some(app));
+            if app.app_type != AppType::ForwardAuth || !app.matches(host, path) {
+                continue;
+            }
+            let rank = (
+                app.path_prefix.as_ref().map_or(0, |p| p.len()),
+                app.host_pattern.as_ref().is_some_and(|p| literal_host_pattern(p)),
+            );
+            match selected_rank {
+                Some(previous) if rank < previous => continue,
+                Some(previous) if rank == previous => ambiguous = true,
+                _ => {
+                    selected_rank = Some(rank);
+                    selected = Some(app);
+                    ambiguous = false;
+                }
             }
         }
-
-        Ok(None)
+        if ambiguous {
+            return Err(AppError::Forbidden);
+        }
+        Ok(selected.filter(|app| app.enabled))
     }
 
-    /// Check if this application matches the given host and path
+    /// Check if this application matches the given host and normalized path.
     pub fn matches(&self, host: &str, path: &str) -> bool {
-        // Check host pattern
         if let Some(pattern) = &self.host_pattern {
-            if pattern == host {
-                // Exact match, check path
+            // A plain hostname is literal. Treating its periods as regex wildcards
+            // silently authorizes different domains with lookalike names.
+            if literal_host_pattern(pattern) {
+                if !pattern.eq_ignore_ascii_case(host) {
+                    return false;
+                }
             } else if let Ok(re) = RegexBuilder::new(&format!("^(?:{pattern})$"))
+                .case_insensitive(true)
                 .size_limit(10_000)
                 .build()
             {
@@ -322,7 +345,6 @@ impl Application {
             }
         }
 
-        // Check path prefix
         if let Some(prefix) = &self.path_prefix {
             if !path.starts_with(prefix) {
                 return false;
@@ -550,6 +572,12 @@ fn validate_oidc_redirect_uri(uri: &str) -> Result<(), String> {
         other if !other.is_empty() => Ok(()),
         _ => Err(format!("redirect_uri has no scheme: {uri}")),
     }
+}
+
+/// Patterns without regex operators describe literal hostnames (with optional ports).
+fn literal_host_pattern(pattern: &str) -> bool {
+    !pattern.is_empty()
+        && pattern.bytes().all(|b| b.is_ascii_alphanumeric() || b".-:_".contains(&b))
 }
 
 impl DbEntity for Application {

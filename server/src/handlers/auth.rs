@@ -1,6 +1,6 @@
 use axum::extract::{self, Query, State};
-use axum::http::header::{self, HeaderMap, HeaderName, HeaderValue};
 use axum::http::StatusCode;
+use axum::http::header::{self, HeaderMap, HeaderName, HeaderValue};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -9,14 +9,17 @@ use uuid::Uuid;
 
 use crate::AppState;
 use crate::application::Application;
-use crate::audit::{audit, AuditContext, AuditEventType, log_login_failed};
+use crate::audit::{AuditContext, AuditEventType, audit, log_login_failed};
 use crate::db::DbEntity;
 use crate::errors::AppError;
 use crate::handlers::{LoginError, build_auth_cookie, build_refresh_cookie, clear_auth_cookies};
 use crate::rate_limit::RateLimitExceeded;
-use crate::user::auth::Authenticator;
-use crate::user::auth::token::{self, TokenPair, generate_token_pair, verify_and_revoke_refresh_token, revoke_user_access_tokens};
+use crate::user::auth::token::{
+    self, TokenPair, generate_token_pair, revoke_user_access_tokens,
+    verify_and_revoke_refresh_token,
+};
 use crate::user::auth::totp::{self, UserTotp};
+use crate::user::auth::{Authenticator, forward};
 use crate::user::{LoginInput, User};
 
 /// Enforce MFA for users who have activated TOTP. Call AFTER successful password check.
@@ -27,7 +30,10 @@ async fn enforce_mfa(
     totp_code: Option<&str>,
     conn: &mut sqlx::SqliteConnection,
 ) -> Result<(), LoginError> {
-    let Some(totp_row) = UserTotp::get(user_id, conn).await.map_err(LoginError::App)? else {
+    let Some(totp_row) = UserTotp::get(user_id, conn)
+        .await
+        .map_err(LoginError::App)?
+    else {
         return Ok(());
     };
     if !totp_row.is_activated() {
@@ -40,11 +46,20 @@ async fn enforce_mfa(
     let secret = totp::decrypt_secret(&totp_row.secret_encrypted).map_err(LoginError::App)?;
     let now = totp::now_epoch();
     if let Some(step) = totp::verify_code(&secret, code, now, totp_row.last_used_step) {
-        UserTotp::record_step(user_id, step, conn).await.map_err(LoginError::App)?;
-        return Ok(());
+        return if UserTotp::record_step(user_id, &totp_row.secret_encrypted, step, conn)
+            .await
+            .map_err(LoginError::App)?
+        {
+            Ok(())
+        } else {
+            Err(LoginError::MfaInvalid)
+        };
     }
     // Fall back to recovery codes. Consumption is atomic; a valid unused code is accepted once.
-    if totp::consume_recovery_code(user_id, code, conn).await.map_err(LoginError::App)? {
+    if totp::consume_recovery_code(user_id, code, conn)
+        .await
+        .map_err(LoginError::App)?
+    {
         return Ok(());
     }
     Err(LoginError::MfaInvalid)
@@ -63,7 +78,8 @@ fn build_auth_headers(user: &User, roles: &[String], email: Option<&str>) -> Hea
 
     headers.insert(
         HeaderName::from_static("x-auth-user"),
-        HeaderValue::from_str(&user.id.to_string()).unwrap_or_else(|_| HeaderValue::from_static("")),
+        HeaderValue::from_str(&user.id.to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("")),
     );
 
     headers.insert(
@@ -76,11 +92,14 @@ fn build_auth_headers(user: &User, roles: &[String], email: Option<&str>) -> Hea
         HeaderValue::from_str(&roles.join(",")).unwrap_or_else(|_| HeaderValue::from_static("")),
     );
 
-    if let Some(email) = email {
-        if let Ok(value) = HeaderValue::from_str(email) {
-            headers.insert(HeaderName::from_static("x-auth-email"), value);
-        }
-    }
+    // Always replace every identity header copied by the proxy. Omitting email
+    // would leave a client-supplied X-Auth-Email intact for users without one.
+    headers.insert(
+        HeaderName::from_static("x-auth-email"),
+        email
+            .and_then(|email| HeaderValue::from_str(email).ok())
+            .unwrap_or_else(|| HeaderValue::from_static("")),
+    );
 
     headers
 }
@@ -116,6 +135,9 @@ pub async fn login(
     }
 
     let mut conn = state.db_pool.acquire().await?;
+    if let Err(msg) = User::validate_username(&input.username) {
+        return Err(AppError::InputError(vec![msg]).into());
+    }
     if let Err(msg) = Authenticator::validate_password(&input.password) {
         return Err(AppError::InputError(vec![msg]).into());
     }
@@ -125,8 +147,11 @@ pub async fn login(
     let user = match User::login(input, &mut conn).await {
         Ok(user) => user,
         Err(e) => {
-            state.login_rate_limiter.record_failure(audit_ctx.ip).await;
-            let failed_user_id = User::get_by_username(&username, &mut conn).await.ok().flatten().map(|u| u.id);
+            let failed_user_id = User::get_by_username(&username, &mut conn)
+                .await
+                .ok()
+                .flatten()
+                .map(|u| u.id);
             warn!(username = %username, ip = %audit_ctx.ip, "login failed");
             let _ = log_login_failed(&username, failed_user_id, &audit_ctx, &mut conn).await;
             return Err(e.into());
@@ -137,7 +162,6 @@ pub async fn login(
         Ok(()) => {}
         Err(LoginError::MfaRequired) => return Err(LoginError::MfaRequired),
         Err(e) => {
-            state.login_rate_limiter.record_failure(audit_ctx.ip).await;
             warn!(user_id = %user.id, username = %username, ip = %audit_ctx.ip, "login failed: bad totp");
             let _ = log_login_failed(&username, Some(user.id), &audit_ctx, &mut conn).await;
             return Err(e);
@@ -148,7 +172,11 @@ pub async fn login(
     let token_pair = generate_token_pair(user.id, roles, &state.signing_key, &mut conn).await?;
 
     info!(user_id = %user.id, username = %user.username, "login successful");
-    let _ = audit(AuditEventType::LoginSuccess).user(user.id).ctx(&audit_ctx).save(&mut conn).await;
+    let _ = audit(AuditEventType::LoginSuccess)
+        .user(user.id)
+        .ctx(&audit_ctx)
+        .save(&mut conn)
+        .await;
 
     Ok(axum::Json(token_pair))
 }
@@ -171,16 +199,17 @@ pub async fn refresh_token(
 ) -> Result<axum::Json<TokenPair>, AppError> {
     let mut conn = state.db_pool.acquire().await?;
 
-    let user_id = verify_and_revoke_refresh_token(&input.refresh_token, &state.signing_key, &mut conn).await?;
+    let token_pair =
+        token::rotate_token_pair(&input.refresh_token, &state.signing_key, &mut conn).await?;
+    let claims =
+        token::verify_access_token(&token_pair.access_token, &state.signing_key, &mut conn).await?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| AppError::AuthenticationRequired)?;
 
-    let user = User::get(user_id, &mut conn)
-        .await?
-        .ok_or(AppError::AuthenticationRequired)?;
-    let roles = user.get_roles(&mut conn).await?;
-
-    let token_pair = generate_token_pair(user_id, roles, &state.signing_key, &mut conn).await?;
-
-    let _ = audit(AuditEventType::TokenRefresh).user(user_id).ctx(&audit_ctx).save(&mut conn).await;
+    let _ = audit(AuditEventType::TokenRefresh)
+        .user(user_id)
+        .ctx(&audit_ctx)
+        .save(&mut conn)
+        .await;
 
     Ok(axum::Json(token_pair))
 }
@@ -203,11 +232,17 @@ pub async fn logout(
 ) -> Result<StatusCode, AppError> {
     let mut conn = state.db_pool.acquire().await?;
 
-    let user_id = verify_and_revoke_refresh_token(&input.refresh_token, &state.signing_key, &mut conn).await?;
-    let _ = revoke_user_access_tokens(user_id, &mut conn).await;
+    let user_id =
+        verify_and_revoke_refresh_token(&input.refresh_token, &state.signing_key, &mut conn)
+            .await?;
+    revoke_user_access_tokens(user_id, &mut conn).await?;
 
     info!(user_id = %user_id, "user logged out");
-    let _ = audit(AuditEventType::Logout).user(user_id).ctx(&audit_ctx).save(&mut conn).await;
+    let _ = audit(AuditEventType::Logout)
+        .user(user_id)
+        .ctx(&audit_ctx)
+        .save(&mut conn)
+        .await;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -257,6 +292,9 @@ pub async fn browser_login(
 
     let mut conn = state.db_pool.acquire().await?;
 
+    if let Err(msg) = User::validate_username(&input.username) {
+        return Err(AppError::InputError(vec![msg]).into());
+    }
     if let Err(msg) = Authenticator::validate_password(&input.password) {
         return Err(AppError::InputError(vec![msg]).into());
     }
@@ -266,8 +304,11 @@ pub async fn browser_login(
     let user = match User::login(input, &mut conn).await {
         Ok(user) => user,
         Err(e) => {
-            state.login_rate_limiter.record_failure(audit_ctx.ip).await;
-            let failed_user_id = User::get_by_username(&username, &mut conn).await.ok().flatten().map(|u| u.id);
+            let failed_user_id = User::get_by_username(&username, &mut conn)
+                .await
+                .ok()
+                .flatten()
+                .map(|u| u.id);
             warn!(username = %username, ip = %audit_ctx.ip, "browser login failed");
             let _ = log_login_failed(&username, failed_user_id, &audit_ctx, &mut conn).await;
             return Err(e.into());
@@ -278,7 +319,6 @@ pub async fn browser_login(
         Ok(()) => {}
         Err(LoginError::MfaRequired) => return Err(LoginError::MfaRequired),
         Err(e) => {
-            state.login_rate_limiter.record_failure(audit_ctx.ip).await;
             warn!(user_id = %user.id, username = %username, ip = %audit_ctx.ip, "browser login failed: bad totp");
             let _ = log_login_failed(&username, Some(user.id), &audit_ctx, &mut conn).await;
             return Err(e);
@@ -289,13 +329,15 @@ pub async fn browser_login(
     let token_pair = generate_token_pair(user.id, roles, &state.signing_key, &mut conn).await?;
 
     info!(user_id = %user.id, username = %user.username, "browser login successful");
-    let _ = audit(AuditEventType::LoginSuccess).user(user.id).ctx(&audit_ctx).save(&mut conn).await;
+    let _ = audit(AuditEventType::LoginSuccess)
+        .user(user.id)
+        .ctx(&audit_ctx)
+        .save(&mut conn)
+        .await;
 
     let access_cookie = build_auth_cookie(&token_pair.access_token, token_pair.expires_in);
-    let refresh_cookie = build_refresh_cookie(
-        &token_pair.refresh_token,
-        token_pair.refresh_expires_in,
-    );
+    let refresh_cookie =
+        build_refresh_cookie(&token_pair.refresh_token, token_pair.refresh_expires_in);
 
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -308,10 +350,12 @@ pub async fn browser_login(
     );
 
     if let Some(redirect_uri) = query.redirect_uri {
-        if redirect_uri.starts_with('/') {
+        if crate::handlers::is_local_redirect(&redirect_uri) {
             headers.insert(
                 axum::http::header::LOCATION,
-                redirect_uri.parse().unwrap(),
+                redirect_uri
+                    .parse()
+                    .map_err(|_| AppError::InputError(vec!["Invalid redirect_uri".into()]))?,
             );
             return Ok((StatusCode::SEE_OTHER, headers).into_response());
         }
@@ -361,16 +405,35 @@ pub async fn browser_logout(
             cookies
                 .split(';')
                 .map(|s| s.trim())
-                .find(|s| s.starts_with("authere_refresh="))
-                .map(|s| s.strip_prefix("authere_refresh=").unwrap_or(""))
+                .find(|s| s.starts_with("__Host-authere_refresh="))
+                .map(|s| s.strip_prefix("__Host-authere_refresh=").unwrap_or(""))
         });
 
+    let mut logout_user = None;
     if let Some(token) = refresh_token {
-        if let Ok(user_id) = verify_and_revoke_refresh_token(token, &state.signing_key, &mut conn).await {
-            let _ = revoke_user_access_tokens(user_id, &mut conn).await;
-            info!(user_id = %user_id, "browser logout");
-            let _ = audit(AuditEventType::Logout).user(user_id).ctx(&audit_ctx).save(&mut conn).await;
+        match verify_and_revoke_refresh_token(token, &state.signing_key, &mut conn).await {
+            Ok(user_id) => logout_user = Some(user_id),
+            Err(AppError::AuthenticationRequired) => {}
+            Err(other) => return Err(other),
         }
+    }
+    if logout_user.is_none() {
+        if let Some(access) = cookie_value(&headers, crate::handlers::AUTH_COOKIE_NAME) {
+            match token::verify_access_token(access, &state.signing_key, &mut conn).await {
+                Ok(claims) => logout_user = Uuid::parse_str(&claims.sub).ok(),
+                Err(AppError::AuthenticationRequired) => {}
+                Err(other) => return Err(other),
+            }
+        }
+    }
+    if let Some(user_id) = logout_user {
+        token::revoke_all_user_tokens(user_id, &mut conn).await?;
+        info!(user_id = %user_id, "browser logout");
+        let _ = audit(AuditEventType::Logout)
+            .user(user_id)
+            .ctx(&audit_ctx)
+            .save(&mut conn)
+            .await;
     }
 
     let clear_cookies = clear_auth_cookies();
@@ -386,10 +449,12 @@ pub async fn browser_logout(
     );
 
     if let Some(redirect_uri) = query.redirect_uri {
-        if redirect_uri.starts_with('/') {
+        if crate::handlers::is_local_redirect(&redirect_uri) {
             headers.insert(
                 axum::http::header::LOCATION,
-                redirect_uri.parse().unwrap(),
+                redirect_uri
+                    .parse()
+                    .map_err(|_| AppError::InputError(vec!["Invalid redirect_uri".into()]))?,
             );
             return Ok((StatusCode::SEE_OTHER, headers).into_response());
         }
@@ -427,69 +492,224 @@ pub async fn browser_refresh(
             cookies
                 .split(';')
                 .map(|s| s.trim())
-                .find(|s| s.starts_with("authere_refresh="))
-                .and_then(|s| s.strip_prefix("authere_refresh="))
+                .find(|s| s.starts_with("__Host-authere_refresh="))
+                .and_then(|s| s.strip_prefix("__Host-authere_refresh="))
                 .map(|s| s.to_owned())
         })
         .ok_or(AppError::AuthenticationRequired)?;
 
-    let user_id = verify_and_revoke_refresh_token(&refresh_token_str, &state.signing_key, &mut conn).await?;
+    let token_pair =
+        token::rotate_browser_token_pair(&refresh_token_str, &state.signing_key, &mut conn).await?;
+    let claims =
+        token::verify_access_token(&token_pair.access_token, &state.signing_key, &mut conn).await?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| AppError::AuthenticationRequired)?;
 
-    let user = User::get(user_id, &mut conn)
-        .await?
-        .ok_or(AppError::AuthenticationRequired)?;
-    let roles = user.get_roles(&mut conn).await?;
-    let token_pair = generate_token_pair(user_id, roles, &state.signing_key, &mut conn).await?;
-
-    let _ = audit(AuditEventType::TokenRefresh).user(user_id).ctx(&audit_ctx).save(&mut conn).await;
+    let _ = audit(AuditEventType::TokenRefresh)
+        .user(user_id)
+        .ctx(&audit_ctx)
+        .save(&mut conn)
+        .await;
 
     let access_cookie = build_auth_cookie(&token_pair.access_token, token_pair.expires_in);
-    let refresh_cookie = build_refresh_cookie(
-        &token_pair.refresh_token,
-        token_pair.refresh_expires_in,
-    );
+    let refresh_cookie =
+        build_refresh_cookie(&token_pair.refresh_token, token_pair.refresh_expires_in);
 
     let mut response_headers = HeaderMap::new();
-    response_headers.insert(axum::http::header::SET_COOKIE, access_cookie.parse().unwrap());
-    response_headers.append(axum::http::header::SET_COOKIE, refresh_cookie.parse().unwrap());
+    response_headers.insert(
+        axum::http::header::SET_COOKIE,
+        access_cookie.parse().unwrap(),
+    );
+    response_headers.append(
+        axum::http::header::SET_COOKIE,
+        refresh_cookie.parse().unwrap(),
+    );
 
-    Ok((StatusCode::OK, response_headers, axum::Json(serde_json::json!({ "ok": true }))).into_response())
+    Ok((
+        StatusCode::OK,
+        response_headers,
+        axum::Json(serde_json::json!({ "ok": true })),
+    )
+        .into_response())
 }
 
 // ============================================================================
 // Forward Auth Endpoint
 // ============================================================================
 
-fn build_forward_auth_redirect(origin: &str, headers: &HeaderMap) -> Response {
-    let proto = headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("https");
-    let host = headers
-        .get("x-forwarded-host")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let uri = headers
-        .get("x-forwarded-uri")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("/");
+/// One canonical interpretation is used for policy lookup, cookie audience, and
+/// redirects. Missing or ambiguous proxy metadata must never select a weaker app.
+struct ForwardTarget {
+    url: url::Url,
+    host: String,
+    policy_path: String,
+}
 
-    let redirect_uri = if host.is_empty() {
-        String::from("/")
-    } else {
-        format!("{proto}://{host}{uri}")
-    };
+impl ForwardTarget {
+    fn parse(input: &str) -> Result<Self, AppError> {
+        let invalid = || AppError::InputError(vec!["Invalid HTTPS forward-auth target".into()]);
+        if input
+            .bytes()
+            .any(|b| b.is_ascii_control() || b.is_ascii_whitespace() || b == b'\\')
+        {
+            return Err(invalid());
+        }
+        let parsed = url::Url::parse(input).map_err(|_| invalid())?;
+        if parsed.scheme() != "https"
+            || parsed.host_str().is_none()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.fragment().is_some()
+            || input
+                .split("://")
+                .nth(1)
+                .is_some_and(|s| s.split(['/', '?', '#']).next().unwrap_or("").contains('@'))
+        {
+            return Err(invalid());
+        }
+        let host = parsed[url::Position::BeforeHost..url::Position::AfterPort].to_string();
+        let policy_path = normalize_policy_path(parsed.path())?;
+        Ok(Self {
+            url: parsed,
+            host,
+            policy_path,
+        })
+    }
 
-    let location = format!(
-        "{origin}/api/auth/forward-redirect?redirect_uri={}",
-        urlencoding::encode(&redirect_uri)
-    );
+    fn from_proxy(headers: &HeaderMap) -> Result<Self, AppError> {
+        let host = single_header(headers, "x-forwarded-host")
+            .ok_or_else(|| AppError::InputError(vec!["Missing forwarded host".into()]))?;
+        let proto = single_header(headers, "x-forwarded-proto").unwrap_or("https");
+        let path = single_header(headers, "x-forwarded-uri")
+            .ok_or_else(|| AppError::InputError(vec!["Missing forwarded URI".into()]))?;
+        if !safe_local_path(path) || host.contains([',', '/', '?', '#', '@']) {
+            return Err(AppError::InputError(vec![
+                "Invalid forward-auth request metadata".into(),
+            ]));
+        }
+        Self::parse(&format!("{proto}://{host}{path}"))
+    }
 
-    (
-        StatusCode::TEMPORARY_REDIRECT,
-        [(header::LOCATION, location)],
-    )
-        .into_response()
+    fn from_callback(headers: &HeaderMap, path: &str) -> Result<Self, AppError> {
+        // Only the browser handoff endpoints use this scope hint. The Caddy
+        // callback proxy overwrites it while retaining its upstream routing Host.
+        // Authentication still requires a signed target origin and browser nonce.
+        let host_header = if headers.contains_key("x-authere-target-host") {
+            "x-authere-target-host"
+        } else {
+            "host"
+        };
+        let host = single_header(headers, host_header)
+            .ok_or_else(|| AppError::InputError(vec!["Missing target host".into()]))?;
+        if !safe_local_path(path) || host.contains([',', '/', '?', '#', '@']) {
+            return Err(AppError::InputError(vec![
+                "Invalid forward-auth target".into(),
+            ]));
+        }
+        Self::parse(&format!("https://{host}{path}"))
+    }
+
+    fn origin(&self) -> String {
+        self.url.origin().ascii_serialization()
+    }
+
+    fn ensure_protected_origin(&self, auth_origin: &str) -> Result<(), AppError> {
+        if url::Url::parse(auth_origin)
+            .ok()
+            .is_some_and(|auth| auth.origin() == self.url.origin())
+        {
+            return Err(AppError::Forbidden);
+        }
+        Ok(())
+    }
+
+    fn local_path(&self) -> &str {
+        &self.url[url::Position::BeforePath..]
+    }
+
+    fn start_url(&self) -> String {
+        format!(
+            "{}/.authere/start?redirect_uri={}",
+            self.origin(),
+            urlencoding::encode(self.local_path())
+        )
+    }
+}
+
+fn single_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    let mut values = headers.get_all(name).iter();
+    let value = values.next()?.to_str().ok()?;
+    if values.next().is_some() {
+        return None;
+    }
+    Some(value)
+}
+
+fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    let mut values = headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .filter_map(|cookie| cookie.trim().split_once('='))
+        .filter_map(|(key, value)| (key == name).then_some(value));
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    Some(value)
+}
+
+fn safe_local_path(path: &str) -> bool {
+    path.starts_with('/')
+        && !path.starts_with("//")
+        && !path.bytes().any(|b| b == b'\\' || b.is_ascii_control())
+}
+
+/// Account for URL decoding and dot-segment handling before matching path ACLs.
+/// Reject separators whose interpretation differs across common web servers.
+fn normalize_policy_path(path: &str) -> Result<String, AppError> {
+    let mut decoded = path.to_string();
+    for _ in 0..5 {
+        let next = urlencoding::decode(&decoded)
+            .map_err(|_| AppError::InputError(vec!["Invalid URL path".into()]))?
+            .into_owned();
+        if next == decoded {
+            break;
+        }
+        decoded = next;
+    }
+    if !safe_local_path(&decoded) || decoded.contains('%') || decoded.contains("//") {
+        return Err(AppError::InputError(vec!["Ambiguous URL path".into()]));
+    }
+    let mut segments = Vec::new();
+    for segment in decoded.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            value => segments.push(value),
+        }
+    }
+    let mut normalized = format!("/{}", segments.join("/"));
+    if decoded.ends_with('/') && normalized != "/" {
+        normalized.push('/');
+    }
+    Ok(normalized)
+}
+
+fn build_forward_auth_redirect(_origin: &str, headers: &HeaderMap) -> Response {
+    match ForwardTarget::from_proxy(headers) {
+        Ok(target) => (
+            StatusCode::SEE_OTHER,
+            [
+                (header::LOCATION, target.start_url()),
+                (header::CACHE_CONTROL, "no-store".into()),
+            ],
+        )
+            .into_response(),
+        Err(error) => error.into_response(),
+    }
 }
 
 fn html_escape(s: &str) -> String {
@@ -509,28 +729,9 @@ fn build_forward_auth_denied_html(
     app_name: Option<&str>,
     required_roles: &[String],
 ) -> Response {
-    let proto = headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("https");
-    let host = headers
-        .get("x-forwarded-host")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let uri = headers
-        .get("x-forwarded-uri")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("/");
-
-    let switch_user_url = if host.is_empty() {
-        format!("{origin}/login")
-    } else {
-        let target = format!("{proto}://{host}{uri}");
-        format!(
-            "{origin}/api/auth/forward-redirect?redirect_uri={}",
-            urlencoding::encode(&target)
-        )
-    };
+    let switch_user_url = ForwardTarget::from_proxy(headers)
+        .map(|target| format!("{}&login=true", target.start_url()))
+        .unwrap_or_else(|_| format!("{origin}/login"));
     let switch_user_url = html_escape(&switch_user_url);
 
     let app_block = match app_name {
@@ -739,7 +940,7 @@ fn build_forward_auth_denied_html(
     path = "/api/auth/verify",
     responses(
         (status = 200, description = "Authenticated and authorized"),
-        (status = 307, description = "Not authenticated, redirect to login"),
+        (status = 303, description = "Not authenticated, redirect to login"),
         (status = 403, description = "Not authorized for this application"),
         (status = 500, description = "Internal server error")
     ),
@@ -749,79 +950,62 @@ pub async fn verify_auth(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Response, Response> {
-    let mut conn = state.db_pool.acquire().await.map_err(|e| {
-        AppError::DbError(e).into_response()
-    })?;
+    let mut conn = state
+        .db_pool
+        .acquire()
+        .await
+        .map_err(|e| AppError::DbError(e).into_response())?;
 
-    let auth_header = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok());
+    let target = ForwardTarget::from_proxy(&headers).map_err(IntoResponse::into_response)?;
+    target
+        .ensure_protected_origin(&state.origin)
+        .map_err(IntoResponse::into_response)?;
+    let app = Application::find_matching(&target.host, &target.policy_path, &mut conn)
+        .await
+        .map_err(IntoResponse::into_response)?
+        .ok_or_else(|| AppError::Forbidden.into_response())?;
 
-    let cookie_token = headers
-        .get("cookie")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|cookies| {
-            cookies
-                .split(';')
-                .map(|s| s.trim())
-                .find(|s| s.starts_with("authere_token="))
-                .map(|s| s.strip_prefix("authere_token=").unwrap_or(""))
-        });
-
-    let token = match auth_header
-        .and_then(|h| h.strip_prefix("Bearer "))
-        .or(cookie_token)
+    // Global Authere API credentials are never valid on a protected upstream.
+    let token = cookie_value(&headers, forward::SESSION_COOKIE)
+        .or_else(|| {
+            single_header(&headers, "authorization").and_then(|value| value.strip_prefix("Bearer "))
+        })
+        .ok_or_else(|| build_forward_auth_redirect(&state.origin, &headers))?;
+    let claims = forward::verify_session(token, &target.origin(), &state.signing_key, &mut conn)
+        .await
+        .map_err(|error| match error {
+            AppError::AuthenticationRequired => {
+                build_forward_auth_redirect(&state.origin, &headers)
+            }
+            other => other.into_response(),
+        })?;
+    let user = User::get(claims.sub, &mut conn)
+        .await
+        .map_err(IntoResponse::into_response)?
+        .ok_or_else(|| AppError::AuthenticationRequired.into_response())?;
+    let roles = user
+        .get_roles(&mut conn)
+        .await
+        .map_err(IntoResponse::into_response)?;
+    if !app
+        .check_access_resolved(&roles, &mut conn)
+        .await
+        .map_err(IntoResponse::into_response)?
     {
-        Some(t) => t,
-        None => return Err(build_forward_auth_redirect(&state.origin, &headers)),
-    };
-
-    let claims = match token::verify_access_token(token, &state.signing_key, &mut conn).await {
-        Ok(c) => c,
-        Err(_) => return Err(build_forward_auth_redirect(&state.origin, &headers)),
-    };
-
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| AppError::InternalError("Invalid user ID in token".to_string()).into_response())?;
-
-    let user = match User::get(user_id, &mut conn).await {
-        Ok(Some(u)) => u,
-        _ => return Err(build_forward_auth_redirect(&state.origin, &headers)),
-    };
-
-    let host = headers
-        .get("x-forwarded-host")
-        .or_else(|| headers.get("host"))
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-
-    let path = headers
-        .get("x-forwarded-uri")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("/");
-
-    use crate::application::Application;
-    if let Some(app) = Application::find_matching(host, path, &mut conn).await.map_err(|e| e.into_response())? {
-        if !app.check_access_resolved(&claims.roles, &mut conn).await.map_err(|e| e.into_response())? {
-            warn!(
-                user_id = %user_id,
-                host = %host,
-                path = %path,
-                app = %app.name,
-                user_roles = ?claims.roles,
-                required_roles = ?app.required_roles,
-                "forward auth denied: insufficient roles"
-            );
-            return Err(build_forward_auth_denied_html(
-                &state.origin,
-                &headers,
-                Some(&app.name),
-                &app.required_roles,
-            ));
-        }
+        warn!(user_id = %user.id, host = %target.host, app = %app.name, "forward auth denied: insufficient roles");
+        return Err(build_forward_auth_denied_html(
+            &state.origin,
+            &headers,
+            Some(&app.name),
+            &app.required_roles,
+        ));
     }
 
-    let response_headers = build_auth_headers(&user, &claims.roles, user.email.as_deref());
+    if claims.application_id != app.id {
+        return Err(build_forward_auth_redirect(&state.origin, &headers));
+    }
+    let mut response_headers = build_auth_headers(&user, &roles, user.email.as_deref());
+    response_headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
 
     Ok((StatusCode::OK, response_headers).into_response())
 }
@@ -831,20 +1015,102 @@ pub async fn verify_auth(
 // ============================================================================
 
 #[derive(Debug, Deserialize)]
+pub struct ForwardStartQuery {
+    pub redirect_uri: Option<String>,
+    #[serde(default)]
+    pub login: bool,
+}
+
+/// Start on the protected origin so the callback can prove that this browser
+/// initiated the login. This prevents an attacker signing another browser into
+/// the attacker's account by supplying a callback link.
+#[utoipa::path(
+    get,
+    path = "/.authere/start",
+    responses((status = 303, description = "Begin browser-bound forward login")),
+    tag = AUTH_TAG,
+)]
+pub async fn forward_auth_start(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ForwardStartQuery>,
+) -> Result<Response, AppError> {
+    let target =
+        ForwardTarget::from_callback(&headers, query.redirect_uri.as_deref().unwrap_or("/"))?;
+    target.ensure_protected_origin(&state.origin)?;
+    let mut conn = state.db_pool.acquire().await?;
+    Application::find_matching(&target.host, &target.policy_path, &mut conn)
+        .await?
+        .ok_or(AppError::Forbidden)?;
+    let nonce = forward::new_state();
+    let continue_path = format!(
+        "/api/auth/forward-redirect?redirect_uri={}&state={}",
+        urlencoding::encode(target.url.as_str()),
+        nonce
+    );
+    let location = if query.login {
+        format!(
+            "{}/login?redirect_uri={}",
+            state.origin.trim_end_matches('/'),
+            urlencoding::encode(&continue_path)
+        )
+    } else {
+        format!("{}{continue_path}", state.origin.trim_end_matches('/'))
+    };
+    Ok((
+        StatusCode::SEE_OTHER,
+        [
+            (header::LOCATION, location),
+            (header::SET_COOKIE, forward::state_cookie(&nonce, 600)),
+            (header::CACHE_CONTROL, "no-store".into()),
+            (header::REFERRER_POLICY, "no-referrer".into()),
+        ],
+    )
+        .into_response())
+}
+
+#[derive(Debug, Deserialize)]
 pub struct ForwardRedirectQuery {
     pub redirect_uri: String,
+    pub state: String,
+}
+
+fn with_origin_cookies(mut response: Response, pair: Option<&TokenPair>) -> Response {
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response.headers_mut().insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    if let Some(pair) = pair {
+        response.headers_mut().append(
+            header::SET_COOKIE,
+            build_auth_cookie(&pair.access_token, pair.expires_in)
+                .parse()
+                .unwrap(),
+        );
+        response.headers_mut().append(
+            header::SET_COOKIE,
+            build_refresh_cookie(&pair.refresh_token, pair.refresh_expires_in)
+                .parse()
+                .unwrap(),
+        );
+    }
+    response
 }
 
 #[utoipa::path(
     get,
     path = "/api/auth/forward-redirect",
     params(
-        ("redirect_uri" = String, Query, description = "Full external URL to redirect to after setting cookies")
+        ("redirect_uri" = String, Query, description = "Registered HTTPS application URL"),
+        ("state" = String, Query, description = "Browser state issued by the target origin")
     ),
     responses(
-        (status = 307, description = "Redirect to callback on target domain with forward token"),
-        (status = 401, description = "Not authenticated"),
-        (status = 500, description = "Internal server error")
+        (status = 303, description = "Redirect to a single-use callback on the target domain"),
+        (status = 400, description = "Invalid target or browser state"),
+        (status = 403, description = "Target application unavailable or access denied")
     ),
     tag = AUTH_TAG,
 )]
@@ -853,100 +1119,124 @@ pub async fn forward_redirect(
     headers: HeaderMap,
     Query(query): Query<ForwardRedirectQuery>,
 ) -> Result<Response, AppError> {
+    let target = ForwardTarget::parse(&query.redirect_uri)?;
+    target.ensure_protected_origin(&state.origin)?;
+    if !forward::valid_state(&query.state) {
+        return Err(AppError::InputError(vec![
+            "Invalid forward login state".into(),
+        ]));
+    }
     let mut conn = state.db_pool.acquire().await?;
+    let app = Application::find_matching(&target.host, &target.policy_path, &mut conn)
+        .await?
+        .ok_or(AppError::Forbidden)?;
 
-    let cookie_token = headers
-        .get("cookie")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|cookies| {
-            cookies
-                .split(';')
-                .map(|s| s.trim())
-                .find(|s| s.starts_with("authere_token="))
-                .map(|s| s.strip_prefix("authere_token=").unwrap_or(""))
-        });
-
-    let claims = match cookie_token {
-        Some(t) => match token::verify_access_token(t, &state.signing_key, &mut conn).await {
-            Ok(c) => c,
-            Err(_) => {
-                let login_url = format!(
-                    "/login?redirect_uri={}",
-                    urlencoding::encode(&format!(
-                        "/api/auth/forward-redirect?redirect_uri={}",
-                        urlencoding::encode(&query.redirect_uri)
-                    ))
-                );
-                return Ok((
-                    StatusCode::TEMPORARY_REDIRECT,
-                    [(header::LOCATION, login_url)],
-                ).into_response());
-            }
+    let mut renewed = None;
+    let mut claims = match cookie_value(&headers, crate::handlers::AUTH_COOKIE_NAME) {
+        Some(token) => match token::verify_access_token(token, &state.signing_key, &mut conn).await
+        {
+            Ok(claims) => Some(claims),
+            Err(AppError::AuthenticationRequired) => None,
+            Err(other) => return Err(other),
         },
-        None => {
-            let login_url = format!(
-                "/login?redirect_uri={}",
-                urlencoding::encode(&format!(
-                    "/api/auth/forward-redirect?redirect_uri={}",
-                    urlencoding::encode(&query.redirect_uri)
-                ))
-            );
-            return Ok((
-                StatusCode::TEMPORARY_REDIRECT,
-                [(header::LOCATION, login_url)],
-            ).into_response());
-        }
+        None => None,
     };
-
-    let parsed = url::Url::parse(&query.redirect_uri)
-        .map_err(|_| AppError::InputError(vec!["Invalid redirect_uri".into()]))?;
-    let target_host = parsed.host_str()
-        .ok_or_else(|| AppError::InputError(vec!["redirect_uri has no host".into()]))?
-        .to_string();
-    let target_scheme = parsed.scheme();
-    let target_path = parsed.path();
-
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| AppError::InternalError("Invalid user ID in token".into()))?;
-
-    let forward_token = token::generate_forward_token(
-        user_id,
-        claims.roles,
-        &target_host,
+    if claims.is_none() {
+        if let Some(refresh) = cookie_value(&headers, crate::handlers::REFRESH_COOKIE_NAME) {
+            match token::rotate_browser_token_pair(refresh, &state.signing_key, &mut conn).await {
+                Ok(pair) => {
+                    claims = Some(
+                        token::verify_access_token(
+                            &pair.access_token,
+                            &state.signing_key,
+                            &mut conn,
+                        )
+                        .await?,
+                    );
+                    renewed = Some(pair);
+                }
+                Err(AppError::AuthenticationRequired) => {}
+                Err(other) => return Err(other),
+            }
+        }
+    }
+    let Some(claims) = claims else {
+        let continue_url = format!(
+            "/api/auth/forward-redirect?redirect_uri={}&state={}",
+            urlencoding::encode(target.url.as_str()),
+            query.state
+        );
+        return Ok(with_origin_cookies(
+            (
+                StatusCode::SEE_OTHER,
+                [(
+                    header::LOCATION,
+                    format!("/login?redirect_uri={}", urlencoding::encode(&continue_url)),
+                )],
+            )
+                .into_response(),
+            None,
+        ));
+    };
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| AppError::AuthenticationRequired)?;
+    let user = User::get(user_id, &mut conn)
+        .await?
+        .ok_or(AppError::AuthenticationRequired)?;
+    let roles = user.get_roles(&mut conn).await?;
+    if !app.check_access_resolved(&roles, &mut conn).await? {
+        let mut target_headers = HeaderMap::new();
+        target_headers.insert(
+            "x-forwarded-host",
+            HeaderValue::from_str(&target.host)
+                .map_err(|_| AppError::InputError(vec!["Invalid target host".into()]))?,
+        );
+        target_headers.insert(
+            "x-forwarded-uri",
+            HeaderValue::from_str(target.local_path())
+                .map_err(|_| AppError::InputError(vec!["Invalid target path".into()]))?,
+        );
+        let denied = build_forward_auth_denied_html(
+            &state.origin,
+            &target_headers,
+            Some(&app.name),
+            &app.required_roles,
+        );
+        return Ok(with_origin_cookies(denied, renewed.as_ref()));
+    }
+    let handoff = forward::issue_handoff(
+        &claims,
+        app.id,
+        &target.origin(),
+        target.local_path(),
+        &query.state,
         &state.signing_key,
-    )?;
-
-    let callback_url = format!(
-        "{target_scheme}://{target_host}/.authere/callback?token={}&redirect_uri={}",
-        urlencoding::encode(&forward_token),
-        urlencoding::encode(target_path),
-    );
-
-    Ok((
-        StatusCode::TEMPORARY_REDIRECT,
-        [(header::LOCATION, callback_url)],
+        &mut conn,
     )
-        .into_response())
+    .await?;
+    let callback_url = format!(
+        "{}/.authere/callback?token={}",
+        target.origin(),
+        urlencoding::encode(&handoff)
+    );
+    Ok(with_origin_cookies(
+        (StatusCode::SEE_OTHER, [(header::LOCATION, callback_url)]).into_response(),
+        renewed.as_ref(),
+    ))
 }
 
 #[derive(Debug, Deserialize)]
 pub struct CallbackQuery {
     pub token: String,
-    pub redirect_uri: Option<String>,
 }
 
 #[utoipa::path(
     get,
     path = "/.authere/callback",
-    params(
-        ("token" = String, Query, description = "Forward auth token"),
-        ("redirect_uri" = Option<String>, Query, description = "Path to redirect to after setting cookies")
-    ),
+    params(("token" = String, Query, description = "Single-use forward login handoff")),
     responses(
-        (status = 307, description = "Cookies set, redirecting to final destination"),
-        (status = 401, description = "Invalid or expired token"),
-        (status = 403, description = "Token host mismatch"),
-        (status = 500, description = "Internal server error")
+        (status = 303, description = "Host-scoped session set, redirect to original path"),
+        (status = 401, description = "Invalid, expired, replayed, or browser-mismatched handoff"),
+        (status = 403, description = "Application access denied")
     ),
     tag = AUTH_TAG,
 )]
@@ -955,38 +1245,64 @@ pub async fn forward_auth_callback(
     headers: HeaderMap,
     Query(query): Query<CallbackQuery>,
 ) -> Result<Response, AppError> {
-    let request_host = headers
-        .get("host")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-
-    let claims = token::verify_forward_token(&query.token, request_host, &state.signing_key)?;
-
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| AppError::InternalError("Invalid user ID in token".into()))?;
-
+    let origin_target = ForwardTarget::from_callback(&headers, "/")?;
+    origin_target.ensure_protected_origin(&state.origin)?;
+    let nonce =
+        cookie_value(&headers, forward::STATE_COOKIE).ok_or(AppError::AuthenticationRequired)?;
     let mut conn = state.db_pool.acquire().await?;
-
-    let user = User::get(user_id, &mut conn)
+    let (session_token, claims, redirect_path) = forward::redeem_handoff(
+        &query.token,
+        &origin_target.origin(),
+        nonce,
+        &state.signing_key,
+        &mut conn,
+    )
+    .await?;
+    let target = ForwardTarget::from_callback(&headers, &redirect_path)?;
+    let app = Application::find_matching(&target.host, &target.policy_path, &mut conn)
+        .await?
+        .ok_or(AppError::Forbidden)?;
+    if claims.application_id != app.id {
+        return Err(AppError::Forbidden);
+    }
+    let user = User::get(claims.sub, &mut conn)
         .await?
         .ok_or(AppError::AuthenticationRequired)?;
     let roles = user.get_roles(&mut conn).await?;
+    if !app.check_access_resolved(&roles, &mut conn).await? {
+        return Err(AppError::Forbidden);
+    }
 
-    let token_pair = generate_token_pair(user_id, roles, &state.signing_key, &mut conn).await?;
-
-    let access_cookie = build_auth_cookie(&token_pair.access_token, token_pair.expires_in);
-    let refresh_cookie = build_refresh_cookie(&token_pair.refresh_token, token_pair.refresh_expires_in);
-
-    let redirect_path = query.redirect_uri
-        .filter(|p| p.starts_with('/'))
-        .unwrap_or_else(|| "/".into());
-
-    let mut resp_headers = HeaderMap::new();
-    resp_headers.insert(header::SET_COOKIE, access_cookie.parse().unwrap());
-    resp_headers.append(header::SET_COOKIE, refresh_cookie.parse().unwrap());
-    resp_headers.insert(header::LOCATION, redirect_path.parse().unwrap());
-
-    Ok((StatusCode::TEMPORARY_REDIRECT, resp_headers).into_response())
+    let mut response = (
+        StatusCode::SEE_OTHER,
+        [
+            (header::LOCATION, redirect_path),
+            (header::CACHE_CONTROL, "no-store".into()),
+            (header::REFERRER_POLICY, "no-referrer".into()),
+        ],
+    )
+        .into_response();
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        forward::session_cookie(&session_token, claims.exp - forward::now())
+            .parse()
+            .unwrap(),
+    );
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        forward::state_cookie("", 0).parse().unwrap(),
+    );
+    // Remove credentials set by older versions on this protected host.
+    for cookie in clear_auth_cookies().into_iter().chain([
+        "authere_token=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0".into(),
+        "authere_refresh=; HttpOnly; Secure; SameSite=Strict; Path=/api/auth; Max-Age=0".into(),
+        "authere_refresh=; HttpOnly; Secure; SameSite=Strict; Path=/auth; Max-Age=0".into(),
+    ]) {
+        response
+            .headers_mut()
+            .append(header::SET_COOKIE, cookie.parse().unwrap());
+    }
+    Ok(response)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1023,15 +1339,11 @@ pub async fn lookup_forward_app(
     State(state): State<AppState>,
     Query(query): Query<ForwardAppQuery>,
 ) -> Result<axum::Json<ForwardAppResponse>, AppError> {
-    let parsed = url::Url::parse(&query.redirect_uri)
-        .map_err(|_| AppError::InputError(vec!["Invalid redirect_uri".into()]))?;
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| AppError::InputError(vec!["redirect_uri has no host".into()]))?;
-    let path = parsed.path();
+    let target = ForwardTarget::parse(&query.redirect_uri)?;
+    target.ensure_protected_origin(&state.origin)?;
 
     let mut conn = state.db_pool.acquire().await?;
-    match Application::find_matching(host, path, &mut conn).await? {
+    match Application::find_matching(&target.host, &target.policy_path, &mut conn).await? {
         Some(app) => Ok(axum::Json(ForwardAppResponse { name: app.name })),
         None => Err(AppError::NotFound),
     }
@@ -1080,7 +1392,7 @@ mod tests {
 
         let headers = build_auth_headers(&user, &roles, None);
 
-        assert!(headers.get("x-auth-email").is_none());
+        assert_eq!(headers.get("x-auth-email").unwrap(), "");
         assert_eq!(headers.get("x-auth-username").unwrap(), "testuser");
         assert_eq!(headers.get("x-auth-roles").unwrap(), "user");
     }
@@ -1118,45 +1430,44 @@ mod tests {
 
         let resp = build_forward_auth_redirect("https://auth.example.com", &headers);
 
-        assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
         assert_eq!(
             extract_location(&resp),
-            "https://auth.example.com/api/auth/forward-redirect?redirect_uri=https%3A%2F%2Fflood.example.com%2Fsome%2Fpath"
+            "https://flood.example.com/.authere/start?redirect_uri=%2Fsome%2Fpath"
         );
     }
 
     #[test]
-    fn forward_auth_redirect_defaults_to_slash_when_no_host() {
+    fn forward_auth_redirect_rejects_missing_host() {
         let headers = HeaderMap::new();
         let resp = build_forward_auth_redirect("https://auth.example.com", &headers);
 
-        assert_eq!(
-            extract_location(&resp),
-            "https://auth.example.com/api/auth/forward-redirect?redirect_uri=%2F"
-        );
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
     fn forward_auth_redirect_defaults_proto_to_https() {
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-host", "app.example.com".parse().unwrap());
+        headers.insert("x-forwarded-uri", "/".parse().unwrap());
 
         let resp = build_forward_auth_redirect("https://auth.example.com", &headers);
 
-        assert!(extract_location(&resp).contains("https%3A%2F%2Fapp.example.com"));
+        assert!(extract_location(&resp).starts_with("https://app.example.com/"));
     }
 
     #[test]
-    fn forward_auth_redirect_defaults_uri_to_slash() {
+    fn forward_auth_redirect_uses_root_uri() {
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-proto", "https".parse().unwrap());
         headers.insert("x-forwarded-host", "app.example.com".parse().unwrap());
+        headers.insert("x-forwarded-uri", "/".parse().unwrap());
 
         let resp = build_forward_auth_redirect("https://auth.example.com", &headers);
 
         assert_eq!(
             extract_location(&resp),
-            "https://auth.example.com/api/auth/forward-redirect?redirect_uri=https%3A%2F%2Fapp.example.com%2F"
+            "https://app.example.com/.authere/start?redirect_uri=%2F"
         );
     }
 
@@ -1169,7 +1480,9 @@ mod tests {
     }
 
     async fn collect_body(resp: Response) -> String {
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         String::from_utf8(bytes.to_vec()).unwrap()
     }
 
@@ -1199,15 +1512,14 @@ mod tests {
         assert!(body.contains("Production Dashboard"));
         assert!(body.contains(r#"<span class="chip">admin</span>"#));
         assert!(body.contains(r#"<span class="chip">ops</span>"#));
-        assert!(body.contains(
-            "https://auth.example.com/api/auth/forward-redirect?redirect_uri=https%3A%2F%2Fapp.example.com%2Fdashboard"
-        ));
+        assert!(body.contains("https://app.example.com/.authere/start?redirect_uri=%2Fdashboard"));
     }
 
     #[tokio::test]
     async fn forward_auth_denied_html_escapes_app_name_and_roles() {
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-host", "app.example.com".parse().unwrap());
+        headers.insert("x-forwarded-uri", "/".parse().unwrap());
 
         let resp = build_forward_auth_denied_html(
             "https://auth.example.com",
@@ -1226,12 +1538,7 @@ mod tests {
     async fn forward_auth_denied_html_omits_details_when_unknown() {
         let headers = HeaderMap::new();
 
-        let resp = build_forward_auth_denied_html(
-            "https://auth.example.com",
-            &headers,
-            None,
-            &[],
-        );
+        let resp = build_forward_auth_denied_html("https://auth.example.com", &headers, None, &[]);
 
         let body = collect_body(resp).await;
         assert!(!body.contains(r#"class="details""#));

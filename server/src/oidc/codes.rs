@@ -33,6 +33,8 @@ pub struct ConsumedCode {
     pub code_challenge: String,
     pub code_challenge_method: String,
     pub auth_time: i64,
+    pub session_version: Option<i64>,
+    pub session_exp: Option<i64>,
 }
 
 fn now_epoch() -> i64 {
@@ -65,18 +67,23 @@ pub async fn issue(
     code_challenge: &str,
     code_challenge_method: &str,
     auth_time: i64,
+    session_version: Option<i64>,
+    session_exp: Option<i64>,
     conn: &mut SqliteConnection,
 ) -> Result<IssuedCode, AppError> {
     let plaintext = generate_plaintext();
     let hash = hash_code(&plaintext);
     let now = now_epoch();
-    let expires_at = now + AUTHORIZATION_CODE_LIFETIME;
+    let expires_at = session_exp
+        .unwrap_or(i64::MAX)
+        .min(now + AUTHORIZATION_CODE_LIFETIME);
 
     sqlx::query!(
         r#"INSERT INTO oidc_authorization_codes
                (code_hash, application_id, user_id, redirect_uri, scope, nonce,
-                code_challenge, code_challenge_method, auth_time, expires_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                code_challenge, code_challenge_method, auth_time, expires_at,
+                session_version, session_exp)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         hash,
         application_id,
         user_id,
@@ -87,6 +94,8 @@ pub async fn issue(
         code_challenge_method,
         auth_time,
         expires_at,
+        session_version,
+        session_exp,
     )
     .execute(conn)
     .await?;
@@ -94,11 +103,14 @@ pub async fn issue(
     Ok(IssuedCode { plaintext })
 }
 
-/// Atomically consume a code: marks `consumed_at = now` only if the code is not already
-/// consumed and not expired. Returns `Ok(Some(...))` when this call claimed the code,
-/// `Ok(None)` for unknown/replayed/expired codes.
+/// Validate the code's client, redirect URI and PKCE binding before atomically consuming
+/// it. A failed exchange must not invalidate another client's outstanding authorization.
+/// Returns `Ok(None)` for invalid, replayed or expired codes and failed bindings.
 pub async fn consume(
     code: &str,
+    application_id: Uuid,
+    redirect_uri: &str,
+    code_verifier: &str,
     conn: &mut SqliteConnection,
 ) -> Result<Option<ConsumedCode>, AppError> {
     let hash = hash_code(code);
@@ -108,22 +120,31 @@ pub async fn consume(
         r#"SELECT application_id as "application_id: Uuid",
                   user_id as "user_id: Uuid",
                   redirect_uri, scope, nonce, code_challenge,
-                  code_challenge_method, auth_time, expires_at, consumed_at
+                  code_challenge_method, auth_time, expires_at, consumed_at,
+                  session_version, session_exp
              FROM oidc_authorization_codes WHERE code_hash = ?"#,
         hash
     )
     .fetch_optional(&mut *conn)
     .await?;
 
-    let Some(row) = row else { return Ok(None); };
-    if row.consumed_at.is_some() || row.expires_at < now {
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    if row.consumed_at.is_some()
+        || row.expires_at <= now
+        || row.application_id != application_id
+        || row.redirect_uri != redirect_uri
+        || row.code_challenge_method != "S256"
+        || !verify_pkce_s256(code_verifier, &row.code_challenge)
+    {
         return Ok(None);
     }
 
     let res = sqlx::query!(
         r#"UPDATE oidc_authorization_codes
               SET consumed_at = ?
-            WHERE code_hash = ? AND consumed_at IS NULL AND expires_at >= ?"#,
+            WHERE code_hash = ? AND consumed_at IS NULL AND expires_at > ?"#,
         now,
         hash,
         now
@@ -144,6 +165,8 @@ pub async fn consume(
         code_challenge: row.code_challenge,
         code_challenge_method: row.code_challenge_method,
         auth_time: row.auth_time,
+        session_version: row.session_version,
+        session_exp: row.session_exp,
     }))
 }
 
@@ -188,6 +211,9 @@ mod tests {
     use sqlx::SqlitePool;
     use sqlx::sqlite::SqlitePoolOptions;
 
+    const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+
     async fn pool() -> SqlitePool {
         let pool = SqlitePoolOptions::new()
             .connect("sqlite::memory:")
@@ -231,15 +257,26 @@ mod tests {
             "https://app.example.com/cb",
             "openid profile",
             Some("nonce-xyz"),
-            "challenge-abc",
+            CHALLENGE,
             "S256",
             1_700_000_000,
+            None,
+            None,
             &mut conn,
         )
         .await
         .unwrap();
 
-        let consumed = consume(&issued.plaintext, &mut conn).await.unwrap().unwrap();
+        let consumed = consume(
+            &issued.plaintext,
+            app_id,
+            "https://app.example.com/cb",
+            VERIFIER,
+            &mut conn,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(consumed.application_id, app_id);
         assert_eq!(consumed.user_id, user_id);
         assert_eq!(consumed.redirect_uri, "https://app.example.com/cb");
@@ -254,21 +291,167 @@ mod tests {
         let (user_id, app_id) = seed(&mut conn).await;
 
         let issued = issue(
-            app_id, user_id, "https://app.example.com/cb", "openid",
-            None, "c", "S256", 0, &mut conn,
+            app_id,
+            user_id,
+            "https://app.example.com/cb",
+            "openid",
+            None,
+            CHALLENGE,
+            "S256",
+            0,
+            None,
+            None,
+            &mut conn,
         )
         .await
         .unwrap();
 
-        assert!(consume(&issued.plaintext, &mut conn).await.unwrap().is_some());
-        assert!(consume(&issued.plaintext, &mut conn).await.unwrap().is_none());
+        assert!(
+            consume(
+                &issued.plaintext,
+                app_id,
+                "https://app.example.com/cb",
+                VERIFIER,
+                &mut conn
+            )
+            .await
+            .unwrap()
+            .is_some()
+        );
+        assert!(
+            consume(
+                &issued.plaintext,
+                app_id,
+                "https://app.example.com/cb",
+                VERIFIER,
+                &mut conn
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
     }
 
     #[tokio::test]
     async fn consume_rejects_unknown() {
         let pool = pool().await;
         let mut conn = pool.acquire().await.unwrap();
-        assert!(consume("nope", &mut conn).await.unwrap().is_none());
+        assert!(
+            consume(
+                "nope",
+                Uuid::new_v4(),
+                "https://app.example.com/cb",
+                VERIFIER,
+                &mut conn
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_bindings_do_not_consume_code() {
+        let pool = pool().await;
+        let mut conn = pool.acquire().await.unwrap();
+        let (user_id, app_id) = seed(&mut conn).await;
+        let issued = issue(
+            app_id,
+            user_id,
+            "https://app.example.com/cb",
+            "openid",
+            None,
+            CHALLENGE,
+            "S256",
+            0,
+            Some(0),
+            None,
+            &mut conn,
+        )
+        .await
+        .unwrap();
+        assert!(
+            consume(
+                &issued.plaintext,
+                Uuid::new_v4(),
+                "https://app.example.com/cb",
+                VERIFIER,
+                &mut conn
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            consume(
+                &issued.plaintext,
+                app_id,
+                "https://app.example.com/other",
+                VERIFIER,
+                &mut conn
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            consume(
+                &issued.plaintext,
+                app_id,
+                "https://app.example.com/cb",
+                &"A".repeat(43),
+                &mut conn
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            consume(
+                &issued.plaintext,
+                app_id,
+                "https://app.example.com/cb",
+                VERIFIER,
+                &mut conn
+            )
+            .await
+            .unwrap()
+            .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn code_cannot_outlive_its_session() {
+        let pool = pool().await;
+        let mut conn = pool.acquire().await.unwrap();
+        let (user_id, app_id) = seed(&mut conn).await;
+        let issued = issue(
+            app_id,
+            user_id,
+            "https://app.example.com/cb",
+            "openid",
+            None,
+            CHALLENGE,
+            "S256",
+            0,
+            Some(0),
+            Some(now_epoch() - 1),
+            &mut conn,
+        )
+        .await
+        .unwrap();
+        assert!(
+            consume(
+                &issued.plaintext,
+                app_id,
+                "https://app.example.com/cb",
+                VERIFIER,
+                &mut conn
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
     }
 
     #[test]

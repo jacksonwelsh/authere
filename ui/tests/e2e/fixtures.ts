@@ -4,10 +4,10 @@ import { loginPageAsAdmin, newAdminRequestContext } from './helpers/api';
 
 type WorkerFixtures = {
   server: WorkerServer;
-  adminRequest: APIRequestContext;
 };
 
 type TestFixtures = {
+  adminRequest: APIRequestContext;
   appURL: string;
   adminPage: Page;
 };
@@ -35,16 +35,13 @@ export const test = base.extend<TestFixtures, WorkerFixtures>({
   // to obtain a bearer token rather than browser cookies (Secure cookies
   // aren't sent by standalone APIRequestContexts over http).
   //
-  // Worker-scoped so we only log in once per worker — avoids chewing through
-  // the 5/60s login rate limit in seed helpers.
-  adminRequest: [
-    async ({ server }, use) => {
-      const request = await newAdminRequestContext(server.baseURL);
-      await use(request);
-      await request.dispose();
-    },
-    { scope: 'worker' },
-  ],
+  // Each test receives a fresh session: logging out in one browser correctly
+  // revokes that user's earlier sessions. Test servers relax login rate limits.
+  adminRequest: async ({ server }, use) => {
+    const request = await newAdminRequestContext(server.baseURL);
+    await use(request);
+    await request.dispose();
+  },
 
   // A browser page already logged in as the admin. Equivalent to clicking
   // through the login form, but skips the rate-limited endpoint so tests

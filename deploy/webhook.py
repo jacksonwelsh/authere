@@ -17,7 +17,9 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
 
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 DEPLOY_SCRIPT = os.environ.get("DEPLOY_SCRIPT", "/opt/authere/deploy.sh")
@@ -34,7 +36,41 @@ def verify_signature(payload: bytes, signature: str) -> bool:
     expected = hmac.new(
         WEBHOOK_SECRET.encode(), payload, hashlib.sha256
     ).hexdigest()
-    return hmac.compare_digest(f"sha256={expected}", signature)
+    try:
+        return hmac.compare_digest(f"sha256={expected}".encode("ascii"), signature.encode("ascii"))
+    except UnicodeEncodeError:
+        return False
+
+
+class WebhookServer(ThreadingMixIn, HTTPServer):
+    """Bound simultaneous requests and time spent waiting for an incomplete body."""
+
+    daemon_threads = True
+
+    def __init__(self, *args, **kwargs):
+        self._requests = threading.BoundedSemaphore(16)
+        super().__init__(*args, **kwargs)
+
+    def get_request(self):
+        request, address = super().get_request()
+        request.settimeout(10)
+        return request, address
+
+    def process_request(self, request, address):
+        if not self._requests.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, address)
+        except BaseException:
+            self._requests.release()
+            raise
+
+    def process_request_thread(self, request, address):
+        try:
+            super().process_request_thread(request, address)
+        finally:
+            self._requests.release()
 
 
 class WebhookHandler(BaseHTTPRequestHandler):
@@ -43,12 +79,23 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self.send_error(404)
             return
 
-        content_length = int(self.headers.get("Content-Length", 0))
+        lengths = self.headers.get_all("Content-Length", [])
+        if self.headers.get("Transfer-Encoding") or len(lengths) != 1 or not lengths[0].isascii() or not lengths[0].isdigit():
+            self.send_error(400)
+            return
+        try:
+            content_length = int(lengths[0])
+        except ValueError:
+            self.send_error(400)
+            return
         if content_length > 1_000_000:
             self.send_error(413)
             return
 
         payload = self.rfile.read(content_length)
+        if len(payload) != content_length:
+            self.send_error(400)
+            return
 
         signature = self.headers.get("X-Hub-Signature-256", "")
         if not verify_signature(payload, signature):
@@ -63,7 +110,14 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self.wfile.write(b"ignored event\n")
             return
 
-        body = json.loads(payload)
+        try:
+            body = json.loads(payload)
+        except (ValueError, UnicodeDecodeError):
+            self.send_error(400)
+            return
+        if not isinstance(body, dict) or not isinstance(body.get("release", {}), dict):
+            self.send_error(400)
+            return
         action = body.get("action", "")
         tag = body.get("release", {}).get("tag_name", "")
 
@@ -97,6 +151,6 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    server = HTTPServer(("127.0.0.1", PORT), WebhookHandler)
+    server = WebhookServer(("127.0.0.1", PORT), WebhookHandler)
     print(f"Webhook listener on 127.0.0.1:{PORT}", file=sys.stderr)
     server.serve_forever()

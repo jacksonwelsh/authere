@@ -192,3 +192,31 @@ async fn rejects_redirect_uri_without_host() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn literal_hostname_does_not_use_regex_wildcards() {
+    let router = setup().await;
+    let resp = router.oneshot(get(
+        "/api/auth/forward-app?redirect_uri=https%3A%2F%2FfloodXexample.com%2F",
+    )).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn canonicalizes_host_case_and_default_https_port() {
+    let router = setup().await;
+    let resp = router.oneshot(get(
+        "/api/auth/forward-app?redirect_uri=https%3A%2F%2FFLOOD.EXAMPLE.COM%3A443%2F",
+    )).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["name"], "Flood Tracker");
+}
+
+#[tokio::test]
+async fn rejects_non_https_and_userinfo_targets() {
+    for uri in ["http://flood.example.com/", "https://user@flood.example.com/", "ftp://flood.example.com/"] {
+        let router = setup().await;
+        let resp = router.oneshot(get(&format!("/api/auth/forward-app?redirect_uri={}", urlencoding::encode(uri)))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+}

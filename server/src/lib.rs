@@ -15,6 +15,7 @@ pub mod app_passwords;
 pub mod application;
 pub mod audit;
 pub mod auth_middleware;
+pub mod browser_security;
 pub mod cli;
 pub mod db;
 pub mod errors;

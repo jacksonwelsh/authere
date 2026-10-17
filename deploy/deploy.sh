@@ -40,7 +40,14 @@ with open(sys.argv[1], "rb") as f:
 ' "$1"
 }
 
-deploy() {
+deploy() (
+  # GitHub may redeliver an event or a release may be published repeatedly. Serialize
+  # downloads and replacement so concurrent webhook jobs cannot race the active binary.
+  exec 9>"${INSTALL_DIR}/.deploy.lock"
+  if ! flock -w 600 9; then
+    log "ERROR: Timed out waiting for the previous deployment"
+    return 1
+  fi
   log "Starting deploy"
 
   local release_json asset_url
@@ -85,7 +92,7 @@ deploy() {
   sudo /usr/bin/systemctl restart authere
 
   log "Deploy complete ($(stat -c %s "${INSTALL_DIR}/${BINARY_NAME}" 2>/dev/null || echo "?") bytes)"
-}
+)
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   # Route stdout/stderr to syslog so bash errors and curl stderr surface in

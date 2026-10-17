@@ -15,9 +15,7 @@
 
 use axum::extract::{Form, Query, State};
 use axum::http::Uri;
-use axum::http::header::{
-    self, AUTHORIZATION, LOCATION, SET_COOKIE, WWW_AUTHENTICATE,
-};
+use axum::http::header::{self, AUTHORIZATION, LOCATION, SET_COOKIE, WWW_AUTHENTICATE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use base64::Engine;
@@ -32,7 +30,10 @@ use crate::AppState;
 use crate::application::{AppType, Application};
 use crate::audit::{AuditContext, AuditEventType, audit};
 use crate::db::DbEntity;
-use crate::handlers::{AUTH_COOKIE_NAME, REFRESH_COOKIE_NAME, clear_auth_cookies};
+use crate::handlers::{
+    AUTH_COOKIE_NAME, REFRESH_COOKIE_NAME, build_auth_cookie, build_refresh_cookie,
+    clear_auth_cookies,
+};
 use crate::oidc::codes;
 use crate::oidc::jwks::build_jwks;
 use crate::oidc::token::{
@@ -41,7 +42,10 @@ use crate::oidc::token::{
 };
 use crate::rate_limit::RateLimitExceeded;
 use crate::user::User;
-use crate::user::auth::token::{revoke_all_user_tokens, verify_access_token};
+use crate::user::auth::token::{
+    TokenPair, revoke_all_user_tokens, rotate_browser_token_pair, verify_access_token,
+    verify_user_session,
+};
 
 const OIDC_TAG: &str = "oidc";
 
@@ -57,6 +61,7 @@ pub enum OAuthError {
     UnsupportedGrantType,
     InvalidScope,
     AccessDenied,
+    LoginRequired,
     ServerError,
 }
 
@@ -71,14 +76,14 @@ impl OAuthError {
             OAuthError::UnsupportedGrantType => "unsupported_grant_type",
             OAuthError::InvalidScope => "invalid_scope",
             OAuthError::AccessDenied => "access_denied",
+            OAuthError::LoginRequired => "login_required",
             OAuthError::ServerError => "server_error",
         }
     }
 
     fn description(&self) -> Option<&'static str> {
         match self {
-            OAuthError::InvalidRequest(m)
-            | OAuthError::InvalidGrant(m) => Some(m),
+            OAuthError::InvalidRequest(m) | OAuthError::InvalidGrant(m) => Some(m),
             _ => None,
         }
     }
@@ -86,6 +91,7 @@ impl OAuthError {
     fn token_endpoint_status(&self) -> StatusCode {
         match self {
             OAuthError::InvalidClient => StatusCode::UNAUTHORIZED,
+            OAuthError::ServerError => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::BAD_REQUEST,
         }
     }
@@ -99,6 +105,8 @@ impl IntoResponse for OAuthError {
             body["error_description"] = json!(desc);
         }
         let mut resp = (status, axum::Json(body)).into_response();
+        resp.headers_mut()
+            .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
         if matches!(self, OAuthError::InvalidClient) {
             resp.headers_mut()
                 .insert(WWW_AUTHENTICATE, "Basic realm=\"oidc\"".parse().unwrap());
@@ -107,19 +115,68 @@ impl IntoResponse for OAuthError {
     }
 }
 
-/// Extract the Authere session cookie (authere_token) from the request.
+/// Extract the host-bound Authere session cookie from the request.
 fn extract_session_cookie(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get("cookie")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|cookies| {
-            cookies
-                .split(';')
-                .map(|s| s.trim())
-                .find(|s| s.starts_with(&format!("{AUTH_COOKIE_NAME}=")))
-                .and_then(|s| s.strip_prefix(&format!("{AUTH_COOKIE_NAME}=")))
-                .map(|s| s.to_string())
-        })
+    extract_cookie(headers, AUTH_COOKIE_NAME)
+}
+
+fn extract_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
+    let mut values = headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .filter_map(|value| value.trim().split_once('='))
+        .filter_map(|(key, value)| (key == name).then_some(value));
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+async fn resolve_browser_session(
+    state: &AppState,
+    headers: &HeaderMap,
+    conn: &mut sqlx::SqliteConnection,
+    renewed: &mut Option<TokenPair>,
+) -> Result<Option<crate::user::auth::token::Claims>, crate::errors::AppError> {
+    use crate::errors::AppError;
+    if let Some(access) = extract_session_cookie(headers) {
+        match verify_access_token(&access, &state.signing_key, conn).await {
+            Ok(claims) => return Ok(Some(claims)),
+            Err(AppError::AuthenticationRequired) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    if let Some(refresh) = extract_cookie(headers, REFRESH_COOKIE_NAME) {
+        match rotate_browser_token_pair(&refresh, &state.signing_key, conn).await {
+            Ok(pair) => {
+                let claims =
+                    verify_access_token(&pair.access_token, &state.signing_key, conn).await?;
+                *renewed = Some(pair);
+                return Ok(Some(claims));
+            }
+            Err(AppError::AuthenticationRequired) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(None)
+}
+
+fn append_session_cookies(response: &mut Response, pair: &TokenPair) {
+    response.headers_mut().append(
+        SET_COOKIE,
+        build_auth_cookie(&pair.access_token, pair.expires_in)
+            .parse()
+            .unwrap(),
+    );
+    response.headers_mut().append(
+        SET_COOKIE,
+        build_refresh_cookie(&pair.refresh_token, pair.refresh_expires_in)
+            .parse()
+            .unwrap(),
+    );
 }
 
 // ============================================================================
@@ -155,7 +212,12 @@ fn build_discovery(origin: &str) -> DiscoveryDocument {
         response_types_supported: vec!["code".into()],
         subject_types_supported: vec!["public".into()],
         id_token_signing_alg_values_supported: vec!["EdDSA".into()],
-        scopes_supported: vec!["openid".into(), "profile".into(), "email".into(), "roles".into()],
+        scopes_supported: vec![
+            "openid".into(),
+            "profile".into(),
+            "email".into(),
+            "roles".into(),
+        ],
         token_endpoint_auth_methods_supported: vec![
             "client_secret_basic".into(),
             "client_secret_post".into(),
@@ -164,9 +226,18 @@ fn build_discovery(origin: &str) -> DiscoveryDocument {
         grant_types_supported: vec!["authorization_code".into()],
         code_challenge_methods_supported: vec!["S256".into()],
         claims_supported: vec![
-            "sub".into(), "iss".into(), "aud".into(), "exp".into(), "iat".into(),
-            "auth_time".into(), "nonce".into(), "name".into(), "preferred_username".into(),
-            "updated_at".into(), "email".into(), "roles".into(),
+            "sub".into(),
+            "iss".into(),
+            "aud".into(),
+            "exp".into(),
+            "iat".into(),
+            "auth_time".into(),
+            "nonce".into(),
+            "name".into(),
+            "preferred_username".into(),
+            "updated_at".into(),
+            "email".into(),
+            "roles".into(),
         ],
     }
 }
@@ -179,9 +250,7 @@ fn build_discovery(origin: &str) -> DiscoveryDocument {
     ),
     tag = OIDC_TAG,
 )]
-pub async fn discovery(
-    State(state): State<AppState>,
-) -> axum::Json<DiscoveryDocument> {
+pub async fn discovery(State(state): State<AppState>) -> axum::Json<DiscoveryDocument> {
     axum::Json(build_discovery(&state.origin))
 }
 
@@ -212,6 +281,8 @@ pub struct AuthorizeQuery {
     pub nonce: Option<String>,
     pub code_challenge: Option<String>,
     pub code_challenge_method: Option<String>,
+    pub prompt: Option<String>,
+    pub max_age: Option<String>,
 }
 
 /// Append query parameters to a base URI. Uses `?` if none present, else `&`. This keeps us
@@ -230,7 +301,15 @@ fn append_query(base: &str, params: &[(&str, &str)]) -> String {
 }
 
 fn redirect(status: StatusCode, location: String) -> Response {
-    (status, [(LOCATION, location)]).into_response()
+    (
+        status,
+        [
+            (LOCATION, location),
+            (header::CACHE_CONTROL, "no-store".to_string()),
+            (header::REFERRER_POLICY, "no-referrer".to_string()),
+        ],
+    )
+        .into_response()
 }
 
 fn authorize_error_redirect(
@@ -264,6 +343,24 @@ pub async fn authorize(
     headers: HeaderMap,
     uri: Uri,
     Query(q): Query<AuthorizeQuery>,
+) -> Response {
+    let mut renewed = None;
+    let mut response = authorize_impl(state, audit_ctx, headers, uri, q, &mut renewed).await;
+    // A central session remains usable for its configured lifetime even when its short
+    // access token expired between visits to an OIDC application.
+    if let Some(pair) = renewed {
+        append_session_cookies(&mut response, &pair);
+    }
+    response
+}
+
+async fn authorize_impl(
+    state: AppState,
+    audit_ctx: AuditContext,
+    headers: HeaderMap,
+    uri: Uri,
+    q: AuthorizeQuery,
+    renewed: &mut Option<TokenPair>,
 ) -> Response {
     let mut conn = match state.db_pool.acquire().await {
         Ok(c) => c,
@@ -304,8 +401,30 @@ pub async fn authorize(
         );
     }
 
+    // Do not silently satisfy a reauthentication request with an existing session. The
+    // login UI does not yet provide a reauthentication/consent flow for these parameters.
+    let prompt_none = q
+        .prompt
+        .as_deref()
+        .is_some_and(|prompt| prompt.split_whitespace().eq(["none"]));
+    if q.max_age.is_some()
+        || q.prompt
+            .as_deref()
+            .is_some_and(|prompt| !prompt.is_empty() && !prompt_none)
+    {
+        return authorize_error_redirect(
+            presented_redirect,
+            state_param,
+            &OAuthError::InvalidRequest("requested reauthentication or consent is not supported"),
+        );
+    }
+
     let scope = parse_scope(q.scope.as_deref().unwrap_or(""));
-    if !scope_contains(&scope, SCOPE_OPENID) {
+    if !scope_contains(&scope, SCOPE_OPENID)
+        || scope
+            .iter()
+            .any(|s| !matches!(s.as_str(), "openid" | "profile" | "email" | "roles"))
+    {
         return authorize_error_redirect(
             presented_redirect,
             state_param,
@@ -323,7 +442,7 @@ pub async fn authorize(
             );
         }
     };
-    let method = q.code_challenge_method.as_deref().unwrap_or("S256");
+    let method = q.code_challenge_method.as_deref().unwrap_or("plain");
     if method != "S256" {
         return authorize_error_redirect(
             presented_redirect,
@@ -331,15 +450,33 @@ pub async fn authorize(
             &OAuthError::InvalidRequest("code_challenge_method must be S256"),
         );
     }
+    if challenge.len() != 43
+        || !challenge
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+        || base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(challenge)
+            .is_err()
+    {
+        return authorize_error_redirect(
+            presented_redirect,
+            state_param,
+            &OAuthError::InvalidRequest("invalid S256 code_challenge"),
+        );
+    }
 
     // Step 2: check the user's Authere session. Missing/expired -> bounce through /login.
-    let session_cookie = extract_session_cookie(&headers);
-    let claims = match session_cookie.as_deref() {
-        Some(t) => match verify_access_token(t, &state.signing_key, &mut conn).await {
-            Ok(c) => c,
-            Err(_) => return login_redirect(&uri),
-        },
-        None => return login_redirect(&uri),
+    let needs_login = || {
+        if prompt_none {
+            authorize_error_redirect(presented_redirect, state_param, &OAuthError::LoginRequired)
+        } else {
+            login_redirect(&uri)
+        }
+    };
+    let claims = match resolve_browser_session(&state, &headers, &mut conn, renewed).await {
+        Ok(Some(claims)) => claims,
+        Ok(None) => return needs_login(),
+        Err(_) => return OAuthError::ServerError.into_response(),
     };
 
     let user_id = match Uuid::parse_str(&claims.sub) {
@@ -353,8 +490,17 @@ pub async fn authorize(
         }
     };
 
-    // Step 3: role gating.
-    match app.check_access_resolved(&claims.roles, &mut conn).await {
+    // Step 3: use current roles so removing access takes effect before the session expires.
+    let user = match User::get(user_id, &mut conn).await {
+        Ok(Some(user)) if user.active => user,
+        Ok(_) => return needs_login(),
+        Err(_) => return OAuthError::ServerError.into_response(),
+    };
+    let roles = match user.get_roles(&mut conn).await {
+        Ok(roles) => roles,
+        Err(_) => return OAuthError::ServerError.into_response(),
+    };
+    match app.check_access_resolved(&roles, &mut conn).await {
         Ok(true) => {}
         Ok(false) => {
             warn!(
@@ -392,7 +538,9 @@ pub async fn authorize(
         q.nonce.as_deref(),
         challenge,
         method,
-        claims.iat,
+        claims.auth_time.unwrap_or(claims.iat),
+        claims.session_version,
+        Some(claims.session_exp.unwrap_or(claims.exp)),
         &mut conn,
     )
     .await
@@ -434,7 +582,10 @@ fn login_redirect(uri: &Uri) -> Response {
         .path_and_query()
         .map(|pq| pq.to_string())
         .unwrap_or_else(|| "/oauth/authorize".to_string());
-    let target = format!("/login?redirect_uri={}", urlencoding::encode(&path_and_query));
+    let target = format!(
+        "/login?redirect_uri={}",
+        urlencoding::encode(&path_and_query)
+    );
     redirect(StatusCode::FOUND, target)
 }
 
@@ -454,13 +605,20 @@ pub struct TokenForm {
 
 fn parse_basic_auth(headers: &HeaderMap) -> Option<(String, String)> {
     let raw = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok())?;
-    let b64 = raw.strip_prefix("Basic ")?;
+    let (scheme, b64) = raw.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("Basic") {
+        return None;
+    }
     let decoded = B64.decode(b64.trim()).ok()?;
     let s = std::str::from_utf8(&decoded).ok()?;
     let (id, secret) = s.split_once(':')?;
     // Per RFC 6749 §2.3.1 client_id and secret are URL-decoded when sent in Basic.
-    let id = urlencoding::decode(id).ok()?.into_owned();
-    let secret = urlencoding::decode(secret).ok()?.into_owned();
+    let id = urlencoding::decode(&id.replace('+', " "))
+        .ok()?
+        .into_owned();
+    let secret = urlencoding::decode(&secret.replace('+', " "))
+        .ok()?
+        .into_owned();
     Some((id, secret))
 }
 
@@ -492,8 +650,23 @@ pub async fn token(
         Err(_) => return OAuthError::ServerError.into_response(),
     };
 
-    // Resolve client credentials: Basic header takes precedence; otherwise use form body.
+    // Reject malformed or conflicting authentication instead of falling back to a second
+    // mechanism. OAuth clients must use only one client authentication method per request.
     let basic = parse_basic_auth(&headers);
+    if headers.contains_key(AUTHORIZATION)
+        && (basic.is_none() || headers.get_all(AUTHORIZATION).iter().count() != 1)
+    {
+        return OAuthError::InvalidClient.into_response();
+    }
+    if let Some((id, _)) = &basic
+        && (form.client_secret.is_some()
+            || form
+                .client_id
+                .as_deref()
+                .is_some_and(|body_id| body_id != id))
+    {
+        return OAuthError::InvalidRequest("conflicting client authentication").into_response();
+    }
     let client_id = basic
         .as_ref()
         .map(|(id, _)| id.clone())
@@ -550,44 +723,31 @@ pub async fn token(
         _ => return OAuthError::InvalidRequest("missing code_verifier").into_response(),
     };
 
-    let Some(consumed) = codes::consume(code_str, &mut conn).await.unwrap_or(None) else {
-        let _ = audit(AuditEventType::OidcTokenRejected)
-            .ctx(&audit_ctx)
-            .details(json!({ "client_id": client_id, "reason": "invalid_code" }))
-            .save(&mut conn)
-            .await;
-        return OAuthError::InvalidGrant("code invalid, consumed, or expired").into_response();
-    };
-
-    if consumed.application_id != app.id {
-        let _ = audit(AuditEventType::OidcTokenRejected)
-            .ctx(&audit_ctx)
-            .details(json!({ "client_id": client_id, "reason": "client_mismatch" }))
-            .save(&mut conn)
-            .await;
-        return OAuthError::InvalidGrant("code was issued to a different client").into_response();
-    }
-
-    if consumed.redirect_uri != redirect_uri {
-        let _ = audit(AuditEventType::OidcTokenRejected)
-            .user(consumed.user_id)
-            .ctx(&audit_ctx)
-            .details(json!({ "client_id": client_id, "reason": "redirect_uri_mismatch" }))
-            .save(&mut conn)
-            .await;
-        return OAuthError::InvalidGrant("redirect_uri mismatch").into_response();
-    }
-
-    if consumed.code_challenge_method != "S256"
-        || !codes::verify_pkce_s256(code_verifier, &consumed.code_challenge)
+    let consumed =
+        match codes::consume(code_str, app.id, redirect_uri, code_verifier, &mut conn).await {
+            Ok(Some(code)) => code,
+            Ok(None) => {
+                let _ = audit(AuditEventType::OidcTokenRejected)
+                    .ctx(&audit_ctx)
+                    .details(json!({ "client_id": client_id, "reason": "invalid_code" }))
+                    .save(&mut conn)
+                    .await;
+                return OAuthError::InvalidGrant("code or authorization binding invalid")
+                    .into_response();
+            }
+            Err(_) => return OAuthError::ServerError.into_response(),
+        };
+    if verify_user_session(
+        consumed.user_id,
+        consumed.auth_time,
+        consumed.session_version,
+        &mut conn,
+    )
+    .await
+    .is_err()
+        || !app.validate_redirect_uri(redirect_uri)
     {
-        let _ = audit(AuditEventType::OidcTokenRejected)
-            .user(consumed.user_id)
-            .ctx(&audit_ctx)
-            .details(json!({ "client_id": client_id, "reason": "pkce_failed" }))
-            .save(&mut conn)
-            .await;
-        return OAuthError::InvalidGrant("PKCE verification failed").into_response();
+        return OAuthError::InvalidGrant("authorization is no longer valid").into_response();
     }
 
     let user = match User::get(consumed.user_id, &mut conn).await {
@@ -605,6 +765,13 @@ pub async fn token(
         Ok(r) => r,
         Err(_) => return OAuthError::ServerError.into_response(),
     };
+    match app.check_access_resolved(&roles, &mut conn).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return OAuthError::InvalidGrant("application access was revoked").into_response();
+        }
+        Err(_) => return OAuthError::ServerError.into_response(),
+    }
 
     let scope = parse_scope(&consumed.scope);
     let token_response = match mint_token_pair(
@@ -617,6 +784,8 @@ pub async fn token(
         consumed.auth_time,
         &state.signing_key,
         &state.signing_kid,
+        consumed.session_version,
+        consumed.session_exp,
     ) {
         Ok(r) => r,
         Err(_) => return OAuthError::ServerError.into_response(),
@@ -682,6 +851,18 @@ pub async fn userinfo(
         Err(_) => return OAuthError::ServerError.into_response(),
     };
 
+    if verify_user_session(user_id, claims.iat, claims.session_version, &mut conn)
+        .await
+        .is_err()
+    {
+        return unauthorized_with_bearer_challenge();
+    }
+    let app = match Application::get_by_oidc_client_id(&claims.aud, &mut conn).await {
+        Ok(Some(app)) if app.enabled => app,
+        Ok(_) => return unauthorized_with_bearer_challenge(),
+        Err(_) => return OAuthError::ServerError.into_response(),
+    };
+
     let user = match User::get(user_id, &mut conn).await {
         Ok(Some(u)) if u.active => u,
         _ => return unauthorized_with_bearer_challenge(),
@@ -690,6 +871,11 @@ pub async fn userinfo(
         Ok(r) => r,
         Err(_) => return OAuthError::ServerError.into_response(),
     };
+    match app.check_access_resolved(&user_roles, &mut conn).await {
+        Ok(true) => {}
+        Ok(false) => return unauthorized_with_bearer_challenge(),
+        Err(_) => return OAuthError::ServerError.into_response(),
+    }
 
     let scope = parse_scope(&claims.scope);
     let mut body = json!({ "sub": user.id.to_string() });
@@ -714,14 +900,16 @@ pub async fn userinfo(
         .save(&mut conn)
         .await;
 
-    axum::Json(body).into_response()
+    ([(header::CACHE_CONTROL, "no-store")], axum::Json(body)).into_response()
 }
 
 fn unauthorized_with_bearer_challenge() -> Response {
     let mut resp = (StatusCode::UNAUTHORIZED, "").into_response();
     resp.headers_mut().insert(
         WWW_AUTHENTICATE,
-        "Bearer realm=\"oidc\", error=\"invalid_token\"".parse().unwrap(),
+        "Bearer realm=\"oidc\", error=\"invalid_token\""
+            .parse()
+            .unwrap(),
     );
     resp
 }
@@ -753,54 +941,189 @@ pub async fn end_session(
     headers: HeaderMap,
     Query(q): Query<EndSessionQuery>,
 ) -> Response {
+    end_session_impl(state, audit_ctx, headers, q, false, false).await
+}
+
+#[utoipa::path(
+    post,
+    path = "/oauth/end_session",
+    responses(
+        (status = 302, description = "Redirect after confirmed logout"),
+        (status = 200, description = "Signed out or confirmation required")
+    ),
+    tag = OIDC_TAG,
+)]
+pub async fn end_session_post(
+    State(state): State<AppState>,
+    audit_ctx: AuditContext,
+    headers: HeaderMap,
+    Form(q): Form<EndSessionQuery>,
+) -> Response {
+    // The OP's own confirmation form posts from the configured origin. A cross-site RP
+    // POST can still log out using a valid matching ID token hint below.
+    let expected_origin = url::Url::parse(&state.origin)
+        .map(|url| url.origin().ascii_serialization())
+        .ok();
+    let confirmed = headers
+        .get(header::ORIGIN)
+        .and_then(|h| h.to_str().ok())
+        .zip(expected_origin.as_deref())
+        .is_some_and(|(actual, expected)| actual == expected);
+    end_session_impl(state, audit_ctx, headers, q, confirmed, !confirmed).await
+}
+
+async fn end_session_impl(
+    state: AppState,
+    audit_ctx: AuditContext,
+    headers: HeaderMap,
+    q: EndSessionQuery,
+    confirmed: bool,
+    require_matching_session: bool,
+) -> Response {
+    let mut renewed = None;
+    let mut response = end_session_response(
+        state,
+        audit_ctx,
+        headers,
+        q,
+        confirmed,
+        require_matching_session,
+        &mut renewed,
+    )
+    .await;
+    if require_matching_session && response.status().is_client_error() {
+        return (
+            StatusCode::FORBIDDEN,
+            "A matching browser session and ID token hint are required",
+        )
+            .into_response();
+    }
+    if !response.headers().contains_key(SET_COOKIE)
+        && let Some(pair) = renewed
+    {
+        append_session_cookies(&mut response, &pair);
+    }
+    response
+}
+
+async fn end_session_response(
+    state: AppState,
+    audit_ctx: AuditContext,
+    headers: HeaderMap,
+    q: EndSessionQuery,
+    confirmed: bool,
+    require_matching_session: bool,
+    renewed: &mut Option<TokenPair>,
+) -> Response {
     let mut conn = match state.db_pool.acquire().await {
         Ok(c) => c,
         Err(_) => return OAuthError::ServerError.into_response(),
     };
 
-    // Resolve the client (optional but preferred when the RP provides id_token_hint).
-    let app = match q.client_id.as_deref() {
+    // An ID token hint identifies a client and user; it is not authority to revoke
+    // arbitrary users' sessions. Decode the ID token shape to reject access tokens.
+    let hint = if let Some(hint) = q.id_token_hint.as_deref() {
+        let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::EdDSA);
+        validation.set_required_spec_claims(&["sub", "iss", "aud", "iat", "exp"]);
+        validation.set_issuer(&[&state.origin]);
+        validation.validate_exp = false;
+        validation.validate_aud = false;
+        let decoding_key =
+            jsonwebtoken::DecodingKey::from_ed_der(&state.signing_key.verifying_key().to_bytes());
+        match jsonwebtoken::decode::<token::IdTokenClaims>(hint, &decoding_key, &validation) {
+            Ok(data) => Some(data.claims),
+            Err(_) => return OAuthError::InvalidRequest("invalid id_token_hint").into_response(),
+        }
+    } else {
+        None
+    };
+    if let (Some(client_id), Some(hint)) = (q.client_id.as_deref(), hint.as_ref())
+        && client_id != hint.aud
+    {
+        return OAuthError::InvalidRequest("client_id does not match id_token_hint")
+            .into_response();
+    }
+    let client_id = q
+        .client_id
+        .as_deref()
+        .or_else(|| hint.as_ref().map(|hint| hint.aud.as_str()));
+    let app = match client_id {
         Some(id) if !id.is_empty() => {
-            Application::get_by_oidc_client_id(id, &mut conn).await.unwrap_or(None)
+            match Application::get_by_oidc_client_id(id, &mut conn).await {
+                Ok(Some(app)) if app.enabled => Some(app),
+                Ok(_) => return OAuthError::InvalidClient.into_response(),
+                Err(_) => return OAuthError::ServerError.into_response(),
+            }
         }
         _ => None,
     };
 
-    // Best-effort user resolution from id_token_hint or current session cookie.
-    let mut sub_user_id: Option<Uuid> = None;
-    if let Some(hint) = q.id_token_hint.as_deref() {
-        // We intentionally tolerate expired hints here per OIDC RP-initiated logout §5 —
-        // the point is to sign the user out, and their id_token may well be stale.
-        let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::EdDSA);
-        validation.set_required_spec_claims(&["sub", "iss", "aud"]);
-        validation.set_issuer(&[&state.origin]);
-        validation.validate_exp = false;
-        validation.validate_aud = false;
-        let decoding_key = jsonwebtoken::DecodingKey::from_ed_der(
-            &state.signing_key.verifying_key().to_bytes(),
-        );
-        if let Ok(data) = jsonwebtoken::decode::<serde_json::Value>(hint, &decoding_key, &validation)
-            && let Some(sub) = data.claims.get("sub").and_then(|v| v.as_str())
-            && let Ok(u) = Uuid::parse_str(sub)
-        {
-            sub_user_id = Some(u);
+    let session = if require_matching_session {
+        // Cross-origin POSTs may omit SameSite cookies. Never let such a request clear
+        // the browser's real cookies, or rotate a refresh token before its hint is bound
+        // to the current browser. A refresh-only browser can use the GET confirmation.
+        if hint.is_none() {
+            return StatusCode::FORBIDDEN.into_response();
         }
-    }
-    if sub_user_id.is_none()
-        && let Some(tok) = extract_session_cookie(&headers)
-        && let Ok(claims) = verify_access_token(&tok, &state.signing_key, &mut conn).await
-        && let Ok(u) = Uuid::parse_str(&claims.sub)
-    {
-        sub_user_id = Some(u);
-    }
+        let Some(access) = extract_session_cookie(&headers) else {
+            return StatusCode::FORBIDDEN.into_response();
+        };
+        match verify_access_token(&access, &state.signing_key, &mut conn).await {
+            Ok(session) => Some(session),
+            Err(crate::errors::AppError::AuthenticationRequired) => {
+                return StatusCode::FORBIDDEN.into_response();
+            }
+            Err(_) => return OAuthError::ServerError.into_response(),
+        }
+    } else {
+        match resolve_browser_session(&state, &headers, &mut conn, renewed).await {
+            Ok(session) => session,
+            Err(_) => return OAuthError::ServerError.into_response(),
+        }
+    };
 
-    if let Some(uid) = sub_user_id {
-        let _ = revoke_all_user_tokens(uid, &mut conn).await;
+    if let Some(session) = session {
+        let uid = match Uuid::parse_str(&session.sub) {
+            Ok(uid) => uid,
+            Err(_) => return OAuthError::ServerError.into_response(),
+        };
+        let matching_hint = match hint.as_ref() {
+            Some(hint)
+                if hint.sub == session.sub
+                    && hint.auth_time == session.auth_time.unwrap_or(session.iat) =>
+            {
+                verify_user_session(uid, hint.iat, hint.session_version, &mut conn)
+                    .await
+                    .is_ok()
+            }
+            _ => false,
+        };
+        if require_matching_session && !matching_hint {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+        if !confirmed && !matching_hint {
+            return (
+                [
+                    (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                    (header::CACHE_CONTROL, "no-store"),
+                    (header::REFERRER_POLICY, "no-referrer"),
+                    (
+                        header::CONTENT_SECURITY_POLICY,
+                        "frame-ancestors 'none'; form-action 'self'",
+                    ),
+                ],
+                build_logout_confirmation_html(&q, client_id),
+            )
+                .into_response();
+        }
+        if revoke_all_user_tokens(uid, &mut conn).await.is_err() {
+            return OAuthError::ServerError.into_response();
+        }
         let _ = audit(AuditEventType::OidcLogout)
             .user(uid)
             .ctx(&audit_ctx)
             .details(json!({
-                "client_id": q.client_id.clone().unwrap_or_default(),
+                "client_id": client_id.unwrap_or_default(),
             }))
             .save(&mut conn)
             .await;
@@ -808,23 +1131,10 @@ pub async fn end_session(
 
     let clear = clear_auth_cookies();
     let mut resp_headers = HeaderMap::new();
-    // Also clear the OIDC session-free cookie path we use on /login (kept consistent with
-    // browser_logout).
+    resp_headers.insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+    resp_headers.insert(header::REFERRER_POLICY, "no-referrer".parse().unwrap());
     resp_headers.insert(SET_COOKIE, clear[0].parse().unwrap());
     resp_headers.append(SET_COOKIE, clear[1].parse().unwrap());
-    // Redundantly scope clears to /oauth to handle cookies written under that path.
-    resp_headers.append(
-        SET_COOKIE,
-        format!("{AUTH_COOKIE_NAME}=; HttpOnly; Secure; SameSite=Lax; Path=/oauth; Max-Age=0")
-            .parse()
-            .unwrap(),
-    );
-    resp_headers.append(
-        SET_COOKIE,
-        format!("{REFRESH_COOKIE_NAME}=; HttpOnly; Secure; SameSite=Strict; Path=/oauth; Max-Age=0")
-            .parse()
-            .unwrap(),
-    );
 
     // If the RP provided an allowed post_logout_redirect_uri, bounce there.
     if let Some(uri) = q.post_logout_redirect_uri.as_deref()
@@ -836,14 +1146,44 @@ pub async fn end_session(
             params.push(("state", s));
         }
         let location = append_query(uri, &params);
-        resp_headers.insert(LOCATION, location.parse().unwrap());
+        let Ok(location) = location.parse() else {
+            return OAuthError::InvalidRequest("invalid post_logout_redirect_uri").into_response();
+        };
+        resp_headers.insert(LOCATION, location);
         return (StatusCode::FOUND, resp_headers).into_response();
     }
 
     let html = build_signed_out_html(&state.origin, app.as_ref().map(|a| a.name.as_str()));
-    resp_headers.insert(header::CONTENT_TYPE, "text/html; charset=utf-8".parse().unwrap());
+    resp_headers.insert(
+        header::CONTENT_TYPE,
+        "text/html; charset=utf-8".parse().unwrap(),
+    );
     resp_headers.insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
     (StatusCode::OK, resp_headers, html).into_response()
+}
+
+fn build_logout_confirmation_html(q: &EndSessionQuery, client_id: Option<&str>) -> String {
+    let mut inputs = String::new();
+    // Deliberately omit a missing/mismatched hint. The user confirms their own current
+    // browser session; a hint for another user must never select the revocation target.
+    for (name, value) in [
+        ("client_id", client_id),
+        (
+            "post_logout_redirect_uri",
+            q.post_logout_redirect_uri.as_deref(),
+        ),
+        ("state", q.state.as_deref()),
+    ] {
+        if let Some(value) = value {
+            inputs.push_str(&format!(
+                r#"<input type="hidden" name="{name}" value="{}">"#,
+                html_escape(value)
+            ));
+        }
+    }
+    format!(
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Confirm sign out</title></head><body><main><h1>Sign out of Authere?</h1><p>This will sign you out of Authere on all devices.</p><form method="post" action="/oauth/end_session">{inputs}<button type="submit">Sign out</button></form><a href="/">Cancel</a></main></body></html>"#
+    )
 }
 
 fn html_escape(s: &str) -> String {
@@ -1010,7 +1350,10 @@ mod tests {
 
     #[test]
     fn append_query_with_no_existing_params() {
-        let r = append_query("https://app.example/cb", &[("code", "abc"), ("state", "xyz")]);
+        let r = append_query(
+            "https://app.example/cb",
+            &[("code", "abc"), ("state", "xyz")],
+        );
         assert_eq!(r, "https://app.example/cb?code=abc&state=xyz");
     }
 
@@ -1111,15 +1454,30 @@ mod tests {
     fn discovery_document_has_required_fields() {
         let d = build_discovery("https://authere.example");
         assert_eq!(d.issuer, "https://authere.example");
-        assert_eq!(d.authorization_endpoint, "https://authere.example/oauth/authorize");
+        assert_eq!(
+            d.authorization_endpoint,
+            "https://authere.example/oauth/authorize"
+        );
         assert_eq!(d.token_endpoint, "https://authere.example/oauth/token");
-        assert_eq!(d.userinfo_endpoint, "https://authere.example/oauth/userinfo");
-        assert_eq!(d.end_session_endpoint, "https://authere.example/oauth/end_session");
+        assert_eq!(
+            d.userinfo_endpoint,
+            "https://authere.example/oauth/userinfo"
+        );
+        assert_eq!(
+            d.end_session_endpoint,
+            "https://authere.example/oauth/end_session"
+        );
         assert_eq!(d.jwks_uri, "https://authere.example/.well-known/jwks.json");
         assert!(d.response_types_supported.contains(&"code".to_string()));
         assert!(d.scopes_supported.contains(&"openid".to_string()));
-        assert!(d.id_token_signing_alg_values_supported.contains(&"EdDSA".to_string()));
-        assert!(d.code_challenge_methods_supported.contains(&"S256".to_string()));
+        assert!(
+            d.id_token_signing_alg_values_supported
+                .contains(&"EdDSA".to_string())
+        );
+        assert!(
+            d.code_challenge_methods_supported
+                .contains(&"S256".to_string())
+        );
     }
 
     #[test]
@@ -1127,7 +1485,9 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert(
             "cookie",
-            "foo=1; authere_token=the-token; bar=2".parse().unwrap(),
+            "foo=1; __Host-authere_token=the-token; bar=2"
+                .parse()
+                .unwrap(),
         );
         assert_eq!(extract_session_cookie(&h).as_deref(), Some("the-token"));
     }
@@ -1178,4 +1538,3 @@ mod tests {
         assert!(!body.contains(r#"class="details""#));
     }
 }
-

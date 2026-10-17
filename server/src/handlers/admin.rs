@@ -198,6 +198,17 @@ pub fn records_to_csv(records: &[AuditLogRecord]) -> String {
 /// Quote a CSV field per RFC 4180: wrap in double quotes if it contains a comma,
 /// newline, CR, or double-quote, and double any embedded double-quotes.
 fn csv_field(value: &str) -> String {
+    // Audit text includes attacker-controlled usernames, headers, and details. CSV quoting
+    // does not stop spreadsheet applications from interpreting a cell as a formula.
+    let escaped_formula;
+    let value = if value.trim_start().starts_with(['=', '+', '-', '@'])
+        || value.starts_with(['\t', '\r', '\n'])
+    {
+        escaped_formula = format!("'{value}");
+        escaped_formula.as_str()
+    } else {
+        value
+    };
     if value
         .chars()
         .any(|c| c == ',' || c == '\n' || c == '\r' || c == '"')
@@ -311,7 +322,7 @@ pub async fn update_settings(
     admin: AdminUser,
     axum::extract::Json(input): axum::extract::Json<UpdateSettingsInput>,
 ) -> Result<axum::Json<SettingsResponse>, AppError> {
-    let mut conn = state.db_pool.acquire().await?;
+    let mut conn = state.db_pool.begin().await?;
 
     let mut changes = serde_json::json!({});
 
@@ -344,6 +355,7 @@ pub async fn update_settings(
     let open_registration = open_registration_enabled(&mut conn).await?;
     let session_expiry = session_expiry_seconds(&mut conn).await?;
     let ldap_cfg = load_ldap_config(&mut conn).await?;
+    conn.commit().await?;
     Ok(axum::Json(SettingsResponse {
         open_registration,
         session_expiry_seconds: session_expiry,
@@ -648,6 +660,15 @@ mod tests {
     fn csv_field_leaves_plain_values_unquoted() {
         assert_eq!(csv_field("plain"), "plain");
         assert_eq!(csv_field(""), "");
+    }
+
+    #[test]
+    fn csv_field_neutralizes_spreadsheet_formulas_in_untrusted_audit_text() {
+        for value in ["=1+1", "+123", "-123", "@SUM(1)", "  =1+1", "\t=1+1", "\r=1+1", "\n=1+1"] {
+            let encoded = csv_field(value);
+            assert!(encoded.starts_with('\'') || encoded.starts_with("\"'"), "{value:?}");
+        }
+        assert_eq!(csv_field("Mozilla/5.0"), "Mozilla/5.0");
     }
 
     #[test]

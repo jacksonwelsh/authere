@@ -48,29 +48,24 @@
   }
 
   function buildCaddySnippet(app: Application): string {
-    const origin = window.location.origin;
-    let upstreamHost = origin.replace(/^https?:\/\//, '');
-    let tlsLines = '';
-    try {
-      const u = new URL(origin);
-      upstreamHost = u.host;
-      if (u.protocol === 'https:') {
-        tlsLines = '\n        transport http {\n            tls\n        }';
-      }
-    } catch {}
-
+    // The browser knows the public issuer, not the internal auth listener.
+    // An explicit placeholder avoids an extra proxy hop rewriting auth metadata.
+    const upstreamHost = 'AUTHERE_INTERNAL_HOST:3000';
     const host = guessHostname(app.host_pattern) ?? 'your-app.example.com';
     const patternComment = `# host_pattern: ${app.host_pattern}`;
     const pathComment = app.path_prefix ? `\n    # path_prefix: ${app.path_prefix}` : '';
 
-    return `${patternComment}${pathComment}
+    return `# Use a direct Authere upstream; extra proxy hops must preserve X-Forwarded-Host.
+${patternComment}${pathComment}
 ${host} {
     route {
-        reverse_proxy /.authere/* ${upstreamHost}${tlsLines}
+        reverse_proxy /.authere/* ${upstreamHost} {
+            header_up X-Authere-Target-Host {http.request.host}
+        }
 
         forward_auth ${upstreamHost} {
             uri /api/auth/verify
-            copy_headers X-Auth-User X-Auth-Username X-Auth-Roles X-Auth-Email${tlsLines}
+            copy_headers X-Auth-User X-Auth-Username X-Auth-Roles X-Auth-Email
         }
         reverse_proxy YOUR_UPSTREAM:8080
     }

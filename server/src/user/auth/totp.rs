@@ -14,7 +14,7 @@ use hmac::{Hmac, Mac};
 use rand::{RngCore, rngs::OsRng};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
-use sqlx::SqliteConnection;
+use sqlx::{Connection, SqliteConnection};
 use uuid::Uuid;
 
 use crate::errors::AppError;
@@ -100,7 +100,7 @@ pub fn verify_code(
     last_used_step: Option<i64>,
 ) -> Option<i64> {
     let trimmed = code_str.trim();
-    if trimmed.len() != TOTP_DIGITS as usize {
+    if trimmed.len() != TOTP_DIGITS as usize || !trimmed.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     let code: u32 = trimmed.parse().ok()?;
@@ -250,16 +250,16 @@ impl UserTotp {
         }))
     }
 
-    /// Upsert a pending (unactivated) enrollment, replacing any prior pending OR active state
-    /// for this user. Callers should require re-authentication before overwriting an active
-    /// enrollment — this function itself does not gate that.
+    /// Replace a pending enrollment atomically. An active factor must first be explicitly
+    /// disabled; a stale read in the enrollment handler must never reset an active factor.
     pub async fn upsert_pending(
         user_id: Uuid,
         secret_encrypted: &str,
         conn: &mut SqliteConnection,
     ) -> Result<(), AppError> {
         let now = now_epoch();
-        sqlx::query!(
+        let mut tx = conn.begin().await?;
+        let result = sqlx::query!(
             r#"INSERT INTO user_totps
                    (user_id, secret_encrypted, last_used_step, activated_at, created_at, updated_at)
                VALUES (?, ?, NULL, NULL, ?, ?)
@@ -267,56 +267,68 @@ impl UserTotp {
                    secret_encrypted = excluded.secret_encrypted,
                    last_used_step = NULL,
                    activated_at = NULL,
-                   updated_at = excluded.updated_at"#,
+                   updated_at = excluded.updated_at
+               WHERE user_totps.activated_at IS NULL"#,
             user_id,
             secret_encrypted,
             now,
             now
         )
-        .execute(&mut *conn)
+        .execute(&mut *tx)
         .await?;
+        if result.rows_affected() != 1 {
+            return Err(AppError::UniqueError("TOTP is already enabled. Disable it first to re-enroll.".into()));
+        }
         // Wipe any stale recovery codes from a previous enrollment.
         sqlx::query!("DELETE FROM totp_recovery_codes WHERE user_id = ?", user_id)
-            .execute(conn)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(())
     }
 
     /// Mark this enrollment active and record the step that activated it.
     pub async fn activate(
         user_id: Uuid,
+        secret_encrypted: &str,
         step: i64,
         conn: &mut SqliteConnection,
-    ) -> Result<(), AppError> {
+    ) -> Result<bool, AppError> {
         let now = now_epoch();
-        sqlx::query!(
+        let result = sqlx::query!(
             r#"UPDATE user_totps SET activated_at = ?, last_used_step = ?, updated_at = ?
-               WHERE user_id = ? AND activated_at IS NULL"#,
+               WHERE user_id = ? AND secret_encrypted = ? AND activated_at IS NULL"#,
             now,
             step,
             now,
-            user_id
+            user_id,
+            secret_encrypted
         )
         .execute(conn)
         .await?;
-        Ok(())
+        Ok(result.rows_affected() == 1)
     }
 
     pub async fn record_step(
         user_id: Uuid,
+        secret_encrypted: &str,
         step: i64,
         conn: &mut SqliteConnection,
-    ) -> Result<(), AppError> {
+    ) -> Result<bool, AppError> {
         let now = now_epoch();
-        sqlx::query!(
-            "UPDATE user_totps SET last_used_step = ?, updated_at = ? WHERE user_id = ?",
+        let result = sqlx::query!(
+            "UPDATE user_totps SET last_used_step = ?, updated_at = ?
+             WHERE user_id = ? AND secret_encrypted = ? AND activated_at IS NOT NULL
+               AND (last_used_step IS NULL OR last_used_step < ?)",
             step,
             now,
-            user_id
+            user_id,
+            secret_encrypted,
+            step
         )
         .execute(conn)
         .await?;
-        Ok(())
+        Ok(result.rows_affected() == 1)
     }
 
     pub async fn delete(user_id: Uuid, conn: &mut SqliteConnection) -> Result<bool, AppError> {
@@ -492,6 +504,7 @@ mod tests {
         assert!(verify_code(secret, "12345", 60, None).is_none()); // wrong length
         assert!(verify_code(secret, "1234567", 60, None).is_none()); // wrong length
         assert!(verify_code(secret, "-12345", 60, None).is_none());
+        assert!(verify_code(secret, "+12345", 60, None).is_none());
     }
 
     #[test]
@@ -580,20 +593,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn enrollment_cannot_replace_an_active_factor_or_its_recovery_codes() {
+        let pool = in_memory_pool().await;
+        let mut conn = pool.acquire().await.unwrap();
+        let user_id = seed_user(&mut conn).await;
+        UserTotp::upsert_pending(user_id, "active-secret", &mut conn).await.unwrap();
+        assert!(UserTotp::activate(user_id, "active-secret", 7, &mut conn).await.unwrap());
+        store_recovery_codes(user_id, &["ABCDE-FGHIJ".into()], &mut conn).await.unwrap();
+
+        assert!(UserTotp::upsert_pending(user_id, "replacement", &mut conn).await.is_err());
+        let after = UserTotp::get(user_id, &mut conn).await.unwrap().unwrap();
+        assert!(after.is_activated());
+        assert_eq!(after.secret_encrypted, "active-secret");
+        assert!(consume_recovery_code(user_id, "ABCDE-FGHIJ", &mut conn).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn activation_requires_the_secret_that_was_verified() {
+        let pool = in_memory_pool().await;
+        let mut conn = pool.acquire().await.unwrap();
+        let user_id = seed_user(&mut conn).await;
+        UserTotp::upsert_pending(user_id, "first-secret", &mut conn).await.unwrap();
+        UserTotp::upsert_pending(user_id, "second-secret", &mut conn).await.unwrap();
+
+        assert!(!UserTotp::activate(user_id, "first-secret", 7, &mut conn).await.unwrap());
+        assert!(!UserTotp::get(user_id, &mut conn).await.unwrap().unwrap().is_activated());
+        assert!(UserTotp::activate(user_id, "second-secret", 7, &mut conn).await.unwrap());
+        assert!(!UserTotp::activate(user_id, "second-secret", 8, &mut conn).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn step_claim_is_atomic_and_bound_to_the_active_secret() {
+        let pool = in_memory_pool().await;
+        let mut conn = pool.acquire().await.unwrap();
+        let user_id = seed_user(&mut conn).await;
+        UserTotp::upsert_pending(user_id, "secret", &mut conn).await.unwrap();
+        assert!(!UserTotp::record_step(user_id, "secret", 8, &mut conn).await.unwrap());
+        UserTotp::activate(user_id, "secret", 7, &mut conn).await.unwrap();
+
+        assert!(!UserTotp::record_step(user_id, "stale-secret", 8, &mut conn).await.unwrap());
+        assert!(UserTotp::record_step(user_id, "secret", 8, &mut conn).await.unwrap());
+        // Two requests that verified against the same earlier snapshot cannot both claim it.
+        assert!(!UserTotp::record_step(user_id, "secret", 8, &mut conn).await.unwrap());
+        assert!(!UserTotp::record_step(user_id, "secret", 7, &mut conn).await.unwrap());
+    }
+
+    #[tokio::test]
     async fn activate_requires_pending_state() {
         let pool = in_memory_pool().await;
         let mut conn = pool.acquire().await.unwrap();
         let user_id = seed_user(&mut conn).await;
 
         UserTotp::upsert_pending(user_id, "fake-ct", &mut conn).await.unwrap();
-        UserTotp::activate(user_id, 7, &mut conn).await.unwrap();
+        UserTotp::activate(user_id, "fake-ct", 7, &mut conn).await.unwrap();
 
         let after = UserTotp::get(user_id, &mut conn).await.unwrap().unwrap();
         assert!(after.is_activated());
         assert_eq!(after.last_used_step, Some(7));
 
         // Re-activating is a no-op on already-activated rows.
-        UserTotp::activate(user_id, 100, &mut conn).await.unwrap();
+        UserTotp::activate(user_id, "fake-ct", 100, &mut conn).await.unwrap();
         let again = UserTotp::get(user_id, &mut conn).await.unwrap().unwrap();
         assert_eq!(again.last_used_step, Some(7));
     }
@@ -607,7 +666,7 @@ mod tests {
         assert!(!UserTotp::is_activated_for(user_id, &mut conn).await.unwrap());
         UserTotp::upsert_pending(user_id, "ct", &mut conn).await.unwrap();
         assert!(!UserTotp::is_activated_for(user_id, &mut conn).await.unwrap());
-        UserTotp::activate(user_id, 1, &mut conn).await.unwrap();
+        UserTotp::activate(user_id, "ct", 1, &mut conn).await.unwrap();
         assert!(UserTotp::is_activated_for(user_id, &mut conn).await.unwrap());
     }
 
@@ -636,7 +695,7 @@ mod tests {
         let user_id = seed_user(&mut conn).await;
 
         UserTotp::upsert_pending(user_id, "ct", &mut conn).await.unwrap();
-        UserTotp::activate(user_id, 1, &mut conn).await.unwrap();
+        UserTotp::activate(user_id, "ct", 1, &mut conn).await.unwrap();
         store_recovery_codes(user_id, &["ABCDE-FGHIJ".into()], &mut conn).await.unwrap();
 
         assert!(UserTotp::delete(user_id, &mut conn).await.unwrap());

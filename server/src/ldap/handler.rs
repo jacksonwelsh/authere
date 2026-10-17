@@ -16,6 +16,7 @@ use uuid::Uuid;
 use crate::AppState;
 use crate::audit::{log_ldap_bind_failed, log_ldap_bind_rejected_mfa_required, log_ldap_bind_success};
 use crate::app_passwords::AppPassword;
+use crate::db::DbEntity;
 use crate::role::{Role, UserRole};
 use crate::settings::{LdapConfig, LdapPasswordMode};
 use crate::user::User;
@@ -50,6 +51,12 @@ pub async fn handle_bind(
     // Anonymous bind — allowed, for Root DSE lookup only.
     if req.dn.is_empty() && req.pw.is_empty() {
         return (req.gen_success(), BindState::Anonymous);
+    }
+
+    // LDAP allows repeated binds on the same socket. Charge every credential attempt,
+    // rather than just the connection, so keeping a socket open cannot bypass the limit.
+    if state.ldap_bind_rate_limiter.check(peer_ip).await.is_err() {
+        return (req.gen_invalid_cred(), BindState::Anonymous);
     }
 
     let Ok(dn) = parse_dn(&req.dn) else {
@@ -373,6 +380,9 @@ pub async fn handle_search(
     state: &AppState,
     bind_state: &BindState,
 ) -> Vec<LdapMsg> {
+    if !cfg.enabled {
+        return vec![done(req, LdapResultCode::UnwillingToPerform, "LDAP disabled")];
+    }
     // Require a bind for anything but the Root DSE (empty base).
     if matches!(bind_state, BindState::Anonymous) && !req.base.is_empty() {
         return vec![done(req, LdapResultCode::InsufficentAccessRights, "bind required")];
@@ -431,6 +441,14 @@ pub async fn handle_search(
             return vec![done(req, LdapResultCode::OperationsError, "internal error")];
         }
     };
+
+    if let BindState::User(user_id) = bind_state {
+        match User::get(*user_id, &mut conn).await {
+            Ok(Some(user)) if user.active => {}
+            Ok(_) => return vec![done(req, LdapResultCode::InsufficentAccessRights, "bind required")],
+            Err(_) => return vec![done(req, LdapResultCode::OperationsError, "internal error")],
+        }
+    }
 
     let mut entries: Vec<Entry> = Vec::new();
 

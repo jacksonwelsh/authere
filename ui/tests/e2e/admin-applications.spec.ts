@@ -37,5 +37,7 @@ test.describe('admin applications', () => {
     await expect(snippet).toContainText('forward_auth');
     await expect(snippet).toContainText('/api/auth/verify');
     await expect(snippet).toContainText('config.example.com');
+    await expect(snippet).toContainText('AUTHERE_INTERNAL_HOST:3000');
+    await expect(snippet).toContainText('header_up X-Authere-Target-Host {http.request.host}');
   });
 });

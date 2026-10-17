@@ -10,6 +10,7 @@ use argon2::{
 use sqlx::{FromRow, Row, SqliteConnection, sqlite::SqliteRow};
 use uuid::Uuid;
 
+pub mod forward;
 pub mod token;
 pub mod totp;
 

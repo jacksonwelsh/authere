@@ -284,7 +284,7 @@
             {#each SESSION_EXPIRY_PRESETS as opt}
               <option value={opt.value}>{opt.label}</option>
             {/each}
-            {#if !SESSION_EXPIRY_PRESETS.some((p) => p.value === settings.session_expiry_seconds)}
+            {#if !SESSION_EXPIRY_PRESETS.some((p) => p.value === settings?.session_expiry_seconds)}
               <option value={settings.session_expiry_seconds}>
                 Custom ({formatSessionExpiry(settings.session_expiry_seconds)})
               </option>

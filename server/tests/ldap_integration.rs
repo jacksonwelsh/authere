@@ -182,6 +182,10 @@ async fn seed(pool: &SqlitePool, mode: LdapPasswordMode) -> (Uuid, Uuid, String)
 }
 
 async fn start_server(mode: LdapPasswordMode) -> Fixture {
+    start_server_with_bind_limit(mode, 1000).await
+}
+
+async fn start_server_with_bind_limit(mode: LdapPasswordMode, max_requests: u32) -> Fixture {
     let pool = new_pool().await;
     let (alice_id, bob_id, bob_app_password) = seed(&pool, mode).await;
 
@@ -189,7 +193,7 @@ async fn start_server(mode: LdapPasswordMode) -> Fixture {
     let signing_key = Arc::new(SigningKey::generate(&mut rand::rngs::OsRng));
 
     let ldap_bind_rate_limiter = RateLimiter::new(RateLimitConfig {
-        max_requests: 1000,
+        max_requests,
         window: Duration::from_secs(60),
     });
     let state = AppState {
@@ -294,6 +298,62 @@ async fn bad_service_password_rejected() {
     let mut ldap = connect(fx.addr).await;
     let res = ldap.simple_bind(&service_dn(), "wrong").await.unwrap();
     assert_ne!(res.rc, 0, "wrong password must not succeed");
+}
+
+#[tokio::test]
+async fn repeated_binds_and_reconnects_share_the_ip_rate_limit() {
+    let fx = start_server_with_bind_limit(LdapPasswordMode::PrimaryAndApp, 2).await;
+    let mut ldap = connect(fx.addr).await;
+    assert_ne!(ldap.simple_bind(&service_dn(), "wrong").await.unwrap().rc, 0);
+    assert_ne!(ldap.simple_bind(&service_dn(), "wrong").await.unwrap().rc, 0);
+    assert_ne!(ldap.simple_bind(&service_dn(), SERVICE_PASSWORD).await.unwrap().rc, 0,
+        "an already-open socket must not bypass the bind limit");
+
+    let mut another = connect(fx.addr).await;
+    assert_ne!(another.simple_bind(&service_dn(), SERVICE_PASSWORD).await.unwrap().rc, 0,
+        "opening a new connection must not reset the limit");
+}
+
+#[tokio::test]
+async fn password_rotation_revokes_bound_directory_access_and_rejects_old_password() {
+    let fx = start_server(LdapPasswordMode::PrimaryAndApp).await;
+    let mut ldap = connect(fx.addr).await;
+    assert_eq!(ldap.simple_bind(&service_dn(), SERVICE_PASSWORD).await.unwrap().rc, 0);
+
+    let new_password = "rotated-service-password";
+    let mut conn = fx.state.db_pool.acquire().await.unwrap();
+    set_setting(KEY_LDAP_SERVICE_PASSWORD_HASH, &hash(new_password), &mut conn).await.unwrap();
+    drop(conn);
+
+    let search = ldap.search(BASE_DN, Scope::Subtree, "(objectClass=*)", vec!["uid"]).await.unwrap().1;
+    assert_eq!(search.rc, 50, "rotation must invalidate the previous bind state");
+    assert_ne!(ldap.simple_bind(&service_dn(), SERVICE_PASSWORD).await.unwrap().rc, 0);
+    assert_eq!(ldap.simple_bind(&service_dn(), new_password).await.unwrap().rc, 0);
+}
+
+#[tokio::test]
+async fn disabled_ldap_closes_existing_connections() {
+    let fx = start_server(LdapPasswordMode::PrimaryAndApp).await;
+    let mut ldap = connect(fx.addr).await;
+    assert_eq!(ldap.simple_bind(&service_dn(), SERVICE_PASSWORD).await.unwrap().rc, 0);
+    let mut conn = fx.state.db_pool.acquire().await.unwrap();
+    set_setting(KEY_LDAP_ENABLED, "false", &mut conn).await.unwrap();
+    drop(conn);
+
+    let result = tokio::time::timeout(Duration::from_secs(2), ldap.simple_bind(&service_dn(), SERVICE_PASSWORD)).await;
+    assert!(matches!(result, Ok(Err(_))), "disabled LDAP must not keep authenticating on an old socket");
+}
+
+#[tokio::test]
+async fn deactivation_revokes_search_on_an_existing_user_bind() {
+    let fx = start_server(LdapPasswordMode::PrimaryAndApp).await;
+    let mut ldap = connect(fx.addr).await;
+    assert_eq!(ldap.simple_bind(&user_dn("alice"), ALICE_PASSWORD).await.unwrap().rc, 0);
+
+    sqlx::query("UPDATE users SET active = 0 WHERE id = ?")
+        .bind(fx.alice_id).execute(&fx.state.db_pool).await.unwrap();
+    let search = ldap.search(BASE_DN, Scope::Subtree, "(objectClass=*)", vec!["uid"]).await.unwrap().1;
+    assert_eq!(search.rc, 50);
 }
 
 #[tokio::test]

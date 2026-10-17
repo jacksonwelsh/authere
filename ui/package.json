@@ -24,14 +24,14 @@
     "@testing-library/user-event": "^14.6.1",
     "@tsconfig/svelte": "^5.0.8",
     "@types/node": "^24.12.2",
-    "@vitest/ui": "^4.1.5",
+    "@vitest/ui": "^4.1.12",
     "happy-dom": "^20.9.0",
     "msw": "^2.13.4",
     "svelte": "^5.55.1",
     "svelte-check": "^4.4.6",
     "typescript": "~6.0.2",
     "vite": "^8.0.4",
-    "vitest": "^4.1.5"
+    "vitest": "^4.1.12"
   },
   "dependencies": {
     "@fontsource/ibm-plex-mono": "^5.2.7",

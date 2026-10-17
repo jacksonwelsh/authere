@@ -145,8 +145,8 @@ pub async fn activate_my_totp(
     auth: AuthUser,
     extract::Json(input): extract::Json<ActivateInput>,
 ) -> Result<axum::Json<ActivateResponse>, AppError> {
-    let mut conn = state.db_pool.acquire().await?;
-    let pending = UserTotp::get(auth.user_id, &mut conn)
+    let mut tx = state.db_pool.begin().await?;
+    let pending = UserTotp::get(auth.user_id, &mut tx)
         .await?
         .filter(|t| !t.is_activated())
         .ok_or_else(|| AppError::InputError(vec!["No pending TOTP enrollment".into()]))?;
@@ -156,10 +156,14 @@ pub async fn activate_my_totp(
     let step = totp::verify_code(&secret, &input.code, now, None)
         .ok_or(AppError::AuthenticationRequired)?;
 
-    UserTotp::activate(auth.user_id, step, &mut conn).await?;
+    if !UserTotp::activate(auth.user_id, &pending.secret_encrypted, step, &mut tx).await? {
+        return Err(AppError::AuthenticationRequired);
+    }
     let recovery_codes = totp::generate_recovery_codes();
-    totp::store_recovery_codes(auth.user_id, &recovery_codes, &mut conn).await?;
+    totp::store_recovery_codes(auth.user_id, &recovery_codes, &mut tx).await?;
+    tx.commit().await?;
 
+    let mut conn = state.db_pool.acquire().await?;
     audit_mfa(AuditEventType::MfaEnabled, auth.user_id, None, &audit_ctx, &mut conn).await;
     info!(user_id = %auth.user_id, "totp activated");
 

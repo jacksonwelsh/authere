@@ -106,6 +106,7 @@ export async function startWorkerServer(workerIndex: number): Promise<WorkerServ
     AUTHERE_KEY_SECRET: TEST_KEY_SECRET,
     AUTHERE_BIND_ADDR: `127.0.0.1:${port}`,
     AUTHERE_ALLOWED_ORIGINS: baseURL,
+    AUTHERE_ORIGIN: baseURL,
     // Relax rate limits for tests. Real rate-limit behavior is exercised via
     // the unit test (Login.test.ts: 429 branch) — there's no value in asking
     // the E2E harness to verify the counter math, since that would force every
