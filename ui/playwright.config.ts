@@ -29,9 +29,14 @@ export default defineConfig({
   },
 
   projects: [
+    ...(['chromium', 'firefox', 'webkit'] as const).map(browserName => ({
+      name: `passkeys-${browserName}`,
+      testMatch: /passkeys.*\.spec\.ts/,
+      use: { browserName },
+    })),
     {
       name: 'chromium',
-      testIgnore: /mobile-.*\.spec\.ts/,
+      testIgnore: /(?:mobile-|passkeys).*\.spec\.ts/,
       use: { ...devices['Desktop Chrome'] },
     },
     {

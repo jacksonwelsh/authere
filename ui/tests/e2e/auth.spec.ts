@@ -6,7 +6,7 @@ test.describe('login form', () => {
     await page.goto(`${appURL}/login`);
     await page.getByLabel('Username').fill('e2e_admin');
     await page.getByLabel('Password').fill('E2E-Admin-Password-1');
-    await page.getByRole('button', { name: /sign in/i }).click();
+    await page.getByRole('button', { name: /^sign in$/i }).click();
     await expect(page).toHaveURL(/\/admin/);
     await expect(page.getByRole('heading', { name: /users/i })).toBeVisible();
   });
@@ -15,7 +15,7 @@ test.describe('login form', () => {
     await page.goto(`${appURL}/login`);
     await page.getByLabel('Username').fill('e2e_admin');
     await page.getByLabel('Password').fill('wrong-password-123');
-    await page.getByRole('button', { name: /sign in/i }).click();
+    await page.getByRole('button', { name: /^sign in$/i }).click();
     await expect(page.getByRole('alert')).toContainText(/username or password is incorrect/i);
     // Still on /login
     await expect(page).toHaveURL(/\/login/);
@@ -25,7 +25,7 @@ test.describe('login form', () => {
     await page.goto(`${appURL}/login?redirect_uri=/admin/invitations`);
     await page.getByLabel('Username').fill('e2e_admin');
     await page.getByLabel('Password').fill('E2E-Admin-Password-1');
-    await page.getByRole('button', { name: /sign in/i }).click();
+    await page.getByRole('button', { name: /^sign in$/i }).click();
     await expect(page).toHaveURL(/\/admin\/invitations/);
   });
 });
@@ -61,7 +61,7 @@ test.describe('non-admin user redirects', () => {
     await page.goto(`${appURL}/login`);
     await page.getByLabel('Username').fill('regular_bob');
     await page.getByLabel('Password').fill('Bob-Password-1234');
-    await page.getByRole('button', { name: /sign in/i }).click();
+    await page.getByRole('button', { name: /^sign in$/i }).click();
 
     // Non-admin lands on /account, not /admin.
     await expect(page).toHaveURL(/\/account/);

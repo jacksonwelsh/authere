@@ -233,7 +233,7 @@ async fn run() -> Result<bool, AppError> {
     }
 
     use authere_server::handlers::{
-        admin, app_passwords, application, auth, oauth, registration, role, totp, user,
+        admin, app_passwords, application, auth, oauth, passkeys, registration, role, totp, user,
     };
 
     let shutdown_handle = state.shutdown.clone();
@@ -269,6 +269,12 @@ async fn run() -> Result<bool, AppError> {
         .routes(routes!(auth::lookup_forward_app))
         // Browser-friendly auth
         .routes(routes!(auth::browser_login))
+        .routes(routes!(passkeys::list))
+        .routes(routes!(passkeys::register_start))
+        .routes(routes!(passkeys::register_finish))
+        .routes(routes!(passkeys::login_start))
+        .routes(routes!(passkeys::login_finish))
+        .routes(routes!(passkeys::delete))
         .routes(routes!(auth::browser_logout))
         .routes(routes!(auth::browser_refresh))
         // User self-service

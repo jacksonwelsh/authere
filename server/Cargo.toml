@@ -41,9 +41,13 @@ ldap3_proto = "0.5"
 tokio-util = { version = "0.7", features = ["codec"] }
 futures-util = "0.3"
 base64 = "0.22"
+# State serialization is used only for single-use server-side SQLite challenges.
+webauthn-rs = { version = "0.5.5", features = ["conditional-ui", "danger-allow-state-serialisation"] }
 
 [dev-dependencies]
 ldap3 = { version = "0.11", default-features = false }
+openssl = "0.10"
+serde_cbor_2 = "0.13"
 
 [lints.rust]
 async_fn_in_trait = "allow"

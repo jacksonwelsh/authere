@@ -16,7 +16,7 @@ test('credentials — app password create + reveal-once', async ({
   await page.goto(`${appURL}/login`);
   await page.getByLabel('Username').fill('app_pw_user');
   await page.getByLabel('Password').fill('Initial-Password-1!');
-  await page.getByRole('button', { name: /sign in/i }).click();
+  await page.getByRole('button', { name: /^sign in$/i }).click();
   // Wait for the post-login redirect to complete before navigating again —
   // otherwise the /credentials visit can overtake the login response and
   // bounce back to /login (which looks like a real auth failure).

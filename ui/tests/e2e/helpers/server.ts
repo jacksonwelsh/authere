@@ -90,7 +90,7 @@ function runBinToCompletion(
   });
 }
 
-export async function startWorkerServer(workerIndex: number): Promise<WorkerServer> {
+export async function startWorkerServer(workerIndex: number, hostname = '127.0.0.1'): Promise<WorkerServer> {
   const port = 3100 + workerIndex;
   const dir = workerDir(workerIndex);
   rmSync(dir, { recursive: true, force: true });
@@ -98,7 +98,7 @@ export async function startWorkerServer(workerIndex: number): Promise<WorkerServ
 
   const dbPath = join(dir, 'data.db');
   const databaseUrl = `sqlite:${dbPath}?mode=rwc`;
-  const baseURL = `http://127.0.0.1:${port}`;
+  const baseURL = `http://${hostname}:${port}`;
 
   const env: NodeJS.ProcessEnv = {
     ...process.env,

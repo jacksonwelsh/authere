@@ -335,6 +335,14 @@ pub async fn browser_login(
         .save(&mut conn)
         .await;
 
+    browser_login_response(&token_pair, query).map_err(Into::into)
+}
+
+/// Shared cookie and safe-redirect behavior for password and passkey sessions.
+pub(crate) fn browser_login_response(
+    token_pair: &TokenPair,
+    query: BrowserLoginQuery,
+) -> Result<Response, AppError> {
     let access_cookie = build_auth_cookie(&token_pair.access_token, token_pair.expires_in);
     let refresh_cookie =
         build_refresh_cookie(&token_pair.refresh_token, token_pair.refresh_expires_in);

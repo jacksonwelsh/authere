@@ -90,6 +90,7 @@ async function tryRefresh(): Promise<boolean> {
 function isAuthPath(path: string): boolean {
   return (
     path.startsWith('/api/auth/login') ||
+    path.startsWith('/api/auth/passkeys/') ||
     path.startsWith('/api/auth/browser-refresh') ||
     path.startsWith('/api/auth/browser-logout') ||
     path.startsWith('/api/login')
@@ -394,3 +395,14 @@ export const restartService = () =>
   request<void>('/api/admin/restart', { method: 'POST' });
 
 export { ApiError };
+
+export interface Passkey {
+  id: string;
+  name: string;
+  created_at: number;
+  last_used_at: number | null;
+}
+
+export const listMyPasskeys = () => request<Passkey[]>('/api/me/passkeys');
+export const deleteMyPasskey = (id: string) =>
+  request<void>(`/api/me/passkeys/${id}`, { method: 'DELETE' });

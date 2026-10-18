@@ -16,7 +16,7 @@ export const test = base.extend<TestFixtures, WorkerFixtures>({
   // One Rust server per Playwright worker; unique port + SQLite file.
   server: [
     async ({}, use, workerInfo) => {
-      const server = await startWorkerServer(workerInfo.parallelIndex);
+      const server = await startWorkerServer(workerInfo.parallelIndex, workerInfo.project.name.startsWith('passkeys-') ? 'localhost' : '127.0.0.1');
       try {
         await use(server);
       } finally {

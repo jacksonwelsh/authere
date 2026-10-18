@@ -66,7 +66,7 @@ test('forward login isolates upstream credentials and preserves the requested qu
     await expect(page.getByText('Sign in to continue to Browser Protected App.')).toBeVisible();
     await page.getByLabel('Username').fill(ADMIN_USERNAME);
     await page.getByLabel('Password').fill(ADMIN_PASSWORD);
-    await page.getByRole('button', { name: /sign in/i }).click();
+    await page.getByRole('button', { name: /^sign in$/i }).click();
     await expect(page).toHaveURL(`${protectedOrigin}/dashboard?view=recent`);
     const body = JSON.parse(await page.locator('body').innerText());
     expect(body.path).toBe('/dashboard?view=recent');

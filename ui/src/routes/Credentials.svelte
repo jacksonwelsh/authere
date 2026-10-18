@@ -20,6 +20,7 @@
   import Button from '../lib/components/Button.svelte';
   import Input from '../lib/components/Input.svelte';
   import Modal from '../lib/components/Modal.svelte';
+  import Passkeys from '../lib/components/Passkeys.svelte';
   import { toasts } from '../lib/toast.svelte';
 
   let currentPassword = $state('');
@@ -151,7 +152,7 @@
       totpStatus = { enabled: false, pending: false };
       totpDisablePassword = '';
       showDisableTotp = false;
-      toasts.success('Two-factor authentication disabled.');
+      toasts.success('Authenticator codes disabled for password sign-in.');
     } catch (err: any) {
       if (err instanceof ApiError && err.status === 401) {
         totpError = 'Password is incorrect.';
@@ -236,6 +237,8 @@
     </div>
   </header>
 
+  <Passkeys />
+
   <!-- Password credential card -->
   <div class="credential-card">
     <div class="credential-header">
@@ -288,10 +291,10 @@
         <h2 class="au-h4">Two-factor authentication</h2>
         <p class="au-small au-fg-3">
           {#if totpStatus?.enabled}
-            An authenticator app is required for every sign-in.
+            An authenticator code is required when signing in with your password. Passkey sign-in does not need a code.
           {:else}
             Add an authenticator app (e.g. 1Password, Authy, Google Authenticator) for a second
-            factor on sign-in. Optional.
+            factor when signing in with your password. Passkeys already satisfy two-factor authentication.
           {/if}
         </p>
       </div>
@@ -451,9 +454,9 @@
 {/if}
 
 {#if showDisableTotp}
-  <Modal title="Disable two-factor authentication" onclose={() => { showDisableTotp = false; totpError = ''; totpDisablePassword = ''; }}>
+  <Modal title="Disable authenticator codes" onclose={() => { showDisableTotp = false; totpError = ''; totpDisablePassword = ''; }}>
     <p class="au-small">
-      Confirm your password to turn off 2FA. You can always re-enable it later.
+      Confirm your password to stop requiring authenticator codes for password sign-in. Passkey verification stays enabled.
     </p>
     <div class="create-field">
       <Input
@@ -476,7 +479,7 @@
         loading={totpBusy}
         disabled={!totpDisablePassword || totpBusy}
       >
-        Disable 2FA
+        Disable codes
       </Button>
     {/snippet}
   </Modal>

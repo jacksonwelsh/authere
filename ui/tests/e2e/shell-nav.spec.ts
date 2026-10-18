@@ -28,7 +28,7 @@ test.describe('shell navigation', () => {
     await page.goto(`${appURL}/login`);
     await page.getByLabel('Username').fill('nav_user');
     await page.getByLabel('Password').fill('Nav-Password-1234!');
-    await page.getByRole('button', { name: /sign in/i }).click();
+    await page.getByRole('button', { name: /^sign in$/i }).click();
     await expect(page).toHaveURL(/\/account/);
 
     const nav = page.getByRole('navigation');

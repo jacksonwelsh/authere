@@ -20,7 +20,7 @@ describe('Login', () => {
 
   it('disables the submit button until username and password are present', async () => {
     render(Login);
-    const submit = screen.getByRole('button', { name: /sign in/i });
+    const submit = screen.getByRole('button', { name: /^sign in$/i });
     expect(submit).toBeDisabled();
 
     await userEvent.type(screen.getByLabelText('Username'), 'alice');
@@ -36,7 +36,7 @@ describe('Login', () => {
     );
     render(Login);
     await fillCredentials();
-    await userEvent.click(screen.getByRole('button', { name: /sign in/i }));
+    await userEvent.click(screen.getByRole('button', { name: /^sign in$/i }));
 
     const alert = await screen.findByRole('alert');
     expect(alert).toHaveTextContent(/username or password is incorrect/i);
@@ -48,7 +48,7 @@ describe('Login', () => {
     );
     render(Login);
     await fillCredentials();
-    await userEvent.click(screen.getByRole('button', { name: /sign in/i }));
+    await userEvent.click(screen.getByRole('button', { name: /^sign in$/i }));
 
     const alert = await screen.findByRole('alert');
     expect(alert).toHaveTextContent(/too many attempts/i);
@@ -60,7 +60,7 @@ describe('Login', () => {
     );
     render(Login);
     await fillCredentials();
-    await userEvent.click(screen.getByRole('button', { name: /sign in/i }));
+    await userEvent.click(screen.getByRole('button', { name: /^sign in$/i }));
 
     const alert = await screen.findByRole('alert');
     expect(alert).toHaveTextContent(/sign-in failed \(500\)/i);
@@ -72,7 +72,7 @@ describe('Login', () => {
     );
     render(Login);
     await fillCredentials();
-    const submit = screen.getByRole('button', { name: /sign in/i });
+    const submit = screen.getByRole('button', { name: /^sign in$/i });
     await userEvent.click(submit);
     await waitFor(() => expect(submit).toBeEnabled());
   });
@@ -85,7 +85,7 @@ describe('Login', () => {
     );
     render(Login);
     await fillCredentials();
-    await userEvent.click(screen.getByRole('button', { name: /sign in/i }));
+    await userEvent.click(screen.getByRole('button', { name: /^sign in$/i }));
 
     // The UI should switch to a code-entry step and a new Verify button.
     await screen.findByLabelText(/authentication code/i);
@@ -109,7 +109,7 @@ describe('Login', () => {
     );
     render(Login);
     await fillCredentials();
-    await userEvent.click(screen.getByRole('button', { name: /sign in/i }));
+    await userEvent.click(screen.getByRole('button', { name: /^sign in$/i }));
 
     const codeInput = await screen.findByLabelText(/authentication code/i);
     await userEvent.type(codeInput, '123456');

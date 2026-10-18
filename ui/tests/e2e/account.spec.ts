@@ -16,7 +16,7 @@ test('account — updates profile and reflects the change', async ({
   await page.goto(`${appURL}/login`);
   await page.getByLabel('Username').fill('acct_user');
   await page.getByLabel('Password').fill('Acct-Password-1234!');
-  await page.getByRole('button', { name: /sign in/i }).click();
+  await page.getByRole('button', { name: /^sign in$/i }).click();
   await expect(page).toHaveURL(/\/account/);
 
   const nameField = page.getByLabel('Full name');

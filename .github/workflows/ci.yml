@@ -58,6 +58,28 @@ jobs:
         working-directory: server
         run: cargo test --verbose
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Install and check UI
+        working-directory: ui
+        run: |
+          npm ci
+          npm run check
+          npm test
+
+      - name: Install browser test engines
+        working-directory: ui
+        run: npx playwright install --with-deps chromium firefox webkit
+
+      - name: Test passkeys across browser engines
+        working-directory: ui
+        run: npm run test:e2e -- passkeys.spec.ts
+
       - name: Run deploy script tests
         run: bash deploy/test_deploy.sh
 

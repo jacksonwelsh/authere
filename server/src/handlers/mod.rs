@@ -3,6 +3,7 @@ pub mod app_passwords;
 pub mod application;
 pub mod auth;
 pub mod oauth;
+pub mod passkeys;
 pub mod registration;
 pub mod role;
 pub mod totp;

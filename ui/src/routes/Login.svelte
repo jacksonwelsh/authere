@@ -3,6 +3,10 @@
   import { sanitizeLoginRedirect } from '../lib/redirect';
   import Button from '../lib/components/Button.svelte';
   import Input from '../lib/components/Input.svelte';
+  import { supportsPasskeys, signInWithPasskey, passkeyError } from '../lib/passkeys';
+
+  const passkeysSupported = supportsPasskeys();
+  let passkeyLoading = $state(false);
 
   let username = $state('');
   let password = $state('');
@@ -39,6 +43,22 @@
       return typeof parsed.error === 'string' ? parsed.error : null;
     } catch {
       return null;
+    }
+  }
+
+  async function handlePasskey() {
+    if (loading) return;
+    error = '';
+    loading = true;
+    passkeyLoading = true;
+    try {
+      await signInWithPasskey();
+      window.location.href = redirectUri;
+    } catch (err) {
+      error = passkeyError(err);
+    } finally {
+      loading = false;
+      passkeyLoading = false;
     }
   }
 
@@ -100,6 +120,15 @@
       </p>
     </header>
 
+    {#if passkeysSupported}
+      <div class="passkey-signin">
+        <Button variant="primary" size="lg" onclick={handlePasskey} loading={passkeyLoading} disabled={loading}>
+          Sign in with a passkey
+        </Button>
+        <p class="au-micro au-fg-3">Recommended · No password or authentication code needed.</p>
+      </div>
+    {/if}
+
     <form onsubmit={handleSubmit} novalidate>
       <div class="form-fields">
         {#if !mfaRequired}
@@ -140,7 +169,7 @@
       {/if}
 
       {#if !mfaRequired}
-        <Button variant="primary" size="lg" type="submit" {loading} disabled={!username || !password || loading}>
+        <Button variant={passkeysSupported ? 'secondary' : 'primary'} size="lg" type="submit" loading={loading && !passkeyLoading} disabled={!username || !password || loading}>
           Sign in
         </Button>
       {:else}
@@ -180,6 +209,7 @@
   }
 
   .auth-header { display: flex; flex-direction: column; gap: var(--sp-2); }
+  .passkey-signin { display: flex; flex-direction: column; gap: var(--sp-2); }
 
   .auth-logo {
     display: flex;
