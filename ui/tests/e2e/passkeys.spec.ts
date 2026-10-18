@@ -61,16 +61,19 @@ test('passkey enrollment, MFA-free login, safe redirect, and removal', async ({ 
 });
 
 test('cancelled passkey request permits retry and password fallback', async ({ page, appURL }) => {
-  // Stub only the OS prompt, leaving real fetch, WebAuthn option conversion,
-  // Svelte click handlers, and browser error handling in each browser engine.
+  // Supply the WebAuthn surface as well as the OS prompt: Playwright's Linux
+  // WebKit has no native PublicKeyCredential. Fetch, option conversion, Svelte
+  // click handlers, and browser error handling still run in each engine.
   await page.addInitScript(() => {
-    Object.defineProperty(Object.getPrototypeOf(navigator.credentials), 'get', { configurable: true, value: async (options: CredentialRequestOptions) => {
+    Object.defineProperty(window, 'PublicKeyCredential', { configurable: true, value: class {} });
+    Object.defineProperty(navigator, 'credentials', { configurable: true, value: { get: async (options: CredentialRequestOptions) => {
       if (!(options.publicKey?.challenge instanceof ArrayBuffer)) throw new Error('Challenge was not decoded');
       if (options.publicKey.userVerification !== 'required') throw new Error('User verification missing');
       if (options.mediation === 'conditional') throw new Error('Explicit sign-in must not require autofill');
-      (window as unknown as Record<string, unknown>).passkeyPromptReached = true;
+      const state = window as unknown as { passkeyPromptCount?: number };
+      state.passkeyPromptCount = (state.passkeyPromptCount ?? 0) + 1;
       throw new DOMException('Cancelled', 'NotAllowedError');
-    } });
+    } } });
   });
   await page.goto(`${appURL}/login`);
   const passkey = page.getByRole('button', { name: 'Sign in with a passkey', exact: true });
@@ -78,9 +81,10 @@ test('cancelled passkey request permits retry and password fallback', async ({ p
   await passkey.click();
   await expect(page.getByRole('alert')).toContainText('cancelled or timed out');
   await expect(passkey).toBeEnabled();
-  expect(await page.evaluate(() => (window as unknown as Record<string, unknown>).passkeyPromptReached)).toBe(true);
+  expect(await page.evaluate(() => (window as unknown as Record<string, unknown>).passkeyPromptCount)).toBe(1);
   await passkey.click();
   await expect(page.getByRole('alert')).toContainText('cancelled or timed out');
+  expect(await page.evaluate(() => (window as unknown as Record<string, unknown>).passkeyPromptCount)).toBe(2);
   await page.getByLabel('Username').fill('wrong-user');
   await page.getByLabel('Password', { exact: true }).fill('Wrong-Password-1');
   await page.getByRole('button', { name: 'Sign in', exact: true }).click();
@@ -100,7 +104,8 @@ test('registration supports browsers without newer WebAuthn serialization helper
   // Exercise the library's portable ArrayBuffer/JSON conversion in each engine.
   // The simulated authenticator intentionally omits Level 3 response helpers.
   await page.addInitScript(() => {
-    Object.defineProperty(Object.getPrototypeOf(navigator.credentials), 'create', { configurable: true, value: async (options: CredentialCreationOptions) => {
+    Object.defineProperty(window, 'PublicKeyCredential', { configurable: true, value: class {} });
+    Object.defineProperty(navigator, 'credentials', { configurable: true, value: { create: async (options: CredentialCreationOptions) => {
       const key = options.publicKey!;
       if (!(key.challenge instanceof ArrayBuffer) || !(key.user.id instanceof ArrayBuffer)) throw new Error('Binary fields were not decoded');
       if (key.authenticatorSelection?.userVerification !== 'required' || key.authenticatorSelection?.residentKey !== 'required') throw new Error('Credential policy missing');
@@ -110,7 +115,7 @@ test('registration supports browsers without newer WebAuthn serialization helper
         response: { clientDataJSON: new Uint8Array([4, 5]).buffer, attestationObject: new Uint8Array([6, 7]).buffer },
         getClientExtensionResults: () => ({ credProps: { rk: true } }),
       };
-    } });
+    } } });
   });
   await page.route('**/api/me', route => route.fulfill({ json: { user_id: 'test', username: 'test', name: 'Test User', email: null, roles: [] } }));
   await page.route('**/api/settings', route => route.fulfill({ json: { ldap: { password_mode: 'primary_only' } } }));
