@@ -34,7 +34,7 @@
   if (forwardTarget) {
     lookupForwardApp(forwardTarget)
       .then(result => { if (result) appName = result.name; })
-      .catch(() => { /* fall back to generic prompt */ });
+      .catch(() => { /* The app name is optional. */ });
   }
 
   function parseErrorCode(body: string): string | null {
@@ -111,22 +111,16 @@
         <span class="au-h4">authere</span>
       </div>
       <h1 class="au-h3">Sign in</h1>
-      <p class="au-small au-fg-3">
-        {#if appName}
-          Sign in to continue to {appName}.
-        {:else}
-          Sign in to continue.
-        {/if}
-      </p>
+      {#if appName}
+        <p class="au-small au-fg-3">Sign in to continue to {appName}.</p>
+      {/if}
     </header>
 
     {#if passkeysSupported}
-      <div class="passkey-signin">
-        <Button variant="primary" size="lg" onclick={handlePasskey} loading={passkeyLoading} disabled={loading}>
-          Sign in with a passkey
-        </Button>
-        <p class="au-micro au-fg-3">Recommended · No password or authentication code needed.</p>
-      </div>
+      <Button variant="primary" size="lg" onclick={handlePasskey} loading={passkeyLoading} disabled={loading}>
+        {#if !passkeyLoading}<i class="ph ph-key" aria-hidden="true"></i>{/if}
+        Sign in with a passkey
+      </Button>
     {/if}
 
     <form onsubmit={handleSubmit} novalidate>
@@ -209,7 +203,6 @@
   }
 
   .auth-header { display: flex; flex-direction: column; gap: var(--sp-2); }
-  .passkey-signin { display: flex; flex-direction: column; gap: var(--sp-2); }
 
   .auth-logo {
     display: flex;

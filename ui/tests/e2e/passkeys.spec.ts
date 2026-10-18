@@ -142,7 +142,7 @@ test('registration supports browsers without newer WebAuthn serialization helper
   await page.goto(`${appURL}/credentials`);
   await page.getByRole('button', { name: 'Add passkey', exact: true }).click();
   await page.getByLabel('Passkey name').fill('Portable passkey');
-  await page.getByRole('button', { name: 'Create passkey', exact: true }).click();
+  await page.getByLabel('Passkey name').press('Enter');
   await expect(page.getByText('Portable passkey', { exact: true })).toBeVisible();
   await expect(page.getByRole('dialog')).toHaveCount(0);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);

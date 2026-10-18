@@ -27,7 +27,7 @@
   onMount(load);
 
   async function add() {
-    if (busy || !name.trim()) return;
+    if (busy || !name.trim() || name.trim().length > 100) return;
     busy = true;
     error = '';
     try {
@@ -97,7 +97,17 @@
 {#if adding}
   <Modal title="Add passkey" onclose={close}>
     <p class="au-small au-fg-3">Choose a name you will recognize. Your browser will help you choose where to save the passkey.</p>
-    <Input label="Passkey name" bind:value={name} placeholder="Personal password manager" />
+    <Input
+      label="Passkey name"
+      bind:value={name}
+      placeholder="Personal password manager"
+      onkeydown={(event) => {
+        if (event.key === 'Enter' && !event.isComposing) {
+          event.preventDefault();
+          add();
+        }
+      }}
+    />
     {#if error}<p class="au-small error" role="alert">{error}</p>{/if}
     {#snippet actions()}
       <Button variant="ghost" disabled={busy} onclick={close}>Cancel</Button>

@@ -142,19 +142,17 @@ describe('Login', () => {
       expect(lookedUpFor).toBe('https://flood.example.com/dashboard');
     });
 
-    it('falls back to the generic prompt when the lookup returns 404', async () => {
+    it('keeps the simple sign-in header when the lookup returns 404', async () => {
       server.use(
         http.get('/api/auth/forward-app', () => HttpResponse.text('not found', { status: 404 })),
       );
       setForwardLoginUrl('https://unknown.example.com/');
       render(Login);
 
-      // Generic prompt is rendered synchronously; wait a tick for the lookup to settle
-      // and confirm we never swap to a "continue to ..." message.
       await waitFor(() => {
-        expect(screen.getByText('Sign in to continue.')).toBeInTheDocument();
+        expect(screen.getByRole('heading', { name: 'Sign in' })).toBeInTheDocument();
       });
-      expect(screen.queryByText(/sign in to continue to /i)).toBeNull();
+      expect(screen.queryByText(/sign in to continue/i)).toBeNull();
     });
 
     it('does not call the lookup endpoint for non-forward-auth redirect_uri values', async () => {
@@ -172,7 +170,8 @@ describe('Login', () => {
       // Give the microtask queue a chance to fire any spurious request.
       await new Promise(r => setTimeout(r, 10));
       expect(called).toBe(false);
-      expect(screen.getByText('Sign in to continue.')).toBeInTheDocument();
+      expect(screen.getByRole('heading', { name: 'Sign in' })).toBeInTheDocument();
+      expect(screen.queryByText(/sign in to continue/i)).toBeNull();
     });
   });
 });
